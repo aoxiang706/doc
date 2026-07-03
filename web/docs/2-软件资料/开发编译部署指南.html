@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>软件开发编译打包指南</title>
+    <link rel="stylesheet" href="../../css/markdown.css">
+</head>
+<body>
+    <article class="markdown-body"><h1 id="_1">软件开发编译打包指南</h1>
+<h2 id="1">1. 下载源码</h2>
+<pre><code class="language-bash">git clone https://adasgitlab.autel.com/ssg/ptz100_agx.git
+cd ptz100_agx
+git checkout develop
+git pull
+git submodule update --init --recursive
+</code></pre>
+<h2 id="2-x86">2. x86 服务器编译</h2>
+<p>在 x86 编译服务器上进行全量编译，适用于无本地交叉编译环境或需与 CI 一致的场景。</p>
+<h3 id="_2">全量编译</h3>
+<ol>
+<li>SSH 登录 x86 编译服务器：<code>10.229.1.52</code></li>
+<li>进入 <code>ptz100_agx</code> 源码目录</li>
+<li>执行编译脚本：</li>
+</ol>
+<pre><code class="language-bash">/home/autel/Downloads/build_agx.sh ptz100_agx
+</code></pre>
+<p>参数 <code>ptz100_agx</code> 为待编译的源码目录名。</p>
+<h3 id="_3">个人编译容器</h3>
+<p>若仅需借用 AGX 编译环境时，可创建个人 Docker 容器。将容器名、挂载路径替换为个人路径后执行：</p>
+<pre><code class="language-bash">docker run -it \
+  --name=&lt;容器名&gt; \
+  --net=host \
+  -v &lt;宿主机目录&gt;:/home/ \
+  10.240.34.2:10000/cibuilder/srp100:v6 \
+  /bin/bash
+</code></pre>
+<p>示例：</p>
+<pre><code class="language-bash">docker run -it --name=zyh_agx_test --net=host -v /home/a25175/share/zyh/:/home/ 10.240.34.2:10000/cibuilder/srp100:v6 /bin/bash
+</code></pre>
+<h2 id="3">3. 本地开发板编译</h2>
+<h3 id="_4">全量编译</h3>
+<pre><code class="language-bash">cd ros_ws
+colcon build --parallel-workers 12
+</code></pre>
+<h3 id="_5">单包编译</h3>
+<pre><code class="language-bash">cd ros_ws
+colcon build --packages-select ptz100_ros
+</code></pre>
+<p>将 <code>ptz100_ros</code> 替换为目标包名即可。各 ROS 包位于 <code>ros_ws/src/</code> 下，例如 <code>ptz100_ros</code>、<code>sysmonit</code>、<code>nexus_gateway</code> 等。</p>
+<h2 id="4">4. 手动运行</h2>
+<blockquote>
+<p>注意：手动启动进程前，确认不与 monit 管理的进程冲突。可先访问 <code>http://&lt;IP&gt;:2812</code>（monit Web 页面）查看当前进程状态。</p>
+</blockquote>
+<pre><code class="language-bash">cd ros_ws
+source install/setup.bash
+ros2 run ptz100_ros ptz100_ros
+</code></pre>
+<h2 id="5">5. 打包</h2>
+<h3 id="51-ci">5.1 CI 脚本一键编译打包（推荐）</h3>
+<p>仓库根目录执行 <code>build_ci.sh</code>，依次完成：子模块初始化 → <code>build_app.sh</code> 编译 → <code>pack_app.sh</code> 打包。</p>
+<pre><code class="language-bash"># 在仓库根目录执行
+./build_ci.sh &quot;${version}&quot;
+
+# 示例
+bash build_ci.sh SRP_GE_FW_V1.0.0
+</code></pre>
+<ul>
+<li>不传版本号时使用 <code>build_app.sh</code> 默认版本。</li>
+<li>产物路径：<code>config/tools/ota_tools/build_host/output/*.bin</code></li>
+</ul>
+<h3 id="52">5.2 本地分步打包（主设备应用包）</h3>
+<p>已编译完成、仅需重新打包时：</p>
+<pre><code class="language-bash">cd config/tools/ota_tools/build_host
+./pack_app.sh
+</code></pre>
+<p>需先编译再打包时：</p>
+<pre><code class="language-bash">cd config/tools/ota_tools/build_host
+./build_app.sh --version SRP_GE_FW_V1.0.0
+./pack_app.sh
+</code></pre>
+<h3 id="53-ota">5.3 综合 OTA 包（主设备 + 子设备）</h3>
+<pre><code class="language-bash">cd config/tools/ota_tools/build_image
+./pack_image.sh --version V1.0.0
+</code></pre>
+<p>将主设备、子设备软件包放入 <code>image/</code> 对应目录并填写 <code>pkg.meta.json</code>。</p>
+<p>详细说明见 <a href="../../config/tools/ota_tools/build_host/README.md">build_host README</a>、<a href="../../config/tools/ota_tools/build_image/README.md">build_image README</a>。</p>
+<h2 id="6">6. 升级</h2>
+<h3 id="_6">手动升级（设备侧）</h3>
+<pre><code class="language-bash">tar -zxf &lt;version&gt;.bin
+cd app_pkg
+./install.sh
+</code></pre>
+<p>流程概要：校验 → 写入 factory/a/b 备用分区 → 切换 <code>current</code> 软链接 → 重启 → 健康检查（失败自动回滚）。</p>
+<h3 id="ota">OTA 升级</h3>
+<p>本地Web网页、C2、云平台下发升级指令</p>
+<h2 id="7">7. 设备配置</h2>
+<p>AGX 现场调试与运维可通过 <strong>monit</strong>、<strong>sysmonit Web</strong> 或 <strong>命令行</strong> 完成进程管理与设备类型等配置。</p>
+<h3 id="71-monit">7.1 本地 monit 登录</h3>
+<p>浏览器访问 monit Web 页面，查看各进程运行状态，并执行 start / stop / restart：</p>
+<pre><code>http://&lt;IP&gt;:2812
+</code></pre>
+<ul>
+<li>用户名：<code>admin</code></li>
+<li>密码：<code>monit</code></li>
+</ul>
+<h3 id="72-web">7.2 本地 Web 登录</h3>
+<p>浏览器访问 sysmonit 运维仪表盘，登录后可进行系统概览、参数配置、进程管理等操作：</p>
+<pre><code>http://&lt;IP&gt;:12345
+</code></pre>
+<ul>
+<li>用户名：<code>admin</code></li>
+<li>密码：<code>monit</code></li>
+</ul>
+<h3 id="73">7.3 手动设置设备类型</h3>
+<p>设备上也可通过命令行直接设置主/次设备类型。不传参数或参数不合法时，会打印可选值及当前配置：</p>
+<pre><code class="language-bash">setDeviceType                    # 查看可选值与当前配置
+setDeviceType ssf200             # 仅设置主设备类型为 spotter ssf200
+setDeviceType sentry ssf200      # 主设备(sentry) + 次设备(ssf200)
+</code></pre>
+<h2 id="8">8. 上传代码</h2>
+<h3 id="81">8.1 拉取并合并</h3>
+<pre><code class="language-bash">git pull
+git pull origin develop
+git submodule update --recursive
+git status
+git submodule status
+</code></pre>
+<p>如有冲突，先用 vim 或 IDE 解决；差异较大的分支合并建议使用 Beyond Compare 等专业工具对比。</p>
+<h3 id="82">8.2 提交主仓库</h3>
+<pre><code class="language-bash">git status
+git add ./
+git commit -m &quot;修改说明&quot;
+git push origin develop
+</code></pre>
+<h3 id="83">8.3 提交子仓库</h3>
+<p>以 <code>ros_ws/src/dhp100</code> 为例：</p>
+<pre><code class="language-bash"># 进入子仓库
+git submodule status
+cd ros_ws/src/dhp100
+git status
+
+# 暂存本地修改
+git stash
+
+# 切换分支并拉取
+git checkout develop
+git pull
+git pull origin develop
+
+# 恢复暂存
+git stash pop
+
+# 提交子仓库
+git status
+git add ./
+git commit -m &quot;修改说明&quot;
+git push origin develop
+
+# 将子仓库新 commit 提交到主仓库
+cd -
+git status
+git add ros_ws/src/dhp100
+git commit -m &quot;更新 dhp100 子模块&quot;
+git push origin develop
+</code></pre></article>
+    <script>
+        // Sync theme with parent page
+        try {
+            var parentTheme = window.parent.document.documentElement.getAttribute('data-theme');
+            if (parentTheme) document.documentElement.setAttribute('data-theme', parentTheme);
+            // Listen for theme changes
+            var observer = new MutationObserver(function(mutations) {
+                mutations.forEach(function(m) {
+                    if (m.attributeName === 'data-theme') {
+                        var t = window.parent.document.documentElement.getAttribute('data-theme');
+                        if (t) document.documentElement.setAttribute('data-theme', t);
+                    }
+                });
+            });
+            observer.observe(window.parent.document.documentElement, { attributes: true });
+        } catch(e) {}
+    </script>
+</body>
+</html>

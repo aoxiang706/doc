@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>系统镜像环境搭建 + 打包备份 + 批量烧录</title>
+    <link rel="stylesheet" href="../../css/markdown.css">
+</head>
+<body>
+    <article class="markdown-body"><h1 id="_1">系统镜像环境搭建 + 打包备份 + 批量烧录</h1>
+<h2 id="nvidia-jetpack">一、NVIDIA JetPack 初始系统烧录</h2>
+<h3 id="11">1.1 烧录工具</h3>
+<table>
+<thead>
+<tr>
+<th>开发板类型</th>
+<th>工具</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>EMMC 开发板</td>
+<td>NVIDIA SDK Manager</td>
+<td>初次在线烧录，时间较长</td>
+</tr>
+<tr>
+<td>SD 卡开发板</td>
+<td>NVIDIA SDK Manager</td>
+<td>初次在线烧录，时间较长</td>
+</tr>
+<tr>
+<td>SD 卡开发板</td>
+<td>Balena Etcher</td>
+<td>离线烧录，批量复制</td>
+</tr>
+</tbody>
+</table>
+<h3 id="12-nvidia-sdk-manager">1.2 NVIDIA SDK Manager 烧录步骤</h3>
+<ol>
+<li>设备接线：...</li>
+<li>Ubuntu 电脑环境准备：...</li>
+<li>选择安装对应版本的 JetPack SDK：勾选 DeepStream 和其它 AI 库，默认带有 CUDA、TensorRT、CuDNN、OpenCV、Gstreamer 等</li>
+<li>设置系统初始账户：用户名 <code>skyfend</code>，密码 <code>123456</code></li>
+</ol>
+<h3 id="13-sd">1.3 SD 卡开发板烧录步骤</h3>
+<p>...</p>
+<h2 id="_2">二、系统环境配置</h2>
+<ol>
+<li>安装基础工具包：</li>
+</ol>
+<pre><code># -- jtop
+sudo apt update
+sudo apt install python3-pip
+sudo pip3 install -U jetson-stats
+sudo systemctl restart jetson-stats
+
+# -- sqlite3、tcpdump、cmake
+sudo apt install sqlite3 
+sudo apt install tcpdump 
+sudo apt install cmake
+
+# -- 补充gstreamer的 rtsp server 库
+sudo apt update
+sudo apt install libgstrtspserver-1.0-dev gstreamer1.0-rtsp
+
+</code></pre>
+<ol start="2">
+<li>安装 ROS2 Humble</li>
+</ol>
+<h2 id="_3">三、生产系统镜像打包备份</h2>
+<p>...</p>
+<h2 id="_4">四、批量烧录</h2>
+<p>...</p>
+<h2 id="_5">五、系统迁移固态硬盘（可选）</h2>
+<p>...</p></article>
+    <script>
+        // Sync theme with parent page
+        try {
+            var parentTheme = window.parent.document.documentElement.getAttribute('data-theme');
+            if (parentTheme) document.documentElement.setAttribute('data-theme', parentTheme);
+            // Listen for theme changes
+            var observer = new MutationObserver(function(mutations) {
+                mutations.forEach(function(m) {
+                    if (m.attributeName === 'data-theme') {
+                        var t = window.parent.document.documentElement.getAttribute('data-theme');
+                        if (t) document.documentElement.setAttribute('data-theme', t);
+                    }
+                });
+            });
+            observer.observe(window.parent.document.documentElement, { attributes: true });
+        } catch(e) {}
+    </script>
+</body>
+</html>

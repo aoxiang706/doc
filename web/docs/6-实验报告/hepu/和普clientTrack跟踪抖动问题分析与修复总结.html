@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>和普 clientTrack 跟踪抖动问题分析与修复总结</title>
+    <link rel="stylesheet" href="../../css/markdown.css">
+</head>
+<body>
+    <article class="markdown-body"><h1 id="clienttrack">和普 clientTrack 跟踪抖动问题分析与修复总结</h1>
+<h2 id="1">1. 问题背景</h2>
+<h3 id="11">1.1 现象</h3>
+<p>现场反馈和普 PTZ 在 AI 跟踪阶段出现画面/云台<strong>晃动（抖动）</strong>。典型日志时段：<code>ptz_service-20260101.01.log</code> 中 <strong>12:32:14</strong> 前后，可见光锁定目标后跟踪不稳定。</p>
+<p>和普供应商（qlc）说明：<code>ivpClientTracking</code>（clientTrack）正常节拍约为 <strong>25fps（~40ms/帧）</strong>。</p>
+<h3 id="12">1.2 影响范围</h3>
+<ul>
+<li>设备：和普 PTZ（场景 C，<code>enableClientTrack</code>）</li>
+<li>路径：AI 发布 <code>/visiblelight_track_objs</code>、<code>/infrared_track_objs</code> → <code>ptz_service</code> → SDK <code>clientTrack</code> + <code>HVS_PositionView</code></li>
+<li>表现：跟踪框滞后、云台顿挫，长间隔后更明显</li>
+</ul>
+<hr />
+<h2 id="2">2. 根因分析</h2>
+<h3 id="21">2.1 日志统计（改前）</h3>
+<p>对 <code>ptz_service-20260101.01.log</code> 分析：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th><code>clientTrack</code> 单次耗时</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>无 FOV</td>
+<td><strong>45–55ms</strong></td>
+<td><code>ivpClientTracking</code> IPC 阻塞</td>
+</tr>
+<tr>
+<td>有 FOV（<code>next_view_valid=1</code>）</td>
+<td><strong>100–110ms</strong></td>
+<td>叠加 <code>HVS_PositionView</code>（+50–60ms）</td>
+</tr>
+</tbody>
+</table>
+<p>稳定段（12:29:10–20）中 &gt;60ms 尖峰约占 <strong>4.4%</strong>，多与 <code>setPositionView</code> 同期出现。</p>
+<h3 id="22">2.2 架构层原因</h3>
+<p>改前 <code>onAiDetectionResultsTrack()</code> 在 <strong>ROS 订阅回调线程</strong>内同步执行：</p>
+<pre><code>ROS 回调 onAiDetectionResultsTrack
+  ├── clientTrack()          ~50ms（阻塞）
+  └── setPositionView()      ~50ms（阻塞，当 next_view_valid=1）
+  合计可达 ~100ms+
+</code></pre>
+<p>叠加因素：</p>
+<ol>
+<li><strong>AI 发布快于处理</strong>：跟踪话题约 25fps，单次处理 50–110ms，消息在 <code>KeepLast(10)</code> 队列中堆积。</li>
+<li><strong>处理旧帧</strong>：回调排队导致下发框滞后，表现为跟踪晃动。</li>
+<li><strong>FOV 与 clientTrack 串行</strong>：变倍时拉长单帧处理时间，形成周期性顿挫。</li>
+<li><strong>无效 AI 图像尺寸</strong>（次要）：<code>image_width</code> 偶发异常值（如 43690），虽 fallback 到 1920×1080，但增加日志噪声；已改为固定标定分辨率。</li>
+</ol>
+<h3 id="23">2.3 与供应商沟通结论</h3>
+<p>和普建议将 <strong>clientTrack</strong> 与 <strong>HVS_PositionView</strong> 解耦；FOV 后续可考虑 <code>sendCommonCmd</code> 异步 fire-and-forget（Phase 3，本次未实施）。</p>
+<hr />
+<h2 id="3">3. 解决方案</h2>
+<h3 id="31">3.1 设计原则</h3>
+<table>
+<thead>
+<tr>
+<th>原则</th>
+<th>做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ROS 回调快速返回</td>
+<td>只投递最新 AI 帧，不做阻塞 IO</td>
+</tr>
+<tr>
+<td>clientTrack 独立线程</td>
+<td>阻塞 IPC 在 worker 中执行</td>
+</tr>
+<tr>
+<td>FOV 独立线程</td>
+<td><code>setPositionView</code> 不阻塞 clientTrack 路径</td>
+</tr>
+<tr>
+<td>Latest-only</td>
+<td>处理期间新帧覆盖旧帧，避免排队滞后</td>
+</tr>
+<tr>
+<td>信任 AI FOV</td>
+<td>去掉视场差过滤、200ms 限速（AI 已 1Hz）</td>
+</tr>
+<tr>
+<td>固定分辨率</td>
+<td>使用 <code>1920×1080</code> / <code>640×512</code> 宏，不读 AI <code>image_width/height</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="32">3.2 架构（改后）</h3>
+<pre><code>ROS 回调 onAiDetectionResultsTrack()     [&lt;1ms，仅投递]
+        │
+        ▼
+clientTrack worker 线程
+  └── processClientTrackFrame()
+        ├── clientTrack()               [~45–55ms，阻塞 IPC]
+        └── postFovRequest()            [非阻塞投递]
+                    │
+                    ▼
+              FOV worker 线程
+                └── setPositionView()   [~50–60ms，独立执行]
+</code></pre>
+<h3 id="33">3.3 涉及文件</h3>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>改动要点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ros_ws/src/ptz_service/src/ptzDevice/ptzDeviceHepu.h</code></td>
+<td>worker 线程、mutex/cv、latest 队列、<code>lastClientTrackDone_</code> 耗时统计</td>
+</tr>
+<tr>
+<td><code>ros_ws/src/ptz_service/src/ptzDevice/ptzDeviceHepu.cpp</code></td>
+<td><code>startClientTrackWorkers</code> / <code>stopClientTrackWorkers</code>、<code>clientTrackWorkerLoop</code>、<code>fovWorkerLoop</code>、<code>processClientTrackFrame</code>、<code>postFovRequest</code></td>
+</tr>
+<tr>
+<td><code>ros_ws/src/ptz_service/src/rosService/rosService.cpp</code></td>
+<td>跟踪订阅回调保留 <code>took ms</code> 诊断；可选 <code>track_qos KeepLast(1)</code></td>
+</tr>
+</tbody>
+</table>
+<p>生命周期：<code>startVideoPipeline()</code> 启动 worker，<code>stopVideoPipeline()</code> 停止并清空 pending。</p>
+<hr />
+<h2 id="4">4. 可观测性</h2>
+<h3 id="41">4.1 日志字段</h3>
+<p>改后新增 worker 侧 DEBUG 日志：</p>
+<pre><code>PtzHepu: clientTrack done vt=0 call_ms=48 since_last_ms=41
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>call_ms</code></td>
+<td>本次 <code>clientTrack()</code> IPC 阻塞耗时</td>
+</tr>
+<tr>
+<td><code>since_last_ms</code></td>
+<td>距该通道上次成功下发的间隔</td>
+</tr>
+</tbody>
+</table>
+<p>ROS 回调侧 <code>onAiDetectionResultsTrack took X ms</code> 现在量的是<strong>投递耗时</strong>（通常 0ms），不再反映真实 IPC 时间；应以 worker 日志为准。</p>
+<h3 id="42-132">4.2 现场统计命令（132 实机）</h3>
+<pre><code class="language-bash"># 下发节拍 → 等效 fps
+grep &quot;clientTrack done vt=0&quot; /home/skyfend/log/ptz_service.log | tail -200 | \
+  grep -oP 'since_last_ms=\K\d+' | \
+  awk '{s+=$1;n++} END{printf &quot;avg_since_last=%.1fms =&gt; %.1f fps\n&quot;, s/n, 1000/(s/n)}'
+
+# 单次 IPC 耗时
+grep &quot;clientTrack done vt=0&quot; /home/skyfend/log/ptz_service.log | tail -200 | \
+  grep -oP 'call_ms=\K\d+' | \
+  awk '{s+=$1;n++} END{printf &quot;avg_call_ms=%.1fms\n&quot;, s/n}'
+</code></pre>
+<hr />
+<h2 id="5-1921682132">5. 验证结果（192.168.2.132 实机）</h2>
+<h3 id="51">5.1 功能验证</h3>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>编译部署</td>
+<td>通过</td>
+</tr>
+<tr>
+<td>ROS 回调非阻塞</td>
+<td><code>onAiDetectionResultsTrack took 0 ms</code></td>
+</tr>
+<tr>
+<td>worker 异步 clientTrack</td>
+<td><code>processClientTrackFrame</code> 与回调分离</td>
+</tr>
+<tr>
+<td>FOV 异步</td>
+<td><code>fovWorkerLoop: setPositionView</code> 不阻塞 clientTrack</td>
+</tr>
+<tr>
+<td>可见光锁定跟踪</td>
+<td><code>hepu_valid=1 hepu=1</code>，画面稳定</td>
+</tr>
+<tr>
+<td><strong>晃动问题</strong></td>
+<td><strong>现场测试认为已解决</strong></td>
+</tr>
+</tbody>
+</table>
+<h3 id="52">5.2 性能数据</h3>
+<p>多次采样最近 200 条 <code>clientTrack done vt=0</code>：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>典型值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>since_last_ms</code> 平均</td>
+<td><strong>44.5–46.3ms</strong></td>
+</tr>
+<tr>
+<td>折算下发帧率</td>
+<td><strong>~21.6–22.5 fps</strong></td>
+</tr>
+<tr>
+<td><code>call_ms</code>（慢档）</td>
+<td><strong>45–55ms</strong></td>
+</tr>
+<tr>
+<td><code>call_ms</code>（drain 快档）</td>
+<td><strong>7–10ms</strong></td>
+</tr>
+<tr>
+<td>AI 输入（<code>cb_visible_track</code>）</td>
+<td><strong>~25fps（~40ms）</strong></td>
+</tr>
+</tbody>
+</table>
+<h3 id="53-ai-25fps-22fps">5.3 为何 AI 25fps、下发 ~22fps</h3>
+<p>并非回调阻塞，而是 <strong>单 worker 串行 + IPC ~50ms</strong> 的吞吐上限：</p>
+<ul>
+<li>AI 每 <strong>~40ms</strong> 进一帧（25fps）</li>
+<li>worker 每 <strong>~45–50ms</strong> 才能成功下发一帧（~20–22fps）</li>
+<li>差额由 <strong>latest-only</strong> 丢弃中间旧帧，保留最新框</li>
+</ul>
+<p>这是用「略跳帧」换「低延迟、不排队」，改前同样受 IPC 耗时限制，但还会叠加队列滞后与 FOV 串行，体感更差。</p>
+<hr />
+<h2 id="6-vs">6. 改前 vs 改后对比</h2>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>改前</th>
+<th>改后</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ROS 回调耗时</td>
+<td>44–110ms</td>
+<td><strong>~0ms</strong></td>
+</tr>
+<tr>
+<td>FOV 与 clientTrack</td>
+<td>同线程串行</td>
+<td><strong>独立线程</strong></td>
+</tr>
+<tr>
+<td>消息队列</td>
+<td>易堆积旧帧</td>
+<td><strong>latest-only</strong></td>
+</tr>
+<tr>
+<td>跟踪滞后</td>
+<td>框越来越旧</td>
+<td>始终跟最新框</td>
+</tr>
+<tr>
+<td>下发帧率</td>
+<td>~20fps 且不稳定</td>
+<td><strong>~22fps 且稳定</strong></td>
+</tr>
+<tr>
+<td>晃动</td>
+<td>明显</td>
+<td><strong>现场验证已消除</strong></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="7">7. 已知限制与后续</h2>
+<h3 id="71">7.1 当前限制</h3>
+<ol>
+<li><strong>SDK <code>m_device_mutex</code></strong>：clientTrack 与 <code>setPositionView</code> 仍可能互抢锁，偶发 <code>call_ms</code> 偏高。</li>
+<li><strong>下发帧率上限</strong>：在 <code>call_ms≈50ms</code> 未降低前，难以稳定达到 25fps 全量下发。</li>
+<li><strong>回调 <code>took ms</code> 语义变化</strong>：仅表示投递耗时，排查 IPC 需看 <code>clientTrack done</code> 日志。</li>
+</ol>
+<h3 id="72">7.2 后续可选优化（未实施）</h3>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Phase 3</td>
+<td>FOV 改 <code>sendCommonCmd</code> fire-and-forget（需和普确认协议）</td>
+</tr>
+<tr>
+<td>供应商侧</td>
+<td>缩短 <code>ivpClientTracking</code> IPC 至 ≤40ms</td>
+</tr>
+<tr>
+<td>AI 侧</td>
+<td>跟踪话题降至 20fps，与下发能力对齐，减少无效跳帧</td>
+</tr>
+<tr>
+<td>简化</td>
+<td><code>track_qos KeepLast(1)</code> 可改回统一 <code>qos</code>（worker 已 latest-only）</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="8">8. 结论</h2>
+<p>本次问题的本质是 <strong>ROS 回调线程被 clientTrack / setPositionView 同步阻塞</strong>，叠加消息排队导致跟踪框滞后，表现为云台晃动。</p>
+<p>通过 <strong>双 worker 异步化 + latest-only 投递</strong>，将阻塞 IO 移出 ROS 回调，FOV 与 clientTrack 解耦，实机验证跟踪稳定，晃动问题<strong>已解决</strong>。</p>
+<p>下发帧率约 <strong>22fps</strong>（低于 AI 25fps）是当前 IPC 耗时的物理上限，不影响「跟最新框」的跟踪质量；若需进一步提升至 25fps，需和普侧缩短 IPC 或采用异步 fire-and-forget 方案。</p>
+<hr />
+<p><strong>文档版本</strong>：v1.0<br />
+<strong>问题日志</strong>：<code>ptz_service-20260101.01.log</code>（12:32:14 时段）<br />
+<strong>验证环境</strong>：192.168.2.132，2026-06-30 实机跟踪测试<br />
+<strong>主要改动模块</strong>：<code>ptz_service</code> / <code>PtzDeviceHepu</code></p></article>
+    <script>
+        // Sync theme with parent page
+        try {
+            var parentTheme = window.parent.document.documentElement.getAttribute('data-theme');
+            if (parentTheme) document.documentElement.setAttribute('data-theme', parentTheme);
+            // Listen for theme changes
+            var observer = new MutationObserver(function(mutations) {
+                mutations.forEach(function(m) {
+                    if (m.attributeName === 'data-theme') {
+                        var t = window.parent.document.documentElement.getAttribute('data-theme');
+                        if (t) document.documentElement.setAttribute('data-theme', t);
+                    }
+                });
+            });
+            observer.observe(window.parent.document.documentElement, { attributes: true });
+        } catch(e) {}
+    </script>
+</body>
+</html>

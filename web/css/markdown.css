@@ -1,0 +1,194 @@
+/* ============================================
+   Markdown Document Styles - 文档内嵌样式
+   供预转换的HTML文档在iframe中使用
+   ============================================ */
+
+@import url("variables.css");
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: var(--font-size-base);
+  line-height: 1.85;
+  color: var(--color-text-primary);
+  background-color: var(--color-bg-primary);
+  padding: var(--space-xl) var(--space-2xl);
+  max-width: 900px;
+  margin: 0 auto;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Headings */
+h1, h2, h3, h4, h5, h6 {
+  color: var(--color-text-primary);
+  line-height: var(--line-height-tight);
+  margin-top: 1.5em;
+  margin-bottom: 0.6em;
+  font-weight: 700;
+}
+
+h1 { font-size: var(--font-size-3xl); border-bottom: 2px solid var(--color-border); padding-bottom: 0.3em; }
+h2 { font-size: var(--font-size-2xl); border-bottom: 1px solid var(--color-border); padding-bottom: 0.25em; }
+h3 { font-size: var(--font-size-xl); }
+h4 { font-size: var(--font-size-lg); }
+h5 { font-size: var(--font-size-base); }
+h6 { font-size: var(--font-size-sm); color: var(--color-text-secondary); }
+
+h1:first-child, h2:first-child { margin-top: 0; }
+
+/* Paragraphs */
+p {
+  margin-bottom: 1em;
+}
+
+/* Links */
+a {
+  color: var(--color-accent);
+  text-decoration: none;
+}
+a:hover {
+  color: var(--color-accent-hover);
+  text-decoration: underline;
+}
+
+/* Lists */
+ul, ol {
+  padding-left: 2em;
+  margin-bottom: 1em;
+}
+li {
+  margin-bottom: 0.3em;
+}
+li > ul, li > ol {
+  margin-top: 0.3em;
+  margin-bottom: 0;
+}
+
+/* Blockquotes */
+blockquote {
+  border-left: 4px solid var(--color-accent);
+  padding: var(--space-sm) var(--space-lg);
+  margin: 1em 0;
+  background: var(--color-accent-light);
+  border-radius: 0 var(--border-radius-sm) var(--border-radius-sm) 0;
+  color: var(--color-text-secondary);
+}
+blockquote p:last-child {
+  margin-bottom: 0;
+}
+
+/* Code */
+code {
+  font-family: var(--font-mono);
+  font-size: 0.875em;
+  padding: 2px 6px;
+  background: var(--color-bg-code);
+  border-radius: var(--border-radius-sm);
+  color: var(--color-accent);
+}
+
+pre {
+  margin: 1em 0;
+  padding: var(--space-lg);
+  background: var(--color-bg-code);
+  border: 1px solid var(--color-border);
+  border-radius: var(--border-radius);
+  overflow-x: auto;
+  line-height: 1.6;
+}
+
+pre code {
+  padding: 0;
+  background: none;
+  border-radius: 0;
+  color: var(--color-text-primary);
+  font-size: var(--font-size-sm);
+}
+
+/* Tables */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1em 0;
+  font-size: var(--font-size-sm);
+  overflow-x: auto;
+  display: block;
+}
+
+th, td {
+  padding: var(--space-sm) var(--space-md);
+  border: 1px solid var(--color-border);
+  text-align: left;
+}
+
+th {
+  background: var(--color-bg-secondary);
+  font-weight: 600;
+  color: var(--color-text-primary);
+  white-space: nowrap;
+}
+
+tr:nth-child(even) {
+  background: var(--color-bg-secondary);
+}
+
+/* Horizontal Rule */
+hr {
+  border: none;
+  height: 1px;
+  background: var(--color-border);
+  margin: 2em 0;
+}
+
+/* Images */
+img {
+  max-width: 100%;
+  height: auto;
+  border-radius: var(--border-radius);
+  margin: 1em 0;
+}
+
+/* Strong / Em */
+strong { font-weight: 700; color: var(--color-text-primary); }
+em { font-style: italic; }
+
+/* Mark / Highlight */
+mark {
+  background: rgba(37, 99, 235, 0.2);
+  padding: 1px 4px;
+  border-radius: 2px;
+}
+
+/* Task lists */
+.task-list-item {
+  list-style: none;
+  margin-left: -1.5em;
+}
+.task-list-item input[type="checkbox"] {
+  margin-right: 0.5em;
+}
+
+/* Definition lists */
+dl { margin: 1em 0; }
+dt { font-weight: 600; color: var(--color-text-primary); margin-top: 0.5em; }
+dd { margin-left: 2em; margin-bottom: 0.5em; color: var(--color-text-secondary); }
+
+/* Footnotes */
+.footnote { font-size: var(--font-size-sm); color: var(--color-text-tertiary); }
+
+/* TOC (if generated) */
+.toc { background: var(--color-bg-secondary); border: 1px solid var(--color-border); border-radius: var(--border-radius); padding: var(--space-lg); margin-bottom: var(--space-xl); }
+.toc ul { padding-left: 1.5em; }
+.toc a { color: var(--color-text-secondary); }
+.toc a:hover { color: var(--color-accent); }
+
+/* Print */
+@media print {
+  body { padding: 0; max-width: 100%; }
+  pre { border: 1px solid #ddd; }
+}

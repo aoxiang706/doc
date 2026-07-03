@@ -1,0 +1,2395 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PTZ 设备模块设计文档</title>
+    <link rel="stylesheet" href="../../css/markdown.css">
+</head>
+<body>
+    <article class="markdown-body"><h1 id="ptz">PTZ 设备模块设计文档</h1>
+<blockquote>
+<p><strong>文档版本</strong>：v1.1<br />
+<strong>更新日期</strong>：2026-04-02<br />
+<strong>负责人</strong>：—<br />
+<strong>状态</strong>：现状描述 + 云端推流方案</p>
+</blockquote>
+<p>本文档描述 PTZ 设备模块的设计与现状，涵盖三条链路：<strong>视频流链路</strong>（拉流、解码、SHM 传图、AI 处理、编码推流）、<strong>控制链路</strong>（引导/跟踪/转台/镜头等指令下发）、<strong>状态上报链路</strong>（设备状态、镜头信息、方位俯仰等上报），以及 <strong>PTZ 与上位机 C2 的交互链路</strong>（Alink 上报/下发）。</p>
+<p><strong>文档结构（推荐阅读顺序）</strong><br />
+- <strong>一、概述</strong>：PTZ 介绍、背景、模块目标<br />
+- <strong>二、系统架构总览</strong>：整体数据流（视频）、设备工厂<br />
+- <strong>视频流链路</strong>（第三～七章）：设备详细说明 → 视频框架演进 → GStreamer 详解 → 共享内存 → MediaMTX<br />
+- <strong>控制链路</strong>（第八章）：控制 Topic、按设备分流、协议差异<br />
+- <strong>状态上报链路</strong>（第九章）：状态 Topic 与数据流向<br />
+- <strong>PTZ 与 C2 交互</strong>（第十章）：AGX↔C2 上报（0xE5/0xEB/0xEC）、下发（0x81 手选目标、0x86/0x8a/0x8b）、与 ROS2 关系<br />
+- <strong>十一～十三</strong>：设备配置、三类设备对比、现状与可选优化<br />
+- <strong>十四、云端推流</strong>（SSF200 上云）：GstCloudPusher 免转码重封装推流至天盾云端<br />
+- <strong>附录</strong>：端口、源文件、播放地址、MediaMTX 配置、缩略语  </p>
+<hr />
+<h2 id="_1">一、概述</h2>
+<h3 id="11-ptz">1.1 PTZ 设备介绍</h3>
+<p><strong>PTZ</strong>（Pan-Tilt-Zoom）即<strong>云台摄像机</strong>，是一种可远程控制水平旋转（Pan）、俯仰（Tilt）和光学变焦（Zoom）的摄像设备，常用于安防监控、光电跟踪、目标观测等场景。</p>
+<p><strong>典型组成</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>组成部分</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>云台</strong></td>
+<td>机械转动机构，实现水平/俯仰转动，承载相机与镜头</td>
+</tr>
+<tr>
+<td><strong>光学镜头</strong></td>
+<td>变焦（Zoom）、对焦（Focus），可选电动光圈</td>
+</tr>
+<tr>
+<td><strong>可见光相机</strong></td>
+<td>主码流/子码流，输出可见光视频（如 1920×1080 H.264）</td>
+</tr>
+<tr>
+<td><strong>红外/热像相机</strong></td>
+<td>可选，输出红外或热成像视频（如 640×512），用于夜间或测温</td>
+</tr>
+<tr>
+<td><strong>控制与网络</strong></td>
+<td>以太网/串口等，接收 PTZ 控制指令（引导、跟踪、镜头控制等）并输出视频流</td>
+</tr>
+</tbody>
+</table>
+<p>本平台所接入的<strong>耐杰 PTZ</strong>、<strong>和普 PTZ</strong> 均为上述云台摄像机；<strong>激光 PTZ</strong>（霍克眼 HEF/HEP 系列）在云台 + 可见光/红外相机基础上，集成了激光测距/指示等能力，视频流多为 SDK 回调的 JPEG 帧。</p>
+<h3 id="12">1.2 背景</h3>
+<p>PTZ100 AGX 平台需要接入多种不同厂家的 PTZ/激光设备，实现视频拉流、解码、AI 推理、OSD 叠加及推流的完整链路。代码通过 <code>GstRtspClient</code> 将编码后的 H264 以 RTP over UDP 推送至 MediaMTX，由 MediaMTX 对外提供 RTSP 服务（端口 9554）。当前系统已接入以下三类设备：</p>
+<table>
+<thead>
+<tr>
+<th>设备类型</th>
+<th>厂家</th>
+<th>型号</th>
+<th>代码位置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>耐杰近程/中程 PTZ</td>
+<td>耐杰</td>
+<td>PTZ_NAIJIE / PTZ_NAIJIE_MID</td>
+<td><code>ptz100_ros</code> 节点（<code>src/app/ptz/ptz_app.cpp</code>）</td>
+</tr>
+<tr>
+<td>和普 PTZ</td>
+<td>和普</td>
+<td>三型 Z50（非制冷）/ 四型 Z50（制冷）</td>
+<td><code>ros_ws/src/ptz_service/</code> (新架构)</td>
+</tr>
+<tr>
+<td>激光 PTZ</td>
+<td>霍克眼</td>
+<td>HEF100 / HEP10 / HEP21</td>
+<td><code>ros_ws/src/laser_service/</code> (新架构)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="13">1.3 模块目标</h3>
+<ul>
+<li><strong>视频流链路</strong>：统一设备接入与视频流管理；GStreamer + NVDEC 硬件解码；SHM 零拷贝传图给 AI；GstRtspClient 编码推流至 MediaMTX</li>
+<li><strong>控制链路</strong>：统一 ROS2 Topic 接口，各节点转成设备协议下发（耐杰以太网、和普 HTTP/SDK、激光 SDK）</li>
+<li><strong>状态上报链路</strong>：设备状态、镜头信息、方位俯仰等通过 ROS2 Topic 发布，供融合/显控使用</li>
+</ul>
+<hr />
+<h2 id="_2">二、系统架构总览</h2>
+<h3 id="21">2.1 整体数据流（仅视频流链路）</h3>
+<p>下图仅描述<strong>视频处理</strong>整体流程（设备 → 解码 → 传输层/SHM → AI → 推流）；控制链路见第八章，状态上报见第九章，C2 交互见第十章。</p>
+<pre><code class="language-mermaid">flowchart TD
+    subgraph 设备层
+        NJ[耐杰 PTZ&lt;br/&gt;RTSP 拉流]
+        HP[和普 PTZ&lt;br/&gt;RTSP 拉流]
+        LZ[激光 PTZ&lt;br/&gt;SDK JPEG 回调]
+    end
+
+    subgraph 解码层
+        GSD1[GstSourceDecode&lt;br/&gt;uridecodebin → NVDEC]
+        GSD2[GstSourceDecode&lt;br/&gt;uridecodebin → NVDEC]
+        JPEG[&quot;JPEG 软解码&lt;br/&gt;cv::imdecode&quot;]
+    end
+
+    subgraph 传输层-共享内存
+        SHM_V[SHM 可见光&lt;br/&gt;SHM_TRANSFER_ZOOM_CAMERA0]
+        SHM_T[SHM 红外&lt;br/&gt;SHM_TRANSFER_INFRARED_CAMERA0]
+    end
+
+    subgraph AI 推理层
+        AI[ptz100_ai&lt;br/&gt;目标检测 + OSD 叠加]
+        SHM_AV[SHM AI 结果-可见光&lt;br/&gt;SHM_TRANSFER_AI_RESULT_ZOOM_CAMERA0]
+        SHM_AT[SHM AI 结果-红外&lt;br/&gt;SHM_TRANSFER_AI_RESULT_INFRARED_CAMERA0]
+    end
+
+    subgraph 推流层
+        GRC[GstRtspClient&lt;br/&gt;nvv4l2h264enc → RTP over UDP]
+        MTX[&quot;MediaMTX&lt;br/&gt;RTSP :9554&quot;]
+    end
+
+    NJ --&gt;|&quot;rtsp://ip/channel=N&quot;| GSD1
+    HP --&gt;|&quot;rtsp://admin:***@ip:554&quot;| GSD2
+    LZ --&gt;|subscribeCameraJpeg| JPEG
+
+    GSD1 --&gt; SHM_V &amp; SHM_T
+    GSD2 --&gt; SHM_V &amp; SHM_T
+    JPEG --&gt; SHM_V
+
+    SHM_V --&gt; AI
+    SHM_T --&gt; AI
+    AI --&gt; SHM_AV &amp; SHM_AT
+
+    SHM_AV --&gt; GRC
+    SHM_AT --&gt; GRC
+    JPEG --&gt; GRC
+
+    GRC --&gt;|UDP RTP 5400~5411| MTX
+</code></pre>
+<h3 id="22">2.2 设备工厂模式</h3>
+<pre><code class="language-mermaid">classDiagram
+    class PtzDeviceBase {
+        &lt;&lt;abstract&gt;&gt;
+        +ctrlPtzGuidance()
+        +ctrlPtzTrack()
+        +ctrlPtzMotion()
+        +ctrlPtzLens()
+        +ctrlPtzManualLockTarget()
+        +ctrlPtzSwitchTrack()
+        +onAiDetectionResults()
+    }
+
+    class PtzDeviceHepu {
+        -GstSourceDecode sourceDecoderVisible_
+        -GstSourceDecode sourceDecoderThermal_
+        -GstRtspClient rtspClientVisible_
+        -GstRtspClient rtspClientThermal_
+        -ShmTransferFrame shmVisibleRaw_
+        -ShmTransferFrame shmThermalRaw_
+        -HepuPtz deviceApi_
+        +startVideoPipeline()
+        +onRawVideoFrame()
+        +visiblePushThread()
+        +thermalPushThread()
+    }
+
+    class PtzDevice {
+        &lt;&lt;factory&gt;&gt;
+        +createDevice(DeviceType) PtzDeviceBase
+    }
+
+    class LaserDeviceBase {
+        &lt;&lt;abstract&gt;&gt;
+        +setLaserParam()
+        +ctrlLaserDevice()
+        +ctrlPtzGuidance()
+        +ctrlPtzTrack()
+    }
+
+    class LaserDeviceHe {
+        -LaserHe deviceApi_
+        -ShmTransferFrame shmApi_[3]
+        -GstRtspClient rtspClientApi_[3]
+        +onCameraJpegCb()
+        +workerTaskLoop()
+    }
+
+    class LaserDevice {
+        &lt;&lt;factory&gt;&gt;
+        +createDevice(index, DeviceType) LaserDeviceBase
+    }
+
+    PtzDeviceBase &lt;|-- PtzDeviceHepu
+    PtzDevice ..&gt; PtzDeviceBase
+    LaserDeviceBase &lt;|-- LaserDeviceHe
+    LaserDevice ..&gt; LaserDeviceBase
+</code></pre>
+<hr />
+<h2 id="_3">三、设备详细说明</h2>
+<h3 id="31-ptzptz100_ros-gstreamer">3.1 耐杰 PTZ（ptz100_ros 节点，GStreamer）</h3>
+<table>
+<thead>
+<tr>
+<th>属性</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>配置类型</strong></td>
+<td><code>PTZ_NAIJIE</code> (近程)、<code>PTZ_NAIJIE_MID</code> (中程)</td>
+</tr>
+<tr>
+<td><strong>代码入口</strong></td>
+<td><code>src/app/ptz/ptz_app.cpp</code> → <code>load_ptz()</code></td>
+</tr>
+<tr>
+<td><strong>视频协议</strong></td>
+<td>RTSP 拉流</td>
+</tr>
+<tr>
+<td><strong>可见光 URL</strong></td>
+<td><code>rtsp://&lt;ip&gt;/channel=0,stream=0</code></td>
+</tr>
+<tr>
+<td><strong>红外 URL</strong></td>
+<td><code>rtsp://&lt;ip&gt;/channel=1,stream=1</code></td>
+</tr>
+<tr>
+<td><strong>可见光分辨率</strong></td>
+<td>1920x1080</td>
+</tr>
+<tr>
+<td><strong>红外分辨率</strong></td>
+<td>640x512</td>
+</tr>
+<tr>
+<td><strong>控制协议</strong></td>
+<td>以太网自定义协议 <code>eth_link_ptz</code>，SDK 位于 <code>thirdpart/naijie/</code></td>
+</tr>
+<tr>
+<td><strong>解码方式</strong></td>
+<td>已从 FFmpeg 切换到 <code>GstSourceDecode</code> 硬解（FFmpeg 代码暂保留）</td>
+</tr>
+<tr>
+<td><strong>AI 传图</strong></td>
+<td>共享内存 <code>SHM_TRANSFER_ZOOM_CAMERA0</code> / <code>SHM_TRANSFER_INFRARED_CAMERA0</code></td>
+</tr>
+<tr>
+<td><strong>推流方式</strong></td>
+<td><code>GstRtspClient</code> H264 硬编码 → UDP RTP :5410/:5411 → MediaMTX</td>
+</tr>
+<tr>
+<td><strong>推流代码</strong></td>
+<td><code>src/app/alg_app/alg_app.cpp</code>（<code>image_get_thread</code> / <code>image_get_thread_infrared</code>）</td>
+</tr>
+</tbody>
+</table>
+<p><strong>视频处理数据流：</strong></p>
+<pre><code class="language-mermaid">flowchart LR
+    subgraph 拉流解码
+        URL[&quot;RTSP URL&quot;] --&gt; DEC[GstSourceDecode] --&gt; SHM_RAW[SHM 原始帧]
+    end
+    subgraph AI处理
+        SHM_RAW --&gt; AI[ptz100_ai] --&gt; SHM_AI[SHM 结果帧]
+    end
+    subgraph 编码推流
+        SHM_AI --&gt; ENC[GstRtspClient x2] --&gt; MTX[&quot;MediaMTX&quot;] --&gt; CLIENT[客户端]
+    end
+</code></pre>
+<blockquote>
+<p><strong>说明</strong>：耐杰 PTZ 的视频处理已从 FFmpeg 切换到 GStreamer，拉流解码使用 <code>GstSourceDecode</code>，编码推流使用 <code>GstRtspClient</code>，拉流 → 解码 → SHM → AI → SHM → 编码推流 → MediaMTX 完整链路已打通。代码在 <code>ptz100_ros</code> 节点（<code>src/app/</code>）中运行，与和普的 <code>ptz_service</code>、激光的 <code>laser_service</code> 并行，FFmpeg 旧代码暂保留未删除。</p>
+</blockquote>
+<h3 id="32-ptz">3.2 和普 PTZ（新架构）</h3>
+<table>
+<thead>
+<tr>
+<th>属性</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>配置类型</strong></td>
+<td><code>PTZ_HEPU</code> (三型非制冷)、<code>PTZ_HEPU_COOLED</code> (四型制冷)</td>
+</tr>
+<tr>
+<td><strong>代码入口</strong></td>
+<td><code>ros_ws/src/ptz_service/</code> → <code>PtzDeviceHepu</code></td>
+</tr>
+<tr>
+<td><strong>视频协议</strong></td>
+<td>RTSP 拉流（设备自带 RTSP 服务）</td>
+</tr>
+<tr>
+<td><strong>可见光 URL</strong></td>
+<td><code>rtsp://admin:Abc.12345@&lt;ip&gt;:554/ch0/stream1</code>（1920x1080, H264, 4Mbps）</td>
+</tr>
+<tr>
+<td><strong>红外 URL</strong></td>
+<td><code>rtsp://admin:Abc.12345@&lt;ip&gt;:554/ch1/stream1</code>（640x512, H264, 2Mbps）</td>
+</tr>
+<tr>
+<td><strong>控制协议</strong></td>
+<td>和普 HTTP/SDK API <code>ptz_hepu.h</code>，AI 结果通过 UDP 回传设备 <code>PtzHepuSmart</code></td>
+</tr>
+<tr>
+<td><strong>解码方式</strong></td>
+<td><code>GstSourceDecode</code>：<code>uridecodebin</code> → <code>nvvidconv</code> → <code>appsink</code> (RGB)</td>
+</tr>
+<tr>
+<td><strong>AI 传图</strong></td>
+<td>共享内存写入原始帧，AI 处理后写入结果帧</td>
+</tr>
+<tr>
+<td><strong>推流方式</strong></td>
+<td><code>visiblePushThread</code> / <code>thermalPushThread</code> → <code>GstRtspClient</code> → UDP RTP → MediaMTX</td>
+</tr>
+</tbody>
+</table>
+<p><strong>视频处理数据流：</strong></p>
+<pre><code class="language-mermaid">flowchart LR
+    subgraph 拉流解码
+        URL[&quot;RTSP URL&quot;] --&gt; DEC[GstSourceDecode] --&gt; SHM_RAW[SHM 原始帧]
+    end
+    subgraph AI处理
+        SHM_RAW --&gt; AI[ptz100_ai] --&gt; SHM_AI[SHM 结果帧]
+    end
+    subgraph 编码推流
+        SHM_AI --&gt; ENC[GstRtspClient] --&gt; MTX[&quot;MediaMTX&quot;] --&gt; CLIENT[客户端]
+    end
+</code></pre>
+<p><strong>组件清单：</strong></p>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>数量</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GstSourceDecode</code></td>
+<td>2</td>
+<td>可见光解码器 + 红外解码器</td>
+</tr>
+<tr>
+<td><code>GstRtspClient</code>（原始流）</td>
+<td>2</td>
+<td>调试用原始流推流</td>
+</tr>
+<tr>
+<td><code>GstRtspClient</code>（处理后流）</td>
+<td>2</td>
+<td>AI 处理后流推流</td>
+</tr>
+<tr>
+<td><code>ShmTransferFrame</code></td>
+<td>4</td>
+<td>可见光/红外 x 原始/AI 结果</td>
+</tr>
+<tr>
+<td><code>PtzHepuSmart</code></td>
+<td>1</td>
+<td>AI 检测结果回传和普设备</td>
+</tr>
+</tbody>
+</table>
+<h3 id="33-ptz">3.3 激光 PTZ（新架构）</h3>
+<table>
+<thead>
+<tr>
+<th>属性</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>配置类型</strong></td>
+<td><code>PTZ_HEF100</code>、<code>PTZ_HEP10</code>、<code>PTZ_HEP21</code></td>
+</tr>
+<tr>
+<td><strong>代码入口</strong></td>
+<td><code>ros_ws/src/laser_service/</code> → <code>LaserDeviceHe</code></td>
+</tr>
+<tr>
+<td><strong>视频协议</strong></td>
+<td>SDK JPEG 回调（非 RTSP 拉流）</td>
+</tr>
+<tr>
+<td><strong>相机通道</strong></td>
+<td>zoom0（粗跟踪）、zoom1（精跟踪）、infrared（红外）</td>
+</tr>
+<tr>
+<td><strong>分辨率</strong></td>
+<td>512x512（各通道）</td>
+</tr>
+<tr>
+<td><strong>控制协议</strong></td>
+<td><code>LaserHe</code> SDK，支持出光打击、照明、红外切换</td>
+</tr>
+<tr>
+<td><strong>解码方式</strong></td>
+<td><code>cv::imdecode</code> JPEG 软解 → RGB</td>
+</tr>
+<tr>
+<td><strong>AI 传图</strong></td>
+<td>共享内存 <code>ShmTransferFrame shmApi_[3]</code></td>
+</tr>
+<tr>
+<td><strong>推流方式</strong></td>
+<td><code>GstRtspClient</code> x3 → UDP RTP → MediaMTX</td>
+</tr>
+</tbody>
+</table>
+<p><strong>视频处理数据流：</strong></p>
+<pre><code class="language-mermaid">flowchart LR
+    subgraph 接收解码
+        SDK[LaserHe SDK] --&gt; DEC[&quot;cv::imdecode&quot;]
+    end
+    subgraph AI处理
+        DEC --&gt; SHM_RAW[SHM 原始帧] --&gt; AI[ptz100_ai]
+    end
+    subgraph 编码推流
+        DEC --&gt;|原始帧直推| ENC[GstRtspClient x3] --&gt; MTX[&quot;MediaMTX&quot;] --&gt; CLIENT[客户端]
+    end
+</code></pre>
+<blockquote>
+<p><strong>注意</strong>：激光 PTZ 当前推流的是解码后的原始帧（非 AI 处理后帧），AI 结果帧尚未接入推流链路。</p>
+</blockquote>
+<hr />
+<h2 id="ffmpeg-gstreamer">四、视频框架演进：FFmpeg → GStreamer</h2>
+<h3 id="41">4.1 新旧架构对照</h3>
+<p>项目视频处理经历了从 FFmpeg 到 GStreamer 的演进。耐杰 PTZ 最早使用 FFmpeg 实现，后续新增的和普 PTZ 与激光 PTZ 全部采用 GStreamer（gstNvDeeps）架构。当前耐杰的拉流解码和编码推流已从 FFmpeg 切换到 GStreamer（<code>GstSourceDecode</code> + <code>GstRtspClient</code>），三类设备均使用 GStreamer 框架，FFmpeg 旧代码暂保留未删除。</p>
+<pre><code class="language-mermaid">flowchart TD
+    subgraph 旧架构 - FFmpeg
+        direction LR
+        FF_CODE[代码&lt;br/&gt;src/app/ptz/ffmpeg/]
+        FF_LIB[三方库&lt;br/&gt;thirdpart/ffmpeg/]
+        FF_DEV[适用设备&lt;br/&gt;耐杰 PTZ]
+    end
+
+    subgraph 新架构 - GStreamer
+        direction LR
+        GST_CODE[代码&lt;br/&gt;public/gstNvDeeps/]
+        GST_LIB[三方库&lt;br/&gt;thirdpart/gstreamer-1.0/]
+        GST_DEV[适用设备&lt;br/&gt;耐杰 / 和普 / 激光 PTZ]
+    end
+
+    旧架构 -.-&gt;|已切换| 新架构
+</code></pre>
+<h3 id="42">4.2 代码与依赖对照</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>FFmpeg（旧）</th>
+<th>GStreamer（新）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>业务代码</strong></td>
+<td><code>src/app/ptz/ffmpeg/</code></td>
+<td><code>public/gstNvDeeps/</code></td>
+</tr>
+<tr>
+<td><strong>三方库</strong></td>
+<td><code>thirdpart/ffmpeg/</code>（含 x86 和 aarch64）</td>
+<td><code>thirdpart/gstreamer-1.0/</code></td>
+</tr>
+<tr>
+<td><strong>核心类</strong></td>
+<td><code>FfmpegService</code>、<code>CEncodecBase</code>、<code>CDecodecBase</code>、<code>AvH264</code>、<code>NvEncodec</code>、<code>NvDecodec</code></td>
+<td><code>GstSourceDecode</code>、<code>GstRtspClient</code>、<code>GstRtspServer</code></td>
+</tr>
+<tr>
+<td><strong>使用设备</strong></td>
+<td>耐杰 PTZ（早期）</td>
+<td>耐杰 PTZ、和普 PTZ、激光 PTZ（当前）</td>
+</tr>
+</tbody>
+</table>
+<h3 id="43-ffmpeg">4.3 FFmpeg 旧架构组件</h3>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>类</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ffmpegservice.h/cpp</code></td>
+<td><code>FfmpegService</code></td>
+<td>拉流主服务：RTSP 拉流、解码、帧回调、RTMP 推流</td>
+</tr>
+<tr>
+<td><code>CodecBase.h</code></td>
+<td><code>CEncodecBase</code> / <code>CDecodecBase</code></td>
+<td>编解码器抽象基类</td>
+</tr>
+<tr>
+<td><code>NvEncodec.h/cpp</code></td>
+<td><code>NvEncodec</code></td>
+<td>NVIDIA 硬件 H264 编码（基于 FFmpeg <code>h264_nvenc</code>）</td>
+</tr>
+<tr>
+<td><code>NvDecodec.h/cpp</code></td>
+<td><code>NvDecodec</code></td>
+<td>NVIDIA 硬件 H264 解码（基于 FFmpeg <code>h264_cuvid</code>）</td>
+</tr>
+<tr>
+<td><code>AvH264.h/cpp</code></td>
+<td><code>AvH264</code></td>
+<td>H264 软编码/软解码封装</td>
+</tr>
+<tr>
+<td><code>CodecUtils.h/cpp</code></td>
+<td>—</td>
+<td>编解码工具函数</td>
+</tr>
+</tbody>
+</table>
+<p><strong>FFmpeg 拉流流程：</strong></p>
+<pre><code class="language-mermaid">flowchart LR
+    RTSP[RTSP 源] --&gt;|avformat_open_input| FMT[AVFormatContext]
+    FMT --&gt;|av_read_frame| PKT[AVPacket]
+    PKT --&gt;|&quot;NvDecodec::DoDecode&quot;| FRM[AVFrame]
+    FRM --&gt;|AVFrameToCvMat| MAT[&quot;cv::Mat RGB&quot;]
+    MAT --&gt;|回调| APP[业务层 / SHM]
+</code></pre>
+<h3 id="44-gstreamer">4.4 GStreamer 新架构组件</h3>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>类</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>gstSourceDecode.h/cpp</code></td>
+<td><code>GstSourceDecode</code></td>
+<td>拉流解码：RTSP/文件 → NVDEC 硬解 → RGB 帧回调</td>
+</tr>
+<tr>
+<td><code>gstRtspClient.h/cpp</code></td>
+<td><code>GstRtspClient</code></td>
+<td>编码推流：RGB 帧 → H264 硬编码 → RTP/UDP 推流</td>
+</tr>
+<tr>
+<td><code>gstCloudPusher.h/cpp</code></td>
+<td><code>GstCloudPusher</code></td>
+<td>云端推流：RTSP 拉流 → 免转码重封装 → RTMP 推流（见第十四章）</td>
+</tr>
+<tr>
+<td><code>gstRtspServer.h/cpp</code></td>
+<td><code>GstRtspServer</code></td>
+<td>RTSP 服务端（已被 MediaMTX 替代）</td>
+</tr>
+</tbody>
+</table>
+<p><strong>GStreamer 拉流流程：</strong></p>
+<pre><code class="language-mermaid">flowchart LR
+    RTSP[RTSP 源] --&gt;|uridecodebin| AUTO[自动协商&lt;br/&gt;解码器选择]
+    AUTO --&gt;|nvv4l2decoder| NVDEC[NVDEC 硬解]
+    NVDEC --&gt;|nvvidconv| CONV[格式转换]
+    CONV --&gt;|appsink| CB[onVideoFrameCb&lt;br/&gt;RGB 帧回调]
+    CB --&gt; APP[业务层 / SHM]
+</code></pre>
+<h3 id="45-ffmpeg-vs-gstreamer">4.5 FFmpeg vs GStreamer 对比</h3>
+<table>
+<thead>
+<tr>
+<th>对比维度</th>
+<th>FFmpeg（旧）</th>
+<th>GStreamer（新）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>架构模式</strong></td>
+<td>命令式 API，手动管理每一步</td>
+<td>Pipeline 管道模型，声明式组装</td>
+</tr>
+<tr>
+<td><strong>硬件加速</strong></td>
+<td>需手动指定 <code>h264_nvenc</code> / <code>h264_cuvid</code></td>
+<td><code>uridecodebin</code> 自动选择 NVDEC，<code>nvv4l2h264enc</code> 原生支持 Jetson</td>
+</tr>
+<tr>
+<td><strong>Jetson 适配</strong></td>
+<td>需额外编译适配 CUDA/NVENC</td>
+<td>NVIDIA 官方提供 DeepStream 插件，原生支持 <code>nvv4l2decoder</code> / <code>nvvidconv</code></td>
+</tr>
+<tr>
+<td><strong>线程管理</strong></td>
+<td>手动创建线程处理拉流/推流</td>
+<td>Pipeline 自动管理线程，各 Element 独立线程运行</td>
+</tr>
+<tr>
+<td><strong>错误恢复</strong></td>
+<td>手动检测超时 (<code>ffmpeg_interrupt_function_cbk</code>) 和重连</td>
+<td>Pipeline 状态机 + Bus 消息机制，自动重连和错误上报</td>
+</tr>
+<tr>
+<td><strong>内存管理</strong></td>
+<td>手动 <code>av_frame_alloc</code> / <code>av_frame_free</code>，易泄漏</td>
+<td>GstBuffer 引用计数自动管理，零拷贝传输</td>
+</tr>
+<tr>
+<td><strong>协议支持</strong></td>
+<td>RTSP/RTMP/文件</td>
+<td>RTSP/RTMP/HLS/WebRTC/SRT/文件（通过插件扩展）</td>
+</tr>
+<tr>
+<td><strong>推流能力</strong></td>
+<td>需手动拼装 <code>AVPacket</code> 推 RTMP</td>
+<td><code>appsrc</code> + Pipeline 自动处理编码和推流</td>
+</tr>
+<tr>
+<td><strong>代码量</strong></td>
+<td>~11 个文件，编解码/推流/拉流耦合</td>
+<td>3 个核心类，模块化清晰</td>
+</tr>
+<tr>
+<td><strong>跨平台</strong></td>
+<td>x86 / aarch64 需分别编译库</td>
+<td>Jetson 系统预装，<code>thirdpart/gstreamer-1.0</code> 统一</td>
+</tr>
+</tbody>
+</table>
+<h3 id="46-gstreamer">4.6 GStreamer 的核心优势</h3>
+<ol>
+<li><strong>Jetson 原生支持</strong>：NVIDIA DeepStream 基于 GStreamer，<code>nvv4l2decoder</code> / <code>nvv4l2h264enc</code> / <code>nvvidconv</code> 均为 Jetson 官方插件，硬件加速零配置</li>
+<li><strong>Pipeline 自动化</strong>：<code>uridecodebin</code> 自动协商协议、容器、编解码器，无需手动处理 <code>AVFormatContext</code> → <code>AVCodecContext</code> 链路</li>
+<li><strong>内存安全</strong>：GstBuffer 引用计数替代手动 <code>malloc/free</code>，历史上 FFmpeg 版本存在内存泄漏问题（代码中 <code>#define USE_NEW_VIDEO_API</code> 注释已指出）</li>
+<li><strong>模块化扩展</strong>：新增设备只需组装 Pipeline，不需要改动底层编解码逻辑</li>
+<li><strong>多协议输出</strong>：配合 MediaMTX 可同时输出 RTSP / HLS / WebRTC / SRT，FFmpeg 仅支持 RTMP 推流</li>
+</ol>
+<h3 id="47">4.7 当前状态</h3>
+<pre><code class="language-mermaid">flowchart LR
+    OLD[&quot;FFmpeg 旧代码&lt;br/&gt;（暂保留未删除）&quot;] --&gt;|&quot;已迁移&quot;| NJ
+
+    subgraph &quot;ptz100_ros（src/app/）&quot;
+        NJ[耐杰 PTZ&lt;br/&gt;GStreamer ✅]
+    end
+
+    subgraph &quot;ptz_service（ros_ws/）&quot;
+        HP[和普 PTZ&lt;br/&gt;GStreamer ✅]
+    end
+
+    subgraph &quot;laser_service（ros_ws/）&quot;
+        LZ[激光 PTZ&lt;br/&gt;GStreamer ✅]
+    end
+
+    style OLD fill:#f5f5f5,stroke:#ccc,stroke-dasharray: 5 5
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>设备</th>
+<th>视频框架</th>
+<th>ROS2 节点</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>耐杰 PTZ</td>
+<td>GStreamer ✅</td>
+<td><code>ptz100_ros</code>（<code>src/app/</code>）</td>
+<td>已从 FFmpeg 切换到 GStreamer</td>
+</tr>
+<tr>
+<td>和普 PTZ</td>
+<td>GStreamer ✅</td>
+<td><code>ptz_service</code>（<code>ros_ws/</code>）</td>
+<td>工厂模式</td>
+</tr>
+<tr>
+<td>激光 PTZ</td>
+<td>GStreamer ✅</td>
+<td><code>laser_service</code>（<code>ros_ws/</code>）</td>
+<td>工厂模式</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>耐杰后续两种方案</strong>：<br />
+1. <strong>保持现状</strong>：当前 <code>ptz100_ros</code> 节点功能完整，拉流/解码/AI/推流链路已从 FFmpeg 切换到 GStreamer，可继续运行<br />
+2. <strong>迁入 ptz_service</strong>：将耐杰设备纳入 ROS2 统一架构，实现 <code>PtzDeviceNaijie</code> 子类，与和普/激光共用工厂模式和代码结构</p>
+</blockquote>
+<hr />
+<h2 id="gstreamer">五、GStreamer 组件串联详解</h2>
+<h3 id="51-ptz">5.1 端到端完整流程（和普 PTZ）</h3>
+<p>和普 PTZ 是最完整的 GStreamer 流程，涵盖「拉流解码 → SHM 传图 → AI 处理 → SHM 回传 → 编码推流 → MediaMTX 分发」全链路。</p>
+<pre><code class="language-mermaid">flowchart LR
+    subgraph 和普PTZ设备
+        DEV_V[&quot;可见光 RTSP 1920x1080&quot;]
+        DEV_T[&quot;红外 RTSP 640x512&quot;]
+    end
+
+    subgraph GstSourceDecode x2
+        URI[uridecodebin] --&gt; NVC[nvvidconv] --&gt; FLT[&quot;capsfilter BGRx&quot;] --&gt; CVT[videoconvert] --&gt; SINK[appsink]
+    end
+
+    subgraph SHM原始帧
+        SHM_V[可见光]
+        SHM_T[红外]
+    end
+
+    subgraph AI
+        AI_P[ptz100_ai&lt;br/&gt;检测+OSD]
+    end
+
+    subgraph SHM结果帧
+        SHM_AV[可见光AI帧]
+        SHM_AT[红外AI帧]
+    end
+
+    subgraph GstRtspClient x2
+        SRC[appsrc] --&gt; CVT2[videoconvert] --&gt; NVC2[nvvidconv] --&gt; ENC[nvv4l2h264enc] --&gt; PAY[rtph264pay] --&gt; UDP[&quot;udpsink :5410/5411&quot;]
+    end
+
+    subgraph MediaMTX
+        MTX[&quot;RTSP :9554&quot;]
+    end
+
+    DEV_V &amp; DEV_T --&gt; URI
+    SINK --&gt; SHM_V &amp; SHM_T
+    SHM_V &amp; SHM_T --&gt; AI_P
+    AI_P --&gt; SHM_AV &amp; SHM_AT
+    SHM_AV &amp; SHM_AT --&gt;|pushFrame| SRC
+    UDP --&gt; MTX
+</code></pre>
+<h3 id="52-ptz">5.2 端到端完整流程（激光 PTZ）</h3>
+<p>激光 PTZ 不使用 RTSP 拉流，而是通过 SDK JPEG 回调获取图像，使用 JPEG 专用管道编码推流。</p>
+<pre><code class="language-mermaid">flowchart LR
+    subgraph LaserHe SDK
+        CAM0[zoom0 粗跟踪]
+        CAM1[zoom1 精跟踪]
+        CAM2[infrared 红外]
+    end
+
+    subgraph 回调+SHM
+        DEC[onCameraJpegCb]
+        SHM[SHM x3]
+    end
+
+    subgraph GstRtspClient JPEG管道 x3
+        SRC_J[appsrc JPEG] --&gt; JDEC[nvjpegdec] --&gt; NVC_J[nvvidconv] --&gt; ENC_J[nvv4l2h264enc] --&gt; PAY_J[rtph264pay] --&gt; UDP_J[&quot;udpsink :5400-5402&quot;]
+    end
+
+    subgraph MediaMTX
+        MTX[&quot;RTSP :9554&quot;]
+    end
+
+    CAM0 &amp; CAM1 &amp; CAM2 --&gt; DEC
+    DEC --&gt; SHM
+    DEC --&gt;|pushFrame| SRC_J
+    UDP_J --&gt; MTX
+</code></pre>
+<h3 id="53-gstsourcedecode-element">5.3 GstSourceDecode 解码管道 Element 详解</h3>
+<p>从代码 <code>createSourceDecodePipeline()</code> 中提取的实际管道结构：</p>
+<pre><code class="language-mermaid">flowchart LR
+    subgraph uridecodebin 自动解码
+        URI[&quot;uridecodebin&lt;br/&gt;uri=rtsp://...&lt;br/&gt;自动选择解码器&quot;]
+        NVD[nvv4l2decoder&lt;br/&gt;NVDEC 硬解码&lt;br/&gt;drop-frame-interval]
+        URI -.-&gt;|child-added&lt;br/&gt;自动创建| NVD
+    end
+
+    NVC[nvvidconv&lt;br/&gt;GPU 格式转换&lt;br/&gt;NVMM→CPU BGRx]
+    FLT[capsfilter&lt;br/&gt;video/x-raw&lt;br/&gt;format=BGRx&lt;br/&gt;宽高可选缩放]
+    CVT[videoconvert&lt;br/&gt;BGRx→RGB&lt;br/&gt;n-threads=2]
+    SINK[appsink&lt;br/&gt;RGB 帧回调&lt;br/&gt;sync=FALSE&lt;br/&gt;max-buffers=5&lt;br/&gt;drop=TRUE]
+
+    URI ==&gt;|pad-added&lt;br/&gt;动态链接 NVMM| NVC
+    NVC --&gt; FLT --&gt; CVT --&gt; SINK
+</code></pre>
+<p><strong>关键配置参数：</strong></p>
+<table>
+<thead>
+<tr>
+<th>Element</th>
+<th>参数</th>
+<th>值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>uridecodebin</code></td>
+<td>uri</td>
+<td>RTSP/RTMP/文件 URL</td>
+<td>自动协商协议和解码器</td>
+</tr>
+<tr>
+<td><code>nvv4l2decoder</code></td>
+<td>drop-frame-interval</td>
+<td>可配置</td>
+<td>丢帧间隔，降低 CPU 负载</td>
+</tr>
+<tr>
+<td><code>nvvidconv</code></td>
+<td>—</td>
+<td>—</td>
+<td>GPU 上 NVMM → CPU 内存格式转换</td>
+</tr>
+<tr>
+<td><code>capsfilter</code></td>
+<td>caps</td>
+<td><code>video/x-raw,format=BGRx[,width=W,height=H]</code></td>
+<td>GPU 输出 BGRx 降低延迟，可选缩放</td>
+</tr>
+<tr>
+<td><code>videoconvert</code></td>
+<td>n-threads</td>
+<td>2</td>
+<td>BGRx→RGB 轻量转换，多线程</td>
+</tr>
+<tr>
+<td><code>appsink</code></td>
+<td>emit-signals</td>
+<td>TRUE</td>
+<td>启用 new-sample 信号</td>
+</tr>
+<tr>
+<td><code>appsink</code></td>
+<td>sync</td>
+<td>FALSE</td>
+<td>禁用时钟同步，降低延迟</td>
+</tr>
+<tr>
+<td><code>appsink</code></td>
+<td>async</td>
+<td>FALSE</td>
+<td>禁用异步，防止帧乱序</td>
+</tr>
+<tr>
+<td><code>appsink</code></td>
+<td>max-buffers</td>
+<td>5</td>
+<td>最大缓存 5 帧</td>
+</tr>
+<tr>
+<td><code>appsink</code></td>
+<td>drop</td>
+<td>TRUE</td>
+<td>缓冲满时丢旧帧</td>
+</tr>
+</tbody>
+</table>
+<h3 id="54-gstrtspclient-element">5.4 GstRtspClient 编码推流管道 Element 详解</h3>
+<p><code>GstRtspClient</code> 根据输入源类型选择不同管道：</p>
+<p><strong>管道 A：RGB/GRAY8 原始图像输入</strong>（和普 PTZ 使用）</p>
+<pre><code class="language-mermaid">flowchart LR
+    SRC_A[appsrc&lt;br/&gt;RGB 帧输入&lt;br/&gt;is-live=TRUE&lt;br/&gt;do-timestamp=TRUE&lt;br/&gt;max-buffers=5]
+    CVT_A[videoconvert&lt;br/&gt;RGB→BGRx&lt;br/&gt;n-threads=2]
+    NVC_A[nvvidconv&lt;br/&gt;CPU→GPU&lt;br/&gt;BGRx→NV12]
+    FLT_A[capsfilter&lt;br/&gt;NV12 NVMM&lt;br/&gt;宽高可选缩放]
+    ENC_A[nvv4l2h264enc&lt;br/&gt;H264 硬编码&lt;br/&gt;bitrate=4Mbps&lt;br/&gt;preset=UltraFast&lt;br/&gt;maxperf=TRUE]
+    PAR_A[h264parse&lt;br/&gt;插入 SPS/PPS&lt;br/&gt;config-interval=-1]
+    PAY_A[rtph264pay&lt;br/&gt;RTP 封装&lt;br/&gt;pt=96]
+    UDP_A[udpsink&lt;br/&gt;UDP 发送&lt;br/&gt;buffer-size=1MB&lt;br/&gt;sync=FALSE]
+
+    SRC_A --&gt; CVT_A --&gt; NVC_A --&gt; FLT_A --&gt; ENC_A --&gt; PAR_A --&gt; PAY_A --&gt; UDP_A
+</code></pre>
+<p><strong>管道 B：JPEG 图像输入</strong>（激光 PTZ 使用）</p>
+<pre><code class="language-mermaid">flowchart LR
+    SRC_B[appsrc&lt;br/&gt;JPEG 帧输入&lt;br/&gt;is-live=TRUE&lt;br/&gt;do-timestamp=TRUE&lt;br/&gt;max-buffers=5]
+    JDEC_B[nvjpegdec&lt;br/&gt;GPU JPEG 硬解&lt;br/&gt;JPEG→NVMM]
+    NVC_B[nvvidconv&lt;br/&gt;GPU 格式转换&lt;br/&gt;→NV12]
+    FLT_B[capsfilter&lt;br/&gt;NV12 NVMM&lt;br/&gt;宽高可选缩放]
+    ENC_B[nvv4l2h264enc&lt;br/&gt;H264 硬编码&lt;br/&gt;bitrate=4Mbps&lt;br/&gt;preset=UltraFast]
+    PAR_B[h264parse&lt;br/&gt;插入 SPS/PPS&lt;br/&gt;config-interval=-1]
+    PAY_B[rtph264pay&lt;br/&gt;RTP 封装&lt;br/&gt;pt=96]
+    UDP_B[udpsink&lt;br/&gt;UDP 发送&lt;br/&gt;buffer-size=1MB&lt;br/&gt;sync=FALSE]
+
+    SRC_B --&gt; JDEC_B --&gt; NVC_B --&gt; FLT_B --&gt; ENC_B --&gt; PAR_B --&gt; PAY_B --&gt; UDP_B
+</code></pre>
+<p><strong>关键配置参数：</strong></p>
+<table>
+<thead>
+<tr>
+<th>Element</th>
+<th>参数</th>
+<th>值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>appsrc</code></td>
+<td>is-live</td>
+<td>TRUE</td>
+<td>实时流模式</td>
+</tr>
+<tr>
+<td><code>appsrc</code></td>
+<td>do-timestamp</td>
+<td>TRUE</td>
+<td>自动生成时间戳</td>
+</tr>
+<tr>
+<td><code>appsrc</code></td>
+<td>max-buffers</td>
+<td>5</td>
+<td>最大缓存帧数</td>
+</tr>
+<tr>
+<td><code>nvv4l2h264enc</code></td>
+<td>bitrate</td>
+<td>4000000 (默认)</td>
+<td>编码码率 bps</td>
+</tr>
+<tr>
+<td><code>nvv4l2h264enc</code></td>
+<td>preset-level</td>
+<td>1 (UltraFast)</td>
+<td>编码速度预设</td>
+</tr>
+<tr>
+<td><code>nvv4l2h264enc</code></td>
+<td>iframeinterval</td>
+<td>30</td>
+<td>I 帧间隔</td>
+</tr>
+<tr>
+<td><code>nvv4l2h264enc</code></td>
+<td>insert-sps-pps</td>
+<td>TRUE</td>
+<td>每个 IDR 帧前插入参数集</td>
+</tr>
+<tr>
+<td><code>nvv4l2h264enc</code></td>
+<td>maxperf-enable</td>
+<td>TRUE</td>
+<td>启用最大性能模式</td>
+</tr>
+<tr>
+<td><code>h264parse</code></td>
+<td>config-interval</td>
+<td>-1</td>
+<td>每个 I 帧插入 SPS/PPS</td>
+</tr>
+<tr>
+<td><code>rtph264pay</code></td>
+<td>pt</td>
+<td>96</td>
+<td>RTP Payload Type</td>
+</tr>
+<tr>
+<td><code>udpsink</code></td>
+<td>sync</td>
+<td>FALSE</td>
+<td>禁用时钟同步，实时发送</td>
+</tr>
+<tr>
+<td><code>udpsink</code></td>
+<td>buffer-size</td>
+<td>1048576</td>
+<td>1MB 发送缓冲区</td>
+</tr>
+</tbody>
+</table>
+<h3 id="55-jetson-vs-x86">5.5 Jetson 硬件加速 vs x86 软件回退</h3>
+<p><code>GstRtspClient</code> 根据平台自动切换编码管道。当前项目运行在 Jetson AGX 平台，默认使用硬件加速编码；x86 软件编码路径作为预留，用于不具备硬件加速条件的环境：</p>
+<pre><code class="language-mermaid">flowchart LR
+    subgraph Jetson AGX 硬件加速
+        direction LR
+        A1[appsrc] --&gt; A2[videoconvert] --&gt; A3[nvvidconv&lt;br/&gt;CPU→GPU NVMM]
+        A3 --&gt; A4[capsfilter&lt;br/&gt;NV12 NVMM] --&gt; A5[nvv4l2h264enc&lt;br/&gt;硬件编码]
+        A5 --&gt; A6[h264parse] --&gt; A7[rtph264pay] --&gt; A8[udpsink]
+    end
+
+    subgraph x86 软件编码
+        direction LR
+        B1[appsrc] --&gt; B2[videoconvert]
+        B2 --&gt; B4[capsfilter&lt;br/&gt;I420] --&gt; B5[x264enc&lt;br/&gt;软件编码]
+        B5 --&gt; B6[h264parse] --&gt; B7[rtph264pay] --&gt; B8[udpsink]
+    end
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>对比</th>
+<th>Jetson 硬件</th>
+<th>x86 软件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>格式转换</td>
+<td><code>nvvidconv</code> (GPU)</td>
+<td>无（<code>videoconvert</code> 直出 I420）</td>
+</tr>
+<tr>
+<td>中间格式</td>
+<td><code>NV12 (memory:NVMM)</code></td>
+<td><code>I420</code></td>
+</tr>
+<tr>
+<td>H264 编码</td>
+<td><code>nvv4l2h264enc</code></td>
+<td><code>x264enc</code></td>
+</tr>
+<tr>
+<td>H265 编码</td>
+<td><code>nvv4l2h265enc</code></td>
+<td><code>x265enc</code></td>
+</tr>
+<tr>
+<td>JPEG 解码</td>
+<td><code>nvjpegdec</code> (GPU)</td>
+<td><code>jpegdec</code> (CPU)</td>
+</tr>
+<tr>
+<td>CPU 占用</td>
+<td>极低（GPU 卸载）</td>
+<td>较高</td>
+</tr>
+</tbody>
+</table>
+<h3 id="56">5.6 管道生命周期与自动重连</h3>
+<pre><code class="language-mermaid">stateDiagram-v2
+    [*] --&gt; start: start() 启动
+    start --&gt; workerThread: 创建工作线程
+
+    state workerThread {
+        [*] --&gt; createPipeline: 创建 Pipeline
+        createPipeline --&gt; PLAYING: gst_element_set_state(PLAYING)
+        PLAYING --&gt; g_main_loop_run: 进入 GMainLoop
+        g_main_loop_run --&gt; ERROR: Bus 收到 ERROR
+        g_main_loop_run --&gt; EOS: Bus 收到 EOS
+        ERROR --&gt; cleanup: 清理资源
+        EOS --&gt; cleanup: 清理资源
+        cleanup --&gt; sleep5s: sleep(5000ms)
+        sleep5s --&gt; createPipeline: 重新创建
+    }
+
+    workerThread --&gt; [*]: stop() threadRunFlag_=false
+</code></pre>
+<ul>
+<li><code>GstSourceDecode</code> 和 <code>GstRtspClient</code> 均采用 <code>workerTaskLoopForever()</code> 循环</li>
+<li>Pipeline 异常（ERROR/EOS）后自动清理并等待 5 秒（解码）/ 2 秒（推流）重建</li>
+<li>通过 <code>GstBus</code> 监听 <code>GST_MESSAGE_ERROR</code> / <code>GST_MESSAGE_EOS</code> / <code>GST_MESSAGE_WARNING</code> 实现状态管理</li>
+</ul>
+<hr />
+<h2 id="_4">六、共享内存传输</h2>
+<h3 id="61-shm">6.1 SHM 通道定义</h3>
+<table>
+<thead>
+<tr>
+<th>SHM 名称</th>
+<th>方向</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SHM_TRANSFER_ZOOM_CAMERA0</code></td>
+<td>设备 → AI</td>
+<td>可见光原始帧</td>
+</tr>
+<tr>
+<td><code>SHM_TRANSFER_INFRARED_CAMERA0</code></td>
+<td>设备 → AI</td>
+<td>红外原始帧</td>
+</tr>
+<tr>
+<td><code>SHM_TRANSFER_AI_RESULT_ZOOM_CAMERA0</code></td>
+<td>AI → 推流</td>
+<td>可见光 AI 处理结果帧</td>
+</tr>
+<tr>
+<td><code>SHM_TRANSFER_AI_RESULT_INFRARED_CAMERA0</code></td>
+<td>AI → 推流</td>
+<td>红外 AI 处理结果帧</td>
+</tr>
+</tbody>
+</table>
+<h3 id="62">6.2 工作原理</h3>
+<pre><code class="language-mermaid">sequenceDiagram
+    participant DEV as 设备解码线程
+    participant SHM as ShmTransferFrame
+    participant AI as ptz100_ai
+    participant PUSH as 推流线程
+
+    DEV-&gt;&gt;SHM: writeFrame(原始帧)
+    AI-&gt;&gt;SHM: readFrame(原始帧)
+    AI-&gt;&gt;AI: 推理 + OSD 叠加
+    AI-&gt;&gt;SHM: writeFrame(结果帧)
+    PUSH-&gt;&gt;SHM: readFrame(结果帧)
+    PUSH-&gt;&gt;PUSH: GstRtspClient::pushFrame()
+</code></pre>
+<hr />
+<h2 id="mediamtx">七、MediaMTX 流媒体服务</h2>
+<h3 id="71">7.1 服务配置</h3>
+<p>MediaMTX 接收来自 <code>GstRtspClient</code> 的 UDP RTP 流，对外提供多种协议访问。当前项目<strong>主要使用 RTSP 协议</strong>，其余协议为 MediaMTX 默认开启但未主动使用：</p>
+<table>
+<thead>
+<tr>
+<th>协议</th>
+<th>端口</th>
+<th>当前使用</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RTSP</td>
+<td>9554</td>
+<td><strong>主要使用</strong></td>
+<td>客户端拉流播放</td>
+</tr>
+<tr>
+<td>RTMP</td>
+<td>1935</td>
+<td>未使用</td>
+<td>兼容旧播放器（默认开启）</td>
+</tr>
+<tr>
+<td>HLS</td>
+<td>8888</td>
+<td>未使用</td>
+<td>低延迟 HLS（默认开启）</td>
+</tr>
+<tr>
+<td>WebRTC</td>
+<td>8889</td>
+<td>未使用</td>
+<td>超低延迟 Web 端（默认开启）</td>
+</tr>
+<tr>
+<td>SRT</td>
+<td>8890</td>
+<td>未使用</td>
+<td>安全可靠传输（默认开启）</td>
+</tr>
+</tbody>
+</table>
+<h3 id="72">7.2 路径映射</h3>
+<table>
+<thead>
+<tr>
+<th>播放路径</th>
+<th>UDP 源端口</th>
+<th>所属设备</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ptz/zoom/ch0</code></td>
+<td>5410</td>
+<td>和普/耐杰 PTZ</td>
+<td>可见光（AI 处理后）</td>
+</tr>
+<tr>
+<td><code>ptz/ir/ch0</code></td>
+<td>5411</td>
+<td>和普/耐杰 PTZ</td>
+<td>红外（AI 处理后）</td>
+</tr>
+<tr>
+<td><code>laser/zoom/ch0</code></td>
+<td>5400</td>
+<td>激光 PTZ</td>
+<td>粗跟踪可见光</td>
+</tr>
+<tr>
+<td><code>laser/zoom/ch1</code></td>
+<td>5401</td>
+<td>激光 PTZ</td>
+<td>精跟踪可见光</td>
+</tr>
+<tr>
+<td><code>laser/ir/ch0</code></td>
+<td>5402</td>
+<td>激光 PTZ</td>
+<td>红外</td>
+</tr>
+<tr>
+<td><code>test/ch0</code></td>
+<td>5420</td>
+<td>测试</td>
+<td>测试流</td>
+</tr>
+</tbody>
+</table>
+<p><strong>播放示例：</strong></p>
+<pre><code class="language-bash"># 和普 PTZ 可见光
+gst-launch-1.0 playbin uri=&quot;rtsp://127.0.0.1:9554/ptz/zoom/ch0&quot;
+
+# 激光 PTZ 粗跟踪
+gst-launch-1.0 playbin uri=&quot;rtsp://127.0.0.1:9554/laser/zoom/ch0&quot;
+</code></pre>
+<hr />
+<h2 id="_5">八、控制链路</h2>
+<p>除视频流处理外，PTZ 设备还需接收<strong>控制指令</strong>（引导、跟踪、转台运动、镜头变焦/对焦等）。控制链路与视频链路分离：指令经 ROS2 Topic 或 Alink/以太网下发，由对应节点转成设备协议后发送给设备。</p>
+<h3 id="81-ros2-topic">8.1 控制指令统一接口（ROS2 Topic）</h3>
+<p>上层（融合、显控、算法等）通过以下 ROS2 Topic 下发 PTZ 控制，各 PTZ 节点订阅后转成各自设备协议：</p>
+<table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>类型</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/ptz_guidance_cmd</code></td>
+<td>PtzGuidanceCmd</td>
+<td>引导控制（指向目标方位/俯仰）</td>
+</tr>
+<tr>
+<td><code>/ptz_track_cmd</code></td>
+<td>PtzTrackCmd</td>
+<td>跟踪控制</td>
+</tr>
+<tr>
+<td><code>/ptz_motion_cmd</code></td>
+<td>PtzMotionCmd</td>
+<td>转台运动（水平/俯仰速度等）</td>
+</tr>
+<tr>
+<td><code>/ptz_lens_cmd</code></td>
+<td>PtzLensCmd</td>
+<td>镜头控制（变焦、对焦、光圈）</td>
+</tr>
+<tr>
+<td><code>/ptz_manual_lock_target_cmd</code></td>
+<td>PtzManualLockTargetCmd</td>
+<td>手动锁定目标</td>
+</tr>
+<tr>
+<td><code>/ptz_switch_tracking_source_cmd</code></td>
+<td>PtzSwitchTrackingSourceCmd</td>
+<td>切换跟踪源（可见光/红外）</td>
+</tr>
+</tbody>
+</table>
+<p>AI 检测结果通过 <code>/visible_track</code>、<code>/infrared_track</code>（AiTargetInfo）下发，供设备实现跟踪闭环。</p>
+<h3 id="82">8.2 控制链路按设备分流</h3>
+<pre><code class="language-mermaid">flowchart LR
+    subgraph 上层
+        FUSION[融合/显控/算法]
+    end
+
+    subgraph ROS2 Topic
+        T1[&quot;/ptz_guidance_cmd&quot;]
+        T2[&quot;/ptz_track_cmd&quot;]
+        T3[&quot;/ptz_motion_cmd&quot;]
+        T4[&quot;/ptz_lens_cmd&quot;]
+    end
+
+    subgraph ptz100_ros
+        ROS_APP[ros_app 订阅]
+        ETH[eth_link_ptz&lt;br/&gt;耐杰以太网协议]
+    end
+
+    subgraph ptz_service
+        RS[RosService 订阅]
+        HEPU[PtzDeviceHepu&lt;br/&gt;和普 HTTP/SDK]
+    end
+
+    subgraph laser_service
+        LASER_RS[RosService 订阅]
+        LASER_HE[LaserDeviceHe&lt;br/&gt;LaserHe SDK]
+    end
+
+    FUSION --&gt; T1 &amp; T2 &amp; T3 &amp; T4
+    T1 &amp; T2 &amp; T3 &amp; T4 --&gt; ROS_APP
+    T1 &amp; T2 &amp; T3 &amp; T4 --&gt; RS
+    T1 &amp; T2 &amp; T3 &amp; T4 --&gt; LASER_RS
+    ROS_APP --&gt;|ptz_protocol_msg_t&lt;br/&gt;NAIJIE_PTZ_CTRL_CMD_*| ETH
+    RS --&gt; HEPU
+    LASER_RS --&gt; LASER_HE
+    ETH --&gt;|UDP/以太网| NJ[耐杰 PTZ]
+    HEPU --&gt;|HTTP/TCP| HP[和普 PTZ]
+    LASER_HE --&gt;|SDK 通道| LZ[激光 PTZ]
+</code></pre>
+<h3 id="83">8.3 各设备控制实现概要</h3>
+<table>
+<thead>
+<tr>
+<th>设备</th>
+<th>节点</th>
+<th>订阅 Topic</th>
+<th>协议转换</th>
+<th>下发方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>耐杰 PTZ</td>
+<td><code>ptz100_ros</code></td>
+<td><code>/ptz_guidance_cmd</code>、<code>/ptz_track_cmd</code>、<code>/ptz_lens_cmd</code> 等</td>
+<td><code>ros_app</code> 回调 → <code>ptz_control</code>、<code>NAIJIE_PTZ_CTRL_CMD_*</code></td>
+<td><code>send_ptz_package()</code> → <code>eth_link_ptz</code> → 以太网至设备</td>
+</tr>
+<tr>
+<td>和普 PTZ</td>
+<td><code>ptz_service</code></td>
+<td>同上</td>
+<td><code>RosService::cb_*</code> → <code>PtzDeviceHepu::ctrlPtz*()</code></td>
+<td>和普 HTTP/SDK（<code>ptz_hepu_ctrl</code>）</td>
+</tr>
+<tr>
+<td>激光 PTZ</td>
+<td><code>laser_service</code></td>
+<td>同上</td>
+<td><code>RosService</code> → <code>LaserDeviceHe::ctrlPtz*()</code></td>
+<td>LaserHe SDK 控制通道</td>
+</tr>
+</tbody>
+</table>
+<h3 id="84">8.4 控制协议差异</h3>
+<p>三类设备底层控制协议不同，AGX 侧统一通过 ROS2 Topic 收口，再由各节点转换为设备私有协议。差异概要如下：</p>
+<table>
+<thead>
+<tr>
+<th>设备</th>
+<th>传输方式</th>
+<th>协议/代码位置</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>耐杰 PTZ</strong></td>
+<td>以太网 UDP/TCP</td>
+<td>自定义二进制协议，<code>src/srv/eth_link/ptz_protocol/</code></td>
+<td>包头 <code>0x8A808988</code>，命令字见 <code>PTZ_PROTOCOL_COMMANDS</code>；镜头控制为 <code>NAIJIE_PTZ_CTRL_CMD_*</code>（变焦/对焦点动、连动等）。<code>eth_link_ptz</code> 封装发送，<code>send_ptz_package()</code> 下发。</td>
+</tr>
+<tr>
+<td><strong>和普 PTZ</strong></td>
+<td>TCP</td>
+<td>和普私有协议，<code>iotDevices/ptzHepuSDK/</code>（<code>ptz_hepu_ctrl.h</code>）</td>
+<td>默认端口 <strong>39020</strong>（<code>HEPU_PTZ_TCP_PORT</code>）。<code>HepuPtzCtrl</code> 封装云台、镜头、跟踪、预置位、智能分析等；AI 检测结果通过 <strong>UDP 39080</strong> 回传设备。</td>
+</tr>
+<tr>
+<td><strong>激光 PTZ</strong></td>
+<td>UDP</td>
+<td>霍克眼 LaserHe 协议，<code>iotDevices/laserHeSDK/</code>（<code>laserHeCtrl.h</code> 等）</td>
+<td><code>LaserHeCtrl</code> 封装引导/跟踪/转台/镜头；另有激光器控制 <code>ctrlLaser()</code>、参数设置 <code>setParams()</code> 等。图像通过 <code>subscribeCameraJpeg</code> 回调，控制与状态通过同一 UDP 通道。</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>上层仅依赖统一 ROS2 接口；协议差异由各节点内部消化，新增设备时需实现对应协议转换与 SDK 封装。</p>
+</blockquote>
+<hr />
+<h2 id="_6">九、状态上报链路</h2>
+<p>各 PTZ 节点从设备读取状态后，通过 ROS2 Topic <strong>发布</strong>，供融合、显控等上层使用：</p>
+<table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>类型</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/ptz_status</code></td>
+<td>PtzStatus</td>
+<td>设备状态</td>
+</tr>
+<tr>
+<td><code>/ptz_lens_info</code></td>
+<td>PtzLensInfo</td>
+<td>镜头信息（变焦倍率、对焦等）</td>
+</tr>
+<tr>
+<td><code>/ptz_azimuth_pitch_info</code></td>
+<td>PtzAzimuthPitchInfo</td>
+<td>方位俯仰角</td>
+</tr>
+<tr>
+<td><code>/ptz_device_info</code></td>
+<td>PtzDeviceInfo</td>
+<td>设备信息</td>
+</tr>
+</tbody>
+</table>
+<p>数据流向：设备 → 节点（SDK/协议解析）→ 发布至上述 Topic → 上层订阅。</p>
+<hr />
+<h2 id="ptz-c2">十、PTZ 与上位机 C2 的交互链路</h2>
+<p>上位机 C2（指挥控制/显控）与 AGX 通过 <strong>Alink</strong> 协议在以太网上通信。<strong>当前 PTZ 与 C2 的交互均经由 ptz100_ros 节点所在进程</strong>：Alink 连接在 <code>c2_network</code> 中建立，设备列表与心跳由 <code>eth_link</code> 周期任务上报，C2 下发的 PTZ 查询/控制在同一进程的 Alink 命令处理中响应（<code>src/srv/alink/</code>、<code>src/srv/eth_link/</code>、<code>src/app/c2_network/</code> 均在 ptz100_ros 进程内）。</p>
+<h3 id="101-agx-c2">10.1 AGX → C2（上报）</h3>
+<p>与 PTZ 相关的上报均由 <strong>AGX 主设备</strong>（ptz100_ros 进程）发起，PTZ 作为子设备信息被包含在心跳/设备列表中。</p>
+<table>
+<thead>
+<tr>
+<th>msg_id</th>
+<th>含义</th>
+<th>数据来源 / 触发</th>
+<th>协议实现位置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>0xE5</strong></td>
+<td>AGX 主设备心跳（含子设备列表）</td>
+<td>AGX 主设备周期上报；<code>eth_link_task</code> → <code>send_slave_devices_info()</code> → <code>get_devices_online_info()</code>（汇总 TCP 子设备 + 耐杰/和普 PTZ）+ <code>alink_upload_heartbeat()</code>。列表中包含 PTZ 等子设备 SN、类型、IP、故障码（含码流状态）</td>
+<td><code>alink_system.cpp</code>：<code>heartbeat_data_package</code>、<code>alink_upload_heartbeat</code>；<code>eth_link.c</code>：<code>send_slave_devices_info</code></td>
+</tr>
+<tr>
+<td><strong>0xEB</strong></td>
+<td>设备列表</td>
+<td>同上，AGX 主设备上报 <code>alink_upload_device_list()</code>；内容与 0xE5 一致，格式为 <code>alink_device_list_t</code></td>
+<td><code>alink_system.cpp</code>：<code>system_device_list</code>、<code>alink_upload_device_list</code></td>
+</tr>
+<tr>
+<td><strong>0xEC</strong></td>
+<td>PTZ 详情（单设备 SN + 码流 URL 等）</td>
+<td>C2 请求 0x86 的响应；或 <code>ros_app</code>/AI 主动上报 <code>alink_upload_ptz_info()</code></td>
+<td><code>alink_system.cpp</code>：<code>system_get_ptz_info</code>、<code>alink_upload_ptz_info</code>；<code>ros_app.cpp</code> / <code>ai_main.cpp</code> 调用</td>
+</tr>
+</tbody>
+</table>
+<p>设备列表中的 PTZ 条目来源：<code>get_devices_online_info()</code>（<code>eth_link_server.c</code>）内会调用 <code>get_ptz_dev_info()</code>（耐杰）、<code>get_hepu_ptz_dev_info()</code>（和普），并将码流故障状态通过 <code>get_stream_push_status()</code> 填入 <code>fault</code> 字段（0x01 表示码流异常）。</p>
+<h3 id="102-c2-agx">10.2 C2 → AGX（下发）</h3>
+<table>
+<thead>
+<tr>
+<th>msg_id</th>
+<th>含义</th>
+<th>处理逻辑</th>
+<th>协议实现位置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>0x81</strong></td>
+<td>手选雷达目标（控制 PTZ 转向该目标搜索无人机）</td>
+<td>C2 下发用户选中的雷达目标（<code>user_track_target_t</code>：type、objid、坐标、SN 等），AGX 转成 <code>TRACK_INFO_FROM_USER</code> 通过 <code>msg_send_to_alg()</code> 送算法；算法据此驱动 PTZ 转向该方向并搜索/跟踪无人机目标</td>
+<td><code>alink_target.c</code>：<code>user_custom_track_target</code>、<code>alink_register_cmd(..., 0x81, ...)</code></td>
+</tr>
+<tr>
+<td><strong>0x86</strong></td>
+<td>查询 PTZ 设备信息</td>
+<td>按 C2 下发的 SN 查询耐杰/激光/和普，返回 <code>alink_ptz_dev_info_t</code>（IP、端口、可见光/红外码流 URL）</td>
+<td><code>alink_system.cpp</code>：<code>alink_get_ptzdev_info</code>；内部调 <code>get_ptz_dev_info</code>、<code>getLaserDevInfo</code>、<code>get_hepu_ptz_dev_info</code></td>
+</tr>
+<tr>
+<td><strong>0x8a</strong></td>
+<td>云台控制</td>
+<td>解析 <code>alink_ptz_ctrl_req_t</code>，根据首设备类型走耐杰或激光：耐杰/和普 → <code>ros_app::ros_app_cmd_set(CMD_ID_SETTING_USER_PTZ_CONTROLLER_ROTATION)</code>，激光 → <code>ros_app::ros_app_pub_laser_cmd_set(...)</code></td>
+<td><code>alink_system.cpp</code>：<code>alink_ctrl_ptz</code></td>
+</tr>
+<tr>
+<td><strong>0x8b</strong></td>
+<td>镜头控制（变焦/对焦）</td>
+<td>解析 <code>alink_ptz_zoom_ctrl_req_t</code>，同样按设备类型转 ROS2 或激光引导节点</td>
+<td><code>alink_system.cpp</code>：<code>alink_ctrl_ptz_zoom</code></td>
+</tr>
+</tbody>
+</table>
+<p>C2 下发的控制经 Alink 进入 AGX 后，由上述处理函数转为 ROS2 或耐杰以太网协议，再经<strong>第八章</strong>所述控制链路到达对应 PTZ/激光设备。即：<strong>C2 --Alink--&gt; ptz100_ros 进程 --ROS2/eth_link_ptz--&gt; 设备</strong>。其中 0x81 为 C2 手选雷达目标后，驱动 PTZ 转过去搜索无人机目标的专用指令。</p>
+<h3 id="103-ros2">10.3 与 ROS2 的关系</h3>
+<ul>
+<li>设备列表在 AGX 内除经 Alink 上报 C2 外，<code>ptz100_ros</code> 会发布 <code>/ptz100_ros_devlist</code>（DevList），供 SFL200 等节点订阅。</li>
+<li>控制与状态仍以第八章、第九章的 ROS2 Topic 与状态上报为主；C2 通过 Alink 下发的 PTZ 相关指令（0x81 手选目标、0x8a/0x8b 云台/镜头控制）在 AGX 侧转为 ROS2 或直接走 <code>eth_link_ptz</code>（耐杰）。</li>
+</ul>
+<h3 id="104">10.4 协议与代码索引</h3>
+<ul>
+<li><strong>C2 连接与上报包注册</strong>：<code>src/app/c2_network/c2_network.cpp</code>（<code>alink_connect_send</code> 注册 0xE5、0xEB、0xEC 等）。</li>
+<li><strong>心跳与设备列表上报</strong>：<code>src/srv/eth_link/eth_link.c</code>（<code>eth_link_task</code> → <code>send_slave_devices_info</code>）、<code>src/srv/alink/command/system/alink_system.cpp</code>（0xE5、0xEB、0xEC 的 package 与 <code>upload</code> 接口）。</li>
+<li><strong>设备列表内容汇总</strong>：<code>src/srv/eth_link/eth_link_server.c</code>（<code>get_devices_online_info</code>）、<code>src/srv/eth_link/eth_link_ptz.cpp</code>（<code>get_ptz_dev_info</code>、<code>get_hepu_ptz_dev_info</code>）。</li>
+<li><strong>C2 下发命令处理</strong>：<code>src/srv/alink/command/system/alink_system.cpp</code>（0x86、0x8a、0x8b 的 <code>alink_register_cmd</code> 与处理函数）；<code>src/srv/alink/command/target/alink_target.c</code>（0x81 手选雷达目标，<code>user_custom_track_target</code> → <code>msg_send_to_alg</code> 驱动 PTZ 转向搜索无人机）。</li>
+</ul>
+<blockquote>
+<p><strong>说明</strong>：视频帧传输走共享内存，不走 ROS2；控制指令走 ROS2 Topic 或 Alink 转 ROS2/以太网下发，状态上报走 ROS2 Topic 发布；PTZ 与 C2 的对接由 AGX 主设备经 Alink 上报 0xE5/0xEB 设备列表、0xEC PTZ 详情，以及 C2 下发 0x81（手选雷达目标控 PTZ）/0x86/0x8a/0x8b 完成，且均经 <strong>ptz100_ros</strong> 节点所在进程。</p>
+</blockquote>
+<hr />
+<h2 id="_7">十一、设备配置管理</h2>
+<h3 id="111">11.1 配置文件</h3>
+<p>设备信息通过 <code>PtzDevicesCfg</code> 管理，配置文件路径：<code>config/ptzDevicesCfg.yaml</code></p>
+<pre><code class="language-mermaid">flowchart LR
+    YAML[ptzDevicesCfg.yaml] --&gt; CFG[PtzDevicesCfg&lt;br/&gt;单例管理]
+    CFG --&gt; |getFirstDevType| SVC1[ptz_service / ptz_app]
+    CFG --&gt; |getSecondDevType| SVC2[laser_service]
+    CFG --&gt; |readList| SVC3[sysmanager]
+</code></pre>
+<h3 id="112">11.2 设备类型枚举</h3>
+<table>
+<thead>
+<tr>
+<th>枚举值</th>
+<th>数值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>PTZ_NAIJIE</code></td>
+<td>0</td>
+<td>耐杰近程 PTZ</td>
+</tr>
+<tr>
+<td><code>PTZ_HEF100</code></td>
+<td>1</td>
+<td>霍克眼激光 HEF100</td>
+</tr>
+<tr>
+<td><code>PTZ_HEP10</code></td>
+<td>2</td>
+<td>霍克眼激光 HEP10</td>
+</tr>
+<tr>
+<td><code>PTZ_HEP21</code></td>
+<td>3</td>
+<td>霍克眼激光 HEP21</td>
+</tr>
+<tr>
+<td><code>PTZ_HEPU</code></td>
+<td>4</td>
+<td>和普三型 Z50（非制冷）</td>
+</tr>
+<tr>
+<td><code>PTZ_NAIJIE_MID</code></td>
+<td>5</td>
+<td>耐杰中程 PTZ</td>
+</tr>
+<tr>
+<td><code>PTZ_HEPU_COOLED</code></td>
+<td>6</td>
+<td>和普四型 Z50（制冷）</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="_8">十二、三类设备对比</h2>
+<table>
+<thead>
+<tr>
+<th>对比维度</th>
+<th>耐杰 PTZ</th>
+<th>和普 PTZ</th>
+<th>激光 PTZ</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>ROS2 节点</strong></td>
+<td><code>ptz100_ros</code>（<code>src/app/</code>）</td>
+<td><code>ptz_service</code>（<code>ros_ws/</code>）</td>
+<td><code>laser_service</code>（<code>ros_ws/</code>）</td>
+</tr>
+<tr>
+<td><strong>视频框架</strong></td>
+<td>GStreamer (gstNvDeeps)</td>
+<td>GStreamer (gstNvDeeps)</td>
+<td>GStreamer (gstNvDeeps)</td>
+</tr>
+<tr>
+<td><strong>视频框架代码</strong></td>
+<td>解码: <code>public/gstNvDeeps/</code>，推流: <code>src/app/alg_app/alg_app.cpp</code></td>
+<td><code>public/gstNvDeeps/</code></td>
+<td><code>public/gstNvDeeps/</code></td>
+</tr>
+<tr>
+<td><strong>视频框架依赖</strong></td>
+<td><code>thirdpart/gstreamer-1.0/</code></td>
+<td><code>thirdpart/gstreamer-1.0/</code></td>
+<td><code>thirdpart/gstreamer-1.0/</code></td>
+</tr>
+<tr>
+<td><strong>视频接入</strong></td>
+<td>RTSP 拉流</td>
+<td>RTSP 拉流</td>
+<td>SDK JPEG 回调</td>
+</tr>
+<tr>
+<td><strong>解码</strong></td>
+<td>GstSourceDecode (NVDEC)</td>
+<td>GstSourceDecode (NVDEC)</td>
+<td>cv::imdecode</td>
+</tr>
+<tr>
+<td><strong>编码推流</strong></td>
+<td>GstRtspClient <code>nvv4l2h264enc</code> → RTP/UDP（<code>alg_app.cpp</code>）</td>
+<td>GstRtspClient <code>nvv4l2h264enc</code> → RTP/UDP</td>
+<td>GstRtspClient <code>nvv4l2h264enc</code> → RTP/UDP</td>
+</tr>
+<tr>
+<td><strong>相机数</strong></td>
+<td>2（可见光 + 红外）</td>
+<td>2（可见光 + 红外）</td>
+<td>3（粗跟踪 + 精跟踪 + 红外）</td>
+</tr>
+<tr>
+<td><strong>可见光分辨率</strong></td>
+<td>1920x1080</td>
+<td>1920x1080</td>
+<td>512x512</td>
+</tr>
+<tr>
+<td><strong>红外分辨率</strong></td>
+<td>640x512</td>
+<td>640x512</td>
+<td>512x512</td>
+</tr>
+<tr>
+<td><strong>AI 传输</strong></td>
+<td>SHM</td>
+<td>SHM</td>
+<td>SHM</td>
+</tr>
+<tr>
+<td><strong>推流</strong></td>
+<td>MediaMTX (5410/5411)</td>
+<td>MediaMTX (5410/5411)</td>
+<td>MediaMTX (5400/5401/5402)</td>
+</tr>
+<tr>
+<td><strong>控制协议</strong></td>
+<td>以太网自定义协议</td>
+<td>和普 HTTP/SDK API</td>
+<td>LaserHe SDK</td>
+</tr>
+<tr>
+<td><strong>工厂类</strong></td>
+<td>无（硬编码判断）</td>
+<td><code>PtzDevice::createDevice()</code></td>
+<td><code>LaserDevice::createDevice()</code></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="_9">十三、现状说明与可选优化</h2>
+<h3 id="131">13.1 现状说明</h3>
+<table>
+<thead>
+<tr>
+<th>编号</th>
+<th>现状</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>三类设备视频处理均使用 GStreamer</td>
+<td>耐杰已从 FFmpeg 切换到 GStreamer，和普/激光直接采用 GStreamer，链路完整</td>
+</tr>
+<tr>
+<td>2</td>
+<td>耐杰 PTZ 运行在 <code>ptz100_ros</code> 节点（<code>src/app/</code>）</td>
+<td>拉流在 <code>ptz_app.cpp</code>，推流在 <code>alg_app.cpp</code>，与 <code>ptz_service</code>/<code>laser_service</code> 并行，功能正常</td>
+</tr>
+<tr>
+<td>3</td>
+<td>和普/激光 PTZ 运行在 ROS2 架构（<code>ptz_service</code> / <code>laser_service</code>）</td>
+<td>使用工厂模式，代码集中在 <code>ros_ws/</code></td>
+</tr>
+<tr>
+<td>4</td>
+<td>FFmpeg 旧代码仍保留在代码库中</td>
+<td><code>src/app/ptz/ffmpeg/</code> 和 <code>thirdpart/ffmpeg/</code> 未删除，已通过 <code>USE_NEW_VIDEO_API</code> 宏弃用</td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>PtzDevice</code> 工厂仅注册了和普设备类型</td>
+<td>耐杰在 <code>ptz100_ros</code> 节点中，激光使用 <code>LaserDevice</code> 工厂</td>
+</tr>
+<tr>
+<td>6</td>
+<td>激光设备使用 JPEG 软解码（<code>cv::imdecode</code>）</td>
+<td>CPU 解码，未使用 GStreamer 硬件 JPEG 解码</td>
+</tr>
+</tbody>
+</table>
+<h3 id="132-ptz">13.2 耐杰 PTZ 后续方案</h3>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>说明</th>
+<th>优点</th>
+<th>缺点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>方案一：保持现状</strong></td>
+<td>耐杰继续在 <code>ptz100_ros</code> 节点运行</td>
+<td>无额外开发量，当前功能稳定</td>
+<td>耐杰代码在 <code>src/app/</code>，和普/激光在 <code>ros_ws/</code></td>
+</tr>
+<tr>
+<td><strong>方案二：迁入 ptz_service</strong></td>
+<td>实现 <code>PtzDeviceNaijie</code> 子类，纳入 ROS2 统一架构</td>
+<td>三类设备统一管理，复用工厂模式</td>
+<td>需要开发和验证工作量</td>
+</tr>
+</tbody>
+</table>
+<h3 id="133">13.3 可选优化</h3>
+<ul>
+<li><strong>清理 FFmpeg 遗留代码</strong>：<code>src/app/ptz/ffmpeg/</code> 和 <code>thirdpart/ffmpeg/</code> 已弃用，可择机移除</li>
+<li><strong>激光硬解</strong>：激光设备可考虑使用 GStreamer <code>nvjpegdec</code> 替代 <code>cv::imdecode</code> 实现硬件加速</li>
+<li><strong>工厂扩展</strong>：如选择方案二，在 <code>PtzDevice</code> 工厂中注册耐杰设备类型</li>
+</ul>
+<hr />
+<h2 id="ssf200">十四、云端推流（SSF200 上云）</h2>
+<h3 id="141">14.1 背景</h3>
+<p>SSF200 上云场景下，视频流需要推送至天盾云端流媒体服务器，而非仅在局域网内通过 MediaMTX 分发给 C2。AGX 通过 MQTT 向天盾请求 RTMP 推流地址，获取后使用 <code>GstCloudPusher</code> 从本地 MediaMTX 拉取已编码的 H.264 RTSP 流，免转码重封装为 FLV，通过 RTMP 推送到云端。</p>
+<p><strong>前提条件</strong>：eth0 必须具备公网访问能力（路由器/4G/VPN），否则无法连接天盾 MQTT Broker 和 RTMP 服务器。</p>
+<h3 id="142">14.2 架构</h3>
+<p>GstCloudPusher 作为 MediaMTX 的下游消费者，与现有管道完全解耦：</p>
+<pre><code class="language-mermaid">flowchart TD
+    subgraph 现有推流层
+        GRC[&quot;GstRtspClient&lt;br/&gt;nvv4l2h264enc → UDP RTP&quot;]
+        MTX[&quot;MediaMTX :9554&quot;]
+    end
+
+    subgraph 分发层-本地
+        C2[&quot;C2 本地拉流&lt;br/&gt;RTSP（eth0 局域网）&quot;]
+    end
+
+    subgraph 分发层-云端-新增
+        GCP[&quot;GstCloudPusher&lt;br/&gt;rtspsrc → rtph264depay&lt;br/&gt;→ h264parse → flvmux&lt;br/&gt;→ rtmpsink&quot;]
+        CLOUD[&quot;天盾云端 RTMP 服务器&quot;]
+    end
+
+    GRC --&gt;|&quot;UDP RTP :5400~5411&quot;| MTX
+    MTX --&gt;|&quot;RTSP（eth0）&quot;| C2
+    MTX --&gt;|&quot;RTSP（localhost）&quot;| GCP
+    GCP --&gt;|&quot;RTMP（eth0 → 公网）&quot;| CLOUD
+</code></pre>
+<h3 id="143-gstcloudpusher">14.3 GstCloudPusher 组件</h3>
+<p><strong>位置</strong>：<code>public/gstNvDeeps/gstCloudPusher/</code></p>
+<p>与 <code>gstSourceDecode</code>（拉流解码）和 <code>gstRtspClient</code>（编码推流）并列，属于 GStreamer 基础能力层。</p>
+<p><strong>管道结构</strong>（免转码重封装）：</p>
+<pre><code class="language-mermaid">flowchart LR
+    SRC[&quot;rtspsrc&lt;br/&gt;latency=300&quot;]
+    DEPAY[&quot;rtph264depay&lt;br/&gt;RTP 解封装&quot;]
+    PARSE[&quot;h264parse&lt;br/&gt;帧边界解析&quot;]
+    MUX[&quot;flvmux&lt;br/&gt;streamable=true&quot;]
+    SINK[&quot;rtmpsink&lt;br/&gt;RTMP 推流&quot;]
+
+    SRC ==&gt;|&quot;pad-added&lt;br/&gt;动态链接&quot;| DEPAY --&gt; PARSE --&gt; MUX --&gt; SINK
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Element</th>
+<th>作用</th>
+<th>关键参数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>rtspsrc</code></td>
+<td>从本地 MediaMTX 拉 RTSP 流</td>
+<td><code>location</code>, <code>latency=300</code>, <code>protocols=TCP</code></td>
+</tr>
+<tr>
+<td><code>rtph264depay</code></td>
+<td>RTP 解封装，提取 H.264 NALU</td>
+<td>--</td>
+</tr>
+<tr>
+<td><code>h264parse</code></td>
+<td>确保 H.264 帧边界正确</td>
+<td>--</td>
+</tr>
+<tr>
+<td><code>flvmux</code></td>
+<td>封装为 FLV（RTMP 要求的容器格式）</td>
+<td><code>streamable=true</code></td>
+</tr>
+<tr>
+<td><code>rtmpsink</code></td>
+<td>推送到天盾返回的 RTMP 地址</td>
+<td><code>location</code>, <code>sync=false</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="144">14.4 与现有推流的对比</h3>
+<table>
+<thead>
+<tr>
+<th>对比维度</th>
+<th>GstRtspClient（本地推流）</th>
+<th>GstCloudPusher（云端推流）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>数据源</td>
+<td>appsrc（RGB/JPEG 帧）</td>
+<td>rtspsrc（RTSP 已编码流）</td>
+</tr>
+<tr>
+<td>是否编码</td>
+<td>是（nvv4l2h264enc 硬编码）</td>
+<td>否（免转码重封装）</td>
+</tr>
+<tr>
+<td>输出格式</td>
+<td>RTP over UDP</td>
+<td>FLV over RTMP</td>
+</tr>
+<tr>
+<td>目标</td>
+<td>本地 MediaMTX（127.0.0.1）</td>
+<td>天盾云端 RTMP 服务器（公网）</td>
+</tr>
+<tr>
+<td>CPU/GPU 开销</td>
+<td>较高（硬件编码）</td>
+<td>极低（仅容器转换）</td>
+</tr>
+<tr>
+<td>代码位置</td>
+<td><code>public/gstNvDeeps/gstRtspClient/</code></td>
+<td><code>public/gstNvDeeps/gstCloudPusher/</code></td>
+</tr>
+<tr>
+<td>调用者</td>
+<td>ptz_service / alg_app</td>
+<td>nexus_gateway</td>
+</tr>
+</tbody>
+</table>
+<h3 id="145-mqtt-485">14.5 MQTT 协议交互（4.8.5 设备获取推流地址）</h3>
+<p><strong>请求</strong>（AGX → 天盾）：</p>
+<pre><code>Topic: thing/product/{PTZ_设备 SN}/requests
+{
+    &quot;tid&quot;: &quot;&lt;uuid&gt;&quot;,
+    &quot;bid&quot;: &quot;&lt;uuid&gt;&quot;,
+    &quot;timestamp&quot;: &lt;utc毫秒&gt;,
+    &quot;method&quot;: &quot;device_stream_url&quot;,
+    &quot;gateway&quot;: &quot;&lt;Spotter Pro 设备 SN&gt;&quot;,
+    &quot;data&quot;: {
+        &quot;Camera&quot;: [{
+            &quot;type&quot;: &quot;zoom&quot;,       // zoom-变焦 wide-广角 normal-普通 ir-红外 night-夜视
+            &quot;camera_id&quot;: &quot;&lt;摄像头ID&gt;&quot;
+        }]
+    }
+}
+</code></pre>
+<p><strong>回复</strong>（天盾 → AGX）：</p>
+<pre><code>Topic: thing/product/{设备SN}/requests_reply
+{
+    &quot;tid&quot;: &quot;&lt;uuid&gt;&quot;,
+    &quot;bid&quot;: &quot;&lt;uuid&gt;&quot;,
+    &quot;timestamp&quot;: &lt;utc毫秒&gt;,
+    &quot;method&quot;: &quot;device_stream_url&quot;,
+    &quot;data&quot;: {
+        &quot;result&quot;: 0,
+        &quot;output&quot;: {
+            &quot;streams&quot;: [{
+                &quot;type&quot;: &quot;zoom&quot;,
+                &quot;streamUrl&quot;: &quot;rtmp://cn.cloud-dev.skyfend.com:1935/live/dev/.../1&quot;
+            }]
+        }
+    }
+}
+</code></pre>
+<p>天盾返回的 <code>streamUrl</code> 是拼接好的完整 RTMP 地址，直接用作 <code>rtmpsink location</code> 参数。</p>
+<h3 id="146-rtsp">14.6 摄像头类型与本地 RTSP 路径映射</h3>
+<table>
+<thead>
+<tr>
+<th>天盾 type</th>
+<th>本地 RTSP 路径</th>
+<th>MediaMTX UDP 端口</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>zoom</code></td>
+<td><code>rtsp://127.0.0.1:9554/ptz/zoom/ch0</code></td>
+<td>5410</td>
+<td>和普/耐杰 可见光</td>
+</tr>
+<tr>
+<td><code>ir</code></td>
+<td><code>rtsp://127.0.0.1:9554/ptz/ir/ch0</code></td>
+<td>5411</td>
+<td>和普/耐杰 红外</td>
+</tr>
+<tr>
+<td><code>zoom</code>（激光）</td>
+<td><code>rtsp://127.0.0.1:9554/laser/zoom/ch0</code></td>
+<td>5400</td>
+<td>激光粗跟踪</td>
+</tr>
+<tr>
+<td><code>ir</code>（激光）</td>
+<td><code>rtsp://127.0.0.1:9554/laser/ir/ch0</code></td>
+<td>5402</td>
+<td>激光红外</td>
+</tr>
+</tbody>
+</table>
+<h3 id="147">14.7 管道生命周期与自动重连</h3>
+<p>与 GstRtspClient 一致的 <code>workerTaskLoopForever()</code> 模式：Pipeline 异常（ERROR/EOS）后自动清理并等待 <code>reconnectDelayMs</code>（默认 5 秒）重建。</p>
+<h3 id="148">14.8 使用方式</h3>
+<pre><code class="language-cpp">#include &quot;gstCloudPusher.h&quot;
+
+auto pusher = std::make_unique&lt;GstCloudPusher&gt;();
+pusher-&gt;startPush(&quot;rtsp://127.0.0.1:9554/ptz/zoom/ch0&quot;,
+                   &quot;rtmp://cn.cloud-dev.skyfend.com:1935/live/dev/.../1&quot;);
+
+// 多路推流：每路一个实例
+auto pusherIr = std::make_unique&lt;GstCloudPusher&gt;();
+pusherIr-&gt;startPush(&quot;rtsp://127.0.0.1:9554/ptz/ir/ch0&quot;,
+                     &quot;rtmp://cn.cloud-dev.skyfend.com:1935/live/dev/.../2&quot;);
+</code></pre>
+<h3 id="149">14.9 测试工具</h3>
+<p><code>public/gstNvDeeps/examples/cloudPusherTest.cpp</code> 提供无 PTZ 设备时的联调测试。</p>
+<p><strong>编译</strong>：</p>
+<pre><code class="language-bash">cd public/gstNvDeeps/examples
+mkdir -p build &amp;&amp; cd build
+cmake .. &amp;&amp; make -j$(nproc)
+</code></pre>
+<p><strong>运行</strong>：</p>
+<pre><code class="language-bash"># 本地闭环测试（不需要 PTZ 和公网，需要 MediaMTX 已启动）
+./cloudPusherTest &quot;rtmp://127.0.0.1:1935/live/cloud_test&quot;
+# 另一终端验证：
+gst-launch-1.0 playbin uri=&quot;rtsp://127.0.0.1:9554/live/cloud_test&quot;
+
+# 推流到天盾云端（需要 eth0 有公网访问）
+./cloudPusherTest &quot;rtmp://cn.cloud-dev.skyfend.com:1935/live/dev/spotter-pro-test-001/spotter-pro-ptz-001/1&quot;
+
+# 仅启动假视频源（不推云端，用 VLC 验证 MediaMTX test/ch0）
+./cloudPusherTest
+</code></pre>
+<p><strong>本地闭环测试数据流</strong>：</p>
+<pre><code>假视频帧(1080P,25fps) → GstRtspClient → UDP RTP :5420 → MediaMTX [test/ch0]
+                                                              ↓ RTSP pull (localhost)
+                                                        GstCloudPusher (rtmp2sink)
+                                                              ↓ RTMP push
+                                                        MediaMTX [live/cloud_test]
+                                                              ↓ RTSP pull
+                                                        VLC/gst-launch 验证
+</code></pre>
+<h3 id="1410">14.10 实现备注</h3>
+<ul>
+<li><strong>RTMP Sink 选型</strong>：优先使用 <code>rtmp2sink</code>（GStreamer 内置实现），如不可用则降级到 <code>rtmpsink</code>（librtmp）。在 Jetson AGX 环境实测中 <code>rtmpsink</code> 存在静默推流失败问题，<code>rtmp2sink</code> 工作正常</li>
+<li><strong>管道增加 queue</strong>：在 <code>h264parse</code> 和 <code>flvmux</code> 之间插入 <code>queue</code> 元素，解耦 rtspsrc 和 flvmux 的线程模型，避免死锁</li>
+<li><strong>h264parse 配置</strong>：<code>config-interval=-1</code>，每个 I 帧前插入 SPS/PPS，确保 RTMP 接收端能正确解码</li>
+</ul>
+<hr />
+<h2 id="_10">附录</h2>
+<h3 id="a">A. 端口分配表</h3>
+<table>
+<thead>
+<tr>
+<th>端口范围</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>554</td>
+<td>设备自身 RTSP 服务（和普 PTZ）</td>
+</tr>
+<tr>
+<td>5400~5402</td>
+<td>激光 PTZ → MediaMTX (UDP RTP)</td>
+</tr>
+<tr>
+<td>5410~5411</td>
+<td>和普/耐杰 PTZ → MediaMTX (UDP RTP)</td>
+</tr>
+<tr>
+<td>5420</td>
+<td>测试流 → MediaMTX (UDP RTP)</td>
+</tr>
+<tr>
+<td>9554</td>
+<td>MediaMTX RTSP 服务</td>
+</tr>
+<tr>
+<td>1935</td>
+<td>天盾云端 RTMP 服务（GstCloudPusher 出站目标）</td>
+</tr>
+<tr>
+<td>8888</td>
+<td>MediaMTX HLS 服务</td>
+</tr>
+<tr>
+<td>8889</td>
+<td>MediaMTX WebRTC 服务</td>
+</tr>
+<tr>
+<td>8890</td>
+<td>MediaMTX SRT 服务</td>
+</tr>
+</tbody>
+</table>
+<h3 id="b">B. 关键源文件索引</h3>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>GStreamer 新架构</strong></td>
+<td></td>
+</tr>
+<tr>
+<td><code>public/gstNvDeeps/gstSourceDecode/</code></td>
+<td>GStreamer 视频拉流解码模块</td>
+</tr>
+<tr>
+<td><code>public/gstNvDeeps/gstRtspClient/</code></td>
+<td>GStreamer 视频编码推流模块</td>
+</tr>
+<tr>
+<td><code>public/gstNvDeeps/gstCloudPusher/</code></td>
+<td>GStreamer 云端推流模块（RTSP→RTMP 免转码重封装，见第十四章）</td>
+</tr>
+<tr>
+<td><code>public/gstNvDeeps/gstRtspServer/</code></td>
+<td>GStreamer RTSP 服务端（已被 MediaMTX 替代）</td>
+</tr>
+<tr>
+<td><code>public/gstNvDeeps/examples/</code></td>
+<td>GStreamer 各模块测试用例（含 cloudPusherTest 云端推流联调测试）</td>
+</tr>
+<tr>
+<td><code>thirdpart/gstreamer-1.0/</code></td>
+<td>GStreamer 三方库（头文件 + 链接库）</td>
+</tr>
+<tr>
+<td><strong>FFmpeg 旧架构</strong></td>
+<td></td>
+</tr>
+<tr>
+<td><code>src/app/ptz/ffmpeg/ffmpegservice.h/cpp</code></td>
+<td>FFmpeg 拉流/推流主服务</td>
+</tr>
+<tr>
+<td><code>src/app/ptz/ffmpeg/NvEncodec.h/cpp</code></td>
+<td>FFmpeg NVIDIA 硬件编码封装</td>
+</tr>
+<tr>
+<td><code>src/app/ptz/ffmpeg/NvDecodec.h/cpp</code></td>
+<td>FFmpeg NVIDIA 硬件解码封装</td>
+</tr>
+<tr>
+<td><code>src/app/ptz/ffmpeg/AvH264.h/cpp</code></td>
+<td>FFmpeg H264 软编解码封装</td>
+</tr>
+<tr>
+<td><code>src/app/ptz/ffmpeg/CodecBase.h</code></td>
+<td>FFmpeg 编解码器抽象基类</td>
+</tr>
+<tr>
+<td><code>thirdpart/ffmpeg/</code></td>
+<td>FFmpeg 三方库（x86 + aarch64）</td>
+</tr>
+<tr>
+<td><strong>设备实现</strong></td>
+<td></td>
+</tr>
+<tr>
+<td><code>ros_ws/src/ptz_service/src/ptzDevice/</code></td>
+<td>PTZ 设备抽象与和普实现（GStreamer）</td>
+</tr>
+<tr>
+<td><code>ros_ws/src/laser_service/src/laserDevice/</code></td>
+<td>激光设备抽象与霍克眼实现（GStreamer）</td>
+</tr>
+<tr>
+<td><code>src/app/ptz/ptz_app.cpp</code></td>
+<td>耐杰 PTZ 拉流解码（GstSourceDecode）+ SHM 写入</td>
+</tr>
+<tr>
+<td><code>src/app/alg_app/alg_app.cpp</code></td>
+<td>耐杰 PTZ AI 结果帧 SHM 读取 + GstRtspClient 编码推流（5410/5411）</td>
+</tr>
+<tr>
+<td><strong>控制协议 / 设备 SDK</strong></td>
+<td></td>
+</tr>
+<tr>
+<td><code>src/srv/eth_link/ptz_protocol/</code></td>
+<td>耐杰 PTZ 以太网控制协议</td>
+</tr>
+<tr>
+<td><code>iotDevices/ptzHepuSDK/</code></td>
+<td>和普 PTZ 控制 SDK（TCP 39020）</td>
+</tr>
+<tr>
+<td><code>iotDevices/laserHeSDK/</code></td>
+<td>霍克眼激光 PTZ 控制 SDK（UDP）</td>
+</tr>
+<tr>
+<td><strong>配置与依赖</strong></td>
+<td></td>
+</tr>
+<tr>
+<td><code>config/ptzDevicesCfg.yaml</code></td>
+<td>设备类型与列表配置（见第十一章）</td>
+</tr>
+<tr>
+<td><code>public/config/yamlConfig/ptzDevicesCfg.h/cpp</code></td>
+<td>设备配置解析（PtzDevicesCfg）</td>
+</tr>
+<tr>
+<td><code>thirdpart/mediamtx/mediamtx.yml</code></td>
+<td>MediaMTX 流媒体配置</td>
+</tr>
+<tr>
+<td><code>thirdpart/naijie/demo/sdk/</code></td>
+<td>耐杰 SDK 头文件</td>
+</tr>
+</tbody>
+</table>
+<h3 id="c">C. 播放地址速查</h3>
+<pre><code class="language-bash"># 和普/耐杰 PTZ（经 MediaMTX，AI 处理后）
+rtsp://127.0.0.1:9554/ptz/zoom/ch0    # 可见光
+rtsp://127.0.0.1:9554/ptz/ir/ch0      # 红外
+
+# 激光 PTZ
+rtsp://127.0.0.1:9554/laser/zoom/ch0  # 粗跟踪可见光
+rtsp://127.0.0.1:9554/laser/zoom/ch1  # 精跟踪可见光
+rtsp://127.0.0.1:9554/laser/ir/ch0    # 红外
+
+# 和普设备原始流（直连设备时）
+rtsp://admin:Abc.12345@&lt;设备IP&gt;:554/ch0/stream0  # 可见光主码流
+rtsp://admin:Abc.12345@&lt;设备IP&gt;:554/ch1/stream0  # 红外主码流
+</code></pre>
+<h3 id="d-mediamtx">D. MediaMTX 流媒体服务器及配置说明</h3>
+<h4 id="d1">D.1 简介与作用</h4>
+<p><strong>MediaMTX</strong>（原 rtsp-simple-server）是一款开源的流媒体服务器，支持 RTSP、RTMP、HLS、WebRTC、SRT 等多种协议。在本项目中用于：</p>
+<ul>
+<li><strong>接收</strong>：AGX 上各节点（<code>GstRtspClient</code>）编码后的 H.264 通过 <strong>RTP over UDP</strong> 推送到 MediaMTX 指定端口；</li>
+<li><strong>分发</strong>：对外提供统一 RTSP（及可选 HLS/WebRTC/SRT）拉流地址，供显控、VLC、Web 等客户端播放。</li>
+</ul>
+<p>即：<strong>设备/节点 → GstRtspClient 推 UDP RTP → MediaMTX 收流并转协议 → 客户端 RTSP/HLS/WebRTC 拉流</strong>。</p>
+<h4 id="d2">D.2 配置文件位置</h4>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>配置文件</td>
+<td><code>thirdpart/mediamtx/mediamtx.yml</code></td>
+</tr>
+<tr>
+<td>可执行文件</td>
+<td><code>thirdpart/mediamtx/</code> 目录下 MediaMTX 二进制（由部署/启动脚本指定）</td>
+</tr>
+</tbody>
+</table>
+<h4 id="d3">D.3 服务端口（全局）</h4>
+<table>
+<thead>
+<tr>
+<th>协议</th>
+<th>配置项</th>
+<th>默认端口</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RTSP</td>
+<td><code>rtspAddress</code></td>
+<td><strong>9554</strong></td>
+<td>主要拉流端口，客户端使用</td>
+</tr>
+<tr>
+<td>RTMP</td>
+<td><code>rtmpAddress</code></td>
+<td>1935</td>
+<td>可选推流/拉流</td>
+</tr>
+<tr>
+<td>HLS</td>
+<td><code>hlsAddress</code></td>
+<td>8888</td>
+<td>HTTP 切片，适合 Web 播放</td>
+</tr>
+<tr>
+<td>WebRTC</td>
+<td><code>webrtcAddress</code></td>
+<td>8889</td>
+<td>低延迟浏览器播放</td>
+</tr>
+<tr>
+<td>SRT</td>
+<td><code>srtAddress</code></td>
+<td>8890</td>
+<td>SRT 推拉流</td>
+</tr>
+</tbody>
+</table>
+<h4 id="d4-udp-rtp-paths">D.4 路径与 UDP RTP 输入（paths）</h4>
+<p>AGX 向 MediaMTX <strong>推流</strong>时，使用 <strong>UDP RTP</strong>：节点将 H.264 通过 RTP 发往本机 <code>127.0.0.1:端口</code>，MediaMTX 在对应端口监听并绑定到逻辑路径。路径与端口对应关系如下（与 <code>mediamtx.yml</code> 中 <code>paths</code> 一致）：</p>
+<table>
+<thead>
+<tr>
+<th>路径（Path）</th>
+<th>源配置（source）</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ptz/zoom/ch0</code></td>
+<td><code>udp+rtp://127.0.0.1:5410</code></td>
+<td>和普/耐杰 可见光（AI 处理后）</td>
+</tr>
+<tr>
+<td><code>ptz/ir/ch0</code></td>
+<td><code>udp+rtp://127.0.0.1:5411</code></td>
+<td>和普/耐杰 红外（AI 处理后）</td>
+</tr>
+<tr>
+<td><code>laser/zoom/ch0</code></td>
+<td><code>udp+rtp://127.0.0.1:5400</code></td>
+<td>激光 粗跟踪可见光</td>
+</tr>
+<tr>
+<td><code>laser/zoom/ch1</code></td>
+<td><code>udp+rtp://127.0.0.1:5401</code></td>
+<td>激光 精跟踪可见光</td>
+</tr>
+<tr>
+<td><code>laser/ir/ch0</code></td>
+<td><code>udp+rtp://127.0.0.1:5402</code></td>
+<td>激光 红外</td>
+</tr>
+<tr>
+<td><code>test/ch0</code></td>
+<td><code>udp+rtp://127.0.0.1:5420</code></td>
+<td>测试用</td>
+</tr>
+</tbody>
+</table>
+<p>每个 path 的 <code>rtpSDP</code> 在配置中声明为 H.264 RTP/AVP 96，与 <code>GstRtspClient</code> 的 RTP 封装一致。</p>
+<h4 id="d5">D.5 关键全局配置项（简要）</h4>
+<table>
+<thead>
+<tr>
+<th>配置项</th>
+<th>推荐/说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>logLevel</code></td>
+<td><code>info</code>，排查问题时可为 <code>debug</code></td>
+</tr>
+<tr>
+<td><code>readTimeout</code> / <code>writeTimeout</code></td>
+<td>默认 10s，可按需调整</td>
+</tr>
+<tr>
+<td><code>udpReadBufferSize</code></td>
+<td>本项目已设为 <strong>1048576</strong>（1MB），减轻高码率下 UDP 丢包；需保证 <code>cat /proc/sys/net/core/rmem_max</code> ≥ 该值</td>
+</tr>
+<tr>
+<td><code>rtsp: true</code></td>
+<td>启用 RTSP 服务</td>
+</tr>
+<tr>
+<td><code>rtspAddress: :9554</code></td>
+<td>RTSP 监听端口</td>
+</tr>
+<tr>
+<td><code>paths</code></td>
+<td>见 D.4，按 path 配置 <code>source</code> 与 <code>rtpSDP</code></td>
+</tr>
+</tbody>
+</table>
+<p>新增一路 PTZ/激光流时：在 <code>paths</code> 下增加新 path 名称，并指定 <code>source: udp+rtp://127.0.0.1:端口</code> 及对应 <code>rtpSDP</code>（H.264 可复用现有片段），同时确保 GstRtspClient 推流目标端口与该端口一致。</p>
+<h3 id="e">E. 缩略语与术语</h3>
+<table>
+<thead>
+<tr>
+<th>术语/缩略语</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>AGX</td>
+<td>本平台主控设备（Jetson 等），运行 ptz100_ros、ptz_service、laser_service 等节点</td>
+</tr>
+<tr>
+<td>Alink</td>
+<td>本平台与上位机 C2 之间的应用层通信协议，用于设备列表、心跳、PTZ 控制等</td>
+</tr>
+<tr>
+<td>C2</td>
+<td>上位机指挥控制/显控，通过 Alink 与 AGX 通信</td>
+</tr>
+<tr>
+<td>PTZ</td>
+<td>Pan-Tilt-Zoom，云台摄像机（水平/俯仰/变焦）</td>
+</tr>
+<tr>
+<td>SHM</td>
+<td>共享内存（Shared Memory），用于设备与 AI、AI 与推流间零拷贝传帧</td>
+</tr>
+<tr>
+<td>NVDEC / NVENC</td>
+<td>NVIDIA 硬件解码 / 编码（Jetson 上常用 nvv4l2decoder、nvv4l2h264enc）</td>
+</tr>
+<tr>
+<td>RTSP</td>
+<td>实时流协议，用于拉流/播放</td>
+</tr>
+<tr>
+<td>RTP</td>
+<td>实时传输协议，通常 over UDP，用于 GstRtspClient 向 MediaMTX 推流</td>
+</tr>
+<tr>
+<td>MediaMTX</td>
+<td>流媒体服务器，接收 UDP RTP 推流，对外提供 RTSP/HLS/WebRTC 等</td>
+</tr>
+<tr>
+<td>path</td>
+<td>MediaMTX 中逻辑路径，如 <code>ptz/zoom/ch0</code>，与 UDP 端口一一对应</td>
+</tr>
+<tr>
+<td>RTMP</td>
+<td>实时消息传输协议，用于 GstCloudPusher 向天盾云端推流</td>
+</tr>
+<tr>
+<td>FLV</td>
+<td>Flash Video 容器格式，RTMP 协议要求的封装格式</td>
+</tr>
+<tr>
+<td>remux</td>
+<td>重封装，不重新编码，仅更换容器格式（如 RTP→FLV），CPU 开销极低</td>
+</tr>
+<tr>
+<td>天盾</td>
+<td>Skyfend 云端平台，提供设备管理、流媒体服务、MQTT Broker 等</td>
+</tr>
+<tr>
+<td>GstCloudPusher</td>
+<td>云端推流组件，从 MediaMTX 拉 RTSP 流免转码重封装推 RTMP 到天盾</td>
+</tr>
+</tbody>
+</table></article>
+    <script>
+        // Sync theme with parent page
+        try {
+            var parentTheme = window.parent.document.documentElement.getAttribute('data-theme');
+            if (parentTheme) document.documentElement.setAttribute('data-theme', parentTheme);
+            // Listen for theme changes
+            var observer = new MutationObserver(function(mutations) {
+                mutations.forEach(function(m) {
+                    if (m.attributeName === 'data-theme') {
+                        var t = window.parent.document.documentElement.getAttribute('data-theme');
+                        if (t) document.documentElement.setAttribute('data-theme', t);
+                    }
+                });
+            });
+            observer.observe(window.parent.document.documentElement, { attributes: true });
+        } catch(e) {}
+    </script>
+</body>
+</html>

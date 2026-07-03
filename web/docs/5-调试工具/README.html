@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>README</title>
+    <link rel="stylesheet" href="../../css/markdown.css">
+</head>
+<body>
+    <article class="markdown-body"><p>无</p></article>
+    <script>
+        // Sync theme with parent page
+        try {
+            var parentTheme = window.parent.document.documentElement.getAttribute('data-theme');
+            if (parentTheme) document.documentElement.setAttribute('data-theme', parentTheme);
+            // Listen for theme changes
+            var observer = new MutationObserver(function(mutations) {
+                mutations.forEach(function(m) {
+                    if (m.attributeName === 'data-theme') {
+                        var t = window.parent.document.documentElement.getAttribute('data-theme');
+                        if (t) document.documentElement.setAttribute('data-theme', t);
+                    }
+                });
+            });
+            observer.observe(window.parent.document.documentElement, { attributes: true });
+        } catch(e) {}
+    </script>
+</body>
+</html>

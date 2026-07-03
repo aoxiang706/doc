@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PTZ100_AGX 通信链路分析（C2 ↔ AGX ↔ 设备）</title>
+    <link rel="stylesheet" href="../../css/markdown.css">
+</head>
+<body>
+    <article class="markdown-body"><h2 id="ptz100_agx-c2-agx">PTZ100_AGX 通信链路分析（C2 ↔ AGX ↔ 设备）</h2>
+<blockquote>
+<p><strong>文档版本</strong>: V1.0<br />
+<strong>适用工程</strong>: <code>ptz100_agx</code><br />
+<strong>关注范围</strong>: C2 与 AGX（含 SFL200/Sentry）之间通信、以及 AGX 与各子设备之间通信</p>
+</blockquote>
+<hr />
+<h2 id="_1">一、整体概览</h2>
+<ul>
+<li><strong>上行链路（设备 → AGX → C2）</strong>：</li>
+<li>设备通过 UDP 组网协议（<code>netcon_protocol</code>）发现 AGX；</li>
+<li>建立 TCP 或 UDP 连接；</li>
+<li>在连接上跑私有协议：<code>alink</code>（雷达/哨兵/TracerP 等）或 PTZ 专用协议；</li>
+<li>
+<p>AGX 侧根据配置（含 SFL200 在线状态）决定是“直接上传给 C2”，还是“先上报给 SFL200 再透传给 C2”。</p>
+</li>
+<li>
+<p><strong>下行链路（C2 → AGX → 设备）</strong>：</p>
+</li>
+<li>C2 与 AGX 间使用 UDP 组网 + TCP/<code>alink</code>；</li>
+<li>C2 下发 <code>alink</code> 指令（包含目标设备 SN / 设备类型 / 消息 ID）；</li>
+<li>AGX 根据 SN/设备类型查表寻找具体设备连接（TCP/UDP/ROS），并进行协议级转发或转换。</li>
+</ul>
+<hr />
+<h2 id="c2-agxsentry">二、C2 ↔ AGX(Sentry) 通信机制</h2>
+<h3 id="21-ip">2.1 角色与 IP/端口配置</h3>
+<ul>
+<li>AGX 默认以 <strong>TCP Client</strong> 身份连接 C2：</li>
+</ul>
+<p>```12:22:src/srv/eth_link/eth_link.h</p>
+<h1 id="define-default_agx_access_ip-1921682163">define DEFAULT_AGX_ACCESS_IP   "192.168.2.163"</h1>
+<h1 id="define-default_agx_access_port-19005">define DEFAULT_AGX_ACCESS_PORT  19005</h1>
+<h1 id="define-agx_default_ip-1921681161">define AGX_DEFAULT_IP "192.168.1.161"</h1>
+<h1 id="define-agx_default_port_head-18070">define AGX_DEFAULT_PORT_HEAD 18070</h1>
+<pre><code>
+- 的确可以通过 UDP 组网流程改变这对 IP/端口（见调试时的 `0xBC` 请求连接逻辑），但“默认直连”是 `192.168.2.163:19005`。
+
+### 2.2 UDP 组网：LOOKUP / LOOKUP_RESP / REQUEST_CONNECT
+
+上位机 C2 和 AGX 之间通过 `netcon_protocol` 做自动发现和连接协商，核心消息：
+
+```11:24:src/srv/eth_link/eth_protocol/netcon_protocol.h
+#define NETPROTOCAL_MSG_ID_LOOKUP           0xBA  // 搜索
+#define NETPROTOCAL_MSG_ID_LOOKUP_RESP      0xBB  // 搜索结果
+#define NETPROTOCAL_MSG_ID_REQUEST_CONNECT  0xBC  // 请求建立 TCP 连接
+#define NETPROTOCAL_MSG_ID_CONFIG_RESP      0xBD
+</code></pre>
+<p>AGX 侧用于 C2 发现的 UDP 套接字配置（客户端身份）：</p>
+<p>```38:50:src/srv/eth_link/eth_link.c<br />
+static udp_socket_cfg_t sUdpCfg = <br />
+{<br />
+  .bFlagRecv    = true,<br />
+  .bBroadcast   = true,<br />
+  .bNetCard = true,<br />
+  .netcard = NETWORK_NETCARD_NAME,<br />
+  .wRecvPort    = 1800,<br />
+  .uRecvIp  = INADDR_ANY,<br />
+  .wSendPort    = 1810,<br />
+  .uSendIp  = 0xFFFFFFFF,<br />
+};</p>
+<pre><code>
+- 收 `1800`，发 `1810`（C2 侧实现需对称）。
+- `eth_protocol_handler()` 负责解析 UDP 报文，区分：
+  - `0xBA`：`eth_protocol_search_handler()`；
+  - `0xBC`：`eth_protocol_cntinfo_handler()`，根据 SN 判断是连 C2 还是连 SFL200。
+
+### 2.3 C2 请求连接逻辑（0xBC）
+
+当 C2 通过 `0xBC` 下发连接参数（包含 ip/port/sn/type）时，AGX 根据 SN 判断“自己当前应该扮演谁”：
+
+```835:869:src/srv/eth_link/eth_link.c
+if(psCntInfo-&gt;sn[0]) {
+    char *sfl200_sn = eth_protocol_get_sn(PTZ100_SENTRY_SN_PREFIX);
+    char *agx_sn    = eth_protocol_get_sn(PTZ100_AGX_SN_PREFIX);
+
+    if (0 == strcmp(sfl200_sn, psCntInfo-&gt;sn)) {
+        user_info.dev_type = ALINK_MONIT_C2_ID_SFL200;
+        eth_link_create_socket(psCntInfo-&gt;type, htonl(psCntInfo-&gt;ip), psCntInfo-&gt;port, &amp;user_info);
+    } else if (0 == strcmp(agx_sn, psCntInfo-&gt;sn)) {
+        user_info.dev_type = ALINK_DEV_ID_C2;
+        eth_link_create_socket(psCntInfo-&gt;type, htonl(psCntInfo-&gt;ip), psCntInfo-&gt;port, &amp;user_info);
+    }
+}
+</code></pre>
+<ul>
+<li>SN 匹配 <code>AGX_SN</code> → 走 “AGX 直接连 C2” 模式；</li>
+<li>SN 匹配 <code>SENTRY_SN</code> → 走 “AGX 以 SFL200/Sentry 身份连 C2（代理 SRP）” 模式。</li>
+</ul>
+<p><code>eth_link_create_socket()</code> 最终会创建 TCP client，并通过回调 <code>c2_network_create()</code> 交给 <code>c2_network</code> 模块。</p>
+<h3 id="24-tcp-alink">2.4 TCP 上的协议：alink</h3>
+<p>TCP 建链完成后，<code>c2_network_cbk_data()</code> 负责从 socket 读取完整的 alink 结构包，并交给 <code>alink_socket_task()</code>：</p>
+<p>```391:459:src/app/c2_network/c2_network.cpp<br />
+int c2_network_cbk_data(..., eth_link_socket_dev_info_t<em> sockeid, int32_t (</em>pi_recv)(...))<br />
+{<br />
+    // 读取并组装完整 alink 包（根据 magic/len/head/crc 判断包长）<br />
+    integrity_pkg_len = alink_package_integrity_check(abyBuffer, iLength, protoco_version);<br />
+    // ...<br />
+    sImport.ePortId     = sockeid-&gt;sock_id;<br />
+    sImport.protocol_type = protoco_version;<br />
+    sImport.pbyData     = pabybuf;<br />
+    sImport.uLength     = integrity_pkg_len;<br />
+    sImport.handle      = psNetwork-&gt;psUser-&gt;psSocket;<br />
+    sImport.handle2     = (void *)psNetwork;<br />
+    sImport.pe_send     = psNetwork-&gt;psUser-&gt;pi_send;</p>
+<pre><code>if (is_sfl200_online) {
+    alink_socket_task( &amp;psNetwork-&gt;sAlinkSocket_sfl200, &amp;sImport );
+} else {
+    alink_socket_task( &amp;psNetwork-&gt;sAlinkSocket, &amp;sImport );
+}
+</code></pre>
+<p>}</p>
+<pre><code>
+`alink_socket_task()` 会调用 `alink_recv_task()` → `alink_order_task()` 完成：
+- magic / head / crc 校验；
+- 按 `msgid` 分发到对应的 command handler（System/Target/Track/…）；
+- 若注册了 `pv_origin_payload_output`，则允许用户代码截取“原始包”做透传/代理。
+
+---
+
+## 三、两种 C2 ↔ AGX 拓扑模式
+
+### 3.1 模式一：AGX 直接作为 SRP/AGX 身份连 C2
+
+- C2 发 `0xBC` 时 SN 匹配 `eth_protocol_get_sn(PTZ100_AGX_SN_PREFIX)`；
+- `eth_link_create_socket()` 创建的是 `dev_type = ALINK_DEV_ID_C2`；
+- `c2_network_create()` 中只初始化 `sAlinkSocket`，并用 `c2_network_send()` 直接发给 C2。
+
+```761:779:src/app/c2_network/c2_network.cpp
+if (psUser-&gt;link_user_info.dev_type == ALINK_DEV_ID_C2) {
+    alink_connect_port(&amp;psNetwork-&gt;sAlinkSocket, NULL, ALINK_DEV_ID_C2);
+    alink_connect_send_agx_srp(psNetwork, psUser, c2_network_send);  // agx直接发送到c2
+}
+</code></pre>
+<p>此模式下，SRP/AGX 的所有上报（雷达/融合/AI/PTZ/设备列表/心跳等）都由 AGX 直接打包为 <code>ALINK_DEV_ID_C2</code> 目的端的 alink 包，发给 C2。</p>
+<h3 id="32-agx-sfl200sentry-sfl200">3.2 模式二：AGX 作为 SFL200/Sentry 的子设备，由 SFL200 代理上报</h3>
+<p>当 <code>get_sfl200_online_status()</code> 为 true 时：<br />
+- C2 发 <code>0xBC</code> 时 SN 匹配 <code>PTZ100_SENTRY_SN_PREFIX</code>；<br />
+- <code>eth_link_create_socket()</code> 选择 <code>dev_type = ALINK_MONIT_C2_ID_SFL200</code>；<br />
+- <code>c2_network_create()</code> 中除了 <code>sAlinkSocket</code> 之外，还会多初始化一个 <code>sAlinkSocket_sfl200</code>，用来解析 SFL200 专属的 alink 流。</p>
+<p>关键是 <strong>0xFD 透传链路</strong>：</p>
+<ol>
+<li><strong>AGX 内部 SRP 报文 → 封成 0xFD 透传给 C2</strong>：</li>
+</ol>
+<p>```111:147:src/app/c2_network/c2_network.cpp<br />
+// sfl200将agx内部SRP雷视原始报文 封装成新的0xfd转发协议<br />
+static int32_t sfl200_package_0xfd_agx_srp(uint8_t <em>data, uint32_t dataLen, uint8_t </em>buf, uint32_t bufSize)<br />
+{<br />
+    alink_transfer_package_t payload{};<br />
+    snprintf((char <em>)payload.sn, sizeof(payload.sn), "%s", agx_sn); // AGX SN<br />
+    payload.protocol = 5;<br />
+    payload.cmdlen = dataLen;<br />
+    memcpy(payload.transfer_package, data, dataLen);<br />
+    // 外层再封装成 msgid=0xFD 的 alink V1 包，destid=C2, sourceid=SFL200/SFL210<br />
+    int32_t len = alinkV1_package_encode(0xFD, 0, 0, ALINK_DEV_ID_C2, sfl_device_type, (uint8_t </em>)&amp;payload, payloadLen, buf, bufSize);<br />
+    return len;<br />
+}</p>
+<pre><code>
+2. **0xFD 转发具体实现**：
+
+```149:168:src/app/c2_network/c2_network.cpp
+// sfl200的0xfd指令透传agx的srp雷视数据
+static int32_t c2_network_send_agx_srp_by_sfl200_0xfd( void* handle, uint8_t *pbyData, uint32_t uLen )
+{
+    uint8_t buf[64 * 1024] = {0};
+    int32_t len = sfl200_package_0xfd_agx_srp(pbyData, uLen, buf, sizeof(buf));
+    eth_link_user_t *psUser = (eth_link_user_t*)handle;
+    return psUser-&gt;pi_send( psUser-&gt;psSocket, buf, len );
+}
+</code></pre>
+<ol start="3">
+<li><strong>SFL200 收到 0xFD 后 → 解出 <code>sn+protocol+cmd</code> → 按 SN 转发给子设备</strong>：<br />
+见 <code>sfl200_origin_payload_data()</code> 中对 <code>byCmd == 0xFD</code> 的处理逻辑：</li>
+</ol>
+<p>```135:185:src/app/sfl200_app/sfl200_app.cpp<br />
+// 0xfd 透传子设备原始消息<br />
+if (0xfd == byCmd) {<br />
+    alink_transfer_package_t <em>package = (alink_transfer_package_t </em>)payload-&gt;pbyData;<br />
+    if (8 == package-&gt;protocol) { // svh100<br />
+        alink_transfer_c2_2_svh100((void <em>)package, devinfo.dev_id);<br />
+    } else if (9 == package-&gt;protocol) { // stp120<br />
+        alink_transfer_c2_2_stp120((void </em>)package, devinfo.dev_id);<br />
+    } else if (5 == package-&gt;protocol) { // 送到AGX内部SRP雷视<br />
+        sfl200TransPackageToAgxSrp(handle2, package-&gt;transfer_package, package-&gt;cmdlen);<br />
+    }<br />
+    return 1; // 表示本进程不再回包，已自行处理<br />
+}</p>
+<pre><code>
+因此，在 “AGX 挂在 SFL200 下” 的拓扑里：
+- C2 只看见一条与 SFL200 的 alink 流（含 `msgid=0xFD` 的“打包转发”帧）；
+- SRP/AGX 与子设备的真实交互，被当作原始 payload 嵌进 `alink_transfer_package_t`，再经 SFL200 转发。
+
+---
+
+## 四、AGX(Sentry) ↔ 子设备 通信机制
+
+### 4.1 通过 eth_link_server 管理的以太网子设备
+
+包括：**雷达（V1/V2）、SFL100（旧名 sentry）、STP120、SVH100、TracerP 等**。  
+统一模式：
+
+1. **AGX 周期性发送 UDP 探测（0xBA）**：
+
+```139:177:src/srv/eth_link/eth_link_server.c
+while(!dt_obj-&gt;exit_relase) {
+    // keep sentry online heartbeat（略）
+    plen = eth_protocol_get_detect_package(..., SKYFEND_PROTOCOL_TYPE_V1);
+    udp_socket_send(dt_obj-&gt;sever_socket, (uint8_t *)&amp;ep_lookup_package, plen);
+    plen = eth_protocol_get_detect_package(..., SKYFEND_PROTOCOL_TYPE_V2);
+    udp_socket_send(dt_obj-&gt;sever_socket, (uint8_t *)&amp;ep_lookup_package, plen);
+    sleep(dt_obj-&gt;detect_frequence); // 默认 2 秒
+}
+</code></pre>
+<ol start="2">
+<li><strong>设备回应 LOOKUP_RESP（0xBB）</strong> → <code>eth_protocol_search_handler()</code> 决定是否接受该设备：</li>
+</ol>
+<p>```945:962:src/srv/eth_link/eth_link_server.c<br />
+if(psdev-&gt;type != ALINK_DEV_ID_RADAR <br />
+   &amp;&amp; psdev-&gt;type != ALINK_DEV_ID_SFL100 <br />
+   &amp;&amp; psdev-&gt;type != ALINK_DEV_ID_STP120 <br />
+   &amp;&amp; psdev-&gt;type != ALINK_DEV_ID_TRACERP<br />
+   &amp;&amp; psdev-&gt;type != ALINK_DEV_ID_SVH100) {<br />
+    return; // 只接受这几类设备<br />
+}<br />
+if(psdev-&gt;type == ALINK_DEV_ID_RADAR &amp;&amp; psdev-&gt;protocol == SKYFEND_PROTOCOL_TYPE_V2) {<br />
+    psdev-&gt;type = ALINK_DEV_ID_RADAR_V2;<br />
+}</p>
+<pre><code>
+3. **AGX 为每个设备类型创建 TCP Server 并要求其连接（0xBC）**：
+
+```965:993:src/srv/eth_link/eth_link_server.c
+int ret = eth_link_create_server(psdev-&gt;type, psdev-&gt;protocol, (char*)psdev-&gt;sn, uIp);
+// ...
+ep_ctlinfo.ip   = psEthList-&gt;server_ip;      // AGX ip
+ep_ctlinfo.port = psEthList-&gt;cur_con;       // 动态分配的 TCP 端口（从 18070 开始）
+ret = eth_protocol_get_request_package((void*)buffer, &amp;ep_ctlinfo);
+udp_socket_send(&amp;sUdpSocket, (uint8_t *)buffer, ret); // 发 0xBC
+</code></pre>
+<ol start="4">
+<li><strong>设备连上来后，由 <code>radar_network</code> 接管该连接</strong>：</li>
+</ol>
+<p>```593:597:src/app/radars_network/radar_network.cpp<br />
+int32_t radar_network_init(void)<br />
+{<br />
+    ros_app::ros_register_subscribe_cbk(ROS_DHP100_DATA, radar_dhp100_ckb_handle);<br />
+    return eth_server_register(RTH_LINK_NET_TCP_CLIENT, radar_network_create);<br />
+}</p>
+<pre><code>
+`radar_network_create()` 根据 `dev_type` 决定接入方式，并为雷达/SFL100/STP120/SVH100/TracerP 注册各自的 `origin_payload` 透传回调：
+
+```472:587:src/app/radars_network/radar_network.cpp
+if(psUser-&gt;link_user_info.dev_type == ALINK_DEV_ID_RADAR) {
+    alink_connect_port(&amp;psNetwork-&gt;sAlinkSocket, NULL, ALINK_DEV_ID_RADAR);
+    // 注册雷达V1的 origin_payload 回调，用于将部分命令原始透传给 C2
+    alink_connect_send(..., 0x1E, ALINK_DEV_ID_RADAR, psUser, radar_network_send);
+    alink_order_payload_op_register(ALINK_DEV_ID_RADAR, radar_v1_origin_payload_data);
+}
+else if(psUser-&gt;link_user_info.dev_type == ALINK_DEV_ID_SFL100 ) {
+    alink_connect_port(&amp;psNetwork-&gt;sAlinkSocket, NULL, ALINK_DEV_ID_SFL100);
+    alink_connect_send(..., 0x25, ALINK_DEV_ID_SFL100, psUser, radar_network_send);
+    alink_connect_send(..., ALINK_MSGID_TRANSFER_CMD, ALINK_DEV_ID_SFL100, psUser, radar_network_send);
+    alink_order_payload_op_register(ALINK_DEV_ID_SFL100, sentry_origin_payload_data);
+}
+// SVH100/STP120/TracerP/RADAR_V2 同理，分别注册自己的 origin_payload 回调
+</code></pre>
+<ol start="5">
+<li><strong>雷达 / SFL100 / STP120 / SVH100 / TracerP 对 C2 的透传逻辑</strong>：</li>
+</ol>
+<ul>
+<li>以雷达 V1 为例：</li>
+</ul>
+<p>```84:101:src/app/radars_network/radar_network.cpp<br />
+static int32_t radar_v1_origin_payload_data(alink_payload_t <em>payload, void </em>data, uint8_t byCmd, void *handle2)<br />
+{<br />
+    // 只对 radar_v1_transfer_commands 白名单中的 msgid 做透传<br />
+    radar_packages_transfer(payload-&gt;ePortId, data, payload-&gt;wLength + ALINK_V1_NO_PAYLOAD_SIZE);<br />
+    return 1; // 返回1表示已处理，不再由 alink_order_send 回包<br />
+}</p>
+<pre><code>
+- `radar_packages_transfer()` 通过 SN 找到该设备在 C2 侧的逻辑 ID，并使用 `alink_transfer_device_2_c2()` 把整个原始包嵌入 `alink_transfer_package_t` 上传：
+
+```60:81:src/app/radars_network/radar_network.cpp
+eth_link_device_info_t devinfo{};
+alink_transfer_package_t pack{};
+find_device_info_by_devid(&amp;devinfo, dev_id);
+pack.cmdlen   = data_len;
+pack.protocol = devinfo.protocol_type;
+snprintf(pack.sn, sizeof(pack.sn), &quot;%s&quot;, devinfo.dev_sn);
+memcpy(pack.transfer_package, data, pack.cmdlen);
+alink_transfer_device_2_c2(&amp;pack);
+</code></pre>
+<h3 id="42-ptzudp-ptz-rtsp">4.2 PTZ（云台）通信：UDP + PTZ 专用协议 + RTSP</h3>
+<p>PTZ 采用的是<strong>独立的 UDP 协议</strong>（非 alink）：</p>
+<ol>
+<li><strong>控制/状态端口</strong>：</li>
+</ol>
+<p>```230:237:src/srv/eth_link/eth_link_ptz.cpp<br />
+pdata_ctrl.ptz_object_content.sUdpCfg.uSendIp   = inet_addr(PTZ_DEFAULT_IP); // "192.168.2.4"<br />
+pdata_ctrl.ptz_object_content.sUdpCfg.wRecvPort = 9966;<br />
+pdata_ctrl.ptz_object_content.sUdpCfg.wSendPort = 9966;</p>
+<pre><code>
+2. **封包/解包协议**：`ptz_control_protocol.c` / `ptz_control.c`  
+   - `ptz_protocol_package()`：封装为 `head + len + cmd + timestamp + payload + seq + crc + stopbit`；
+   - `ptz_protocol_network_data_analysis()`：解析 UDP 帧，得到 `command + msglen + msg` 等。
+
+3. **AGX 发送 PTZ 控制指令**：上层调用 `send_ptz_control_*()`，最终走 `send_ptz_package()` → UDP：
+
+```18:41:src/srv/eth_link/ptz_protocol/ptz_control.c
+int send_ptz_control_addr(ptz_msgid_0x03_addr_t *addr_t)
+{
+  // 填充时间戳等
+  msginfo.command = PTZ_COMMAND_ADDR;
+  msginfo.msglen  = sizeof(ptz_msgid_0x03_addr_t);
+  ret = send_ptz_package(&amp;msginfo);
+}
+</code></pre>
+<p>```308:321:src/srv/eth_link/eth_link_ptz.cpp<br />
+int send_ptz_package(ptz_protocol_msg_t *msginfo)<br />
+{<br />
+    uint8_t pac[PTZ_PACKAGE_MAX_LEN] = {0};<br />
+    retlen = ptz_protocol_package(msginfo-&gt;command, msginfo-&gt;msg, msginfo-&gt;msglen, pac);<br />
+    udp_socket_send(&amp;pdata_ctrl.ptz_object_content.sUdpSocket, pac, retlen);<br />
+    // 同时可以回调给上层做“原始数据上报给 ROS/C2”<br />
+}</p>
+<pre><code>
+4. **AGX 接收 PTZ 状态 / 目标**：
+
+```94:118:src/srv/eth_link/eth_link_ptz.cpp
+static void eth_protocol_handler( void* msg, uint32_t len, uint32_t devid )
+{
+    ptz_protocol_msg_t lmsg = {0};
+    ptz_protocol_network_data_analysis((uint8_t*)msg, len, &amp;lmsg);
+    lmsg.devid = devid;
+    if(pdata_ctrl.ptz_list_obj &amp;&amp; pdata_ctrl.ptz_list_obj[lmsg.command].cbk) {
+        pdata_ctrl.ptz_list_obj[lmsg.command].cbk(&amp;lmsg);
+    }
+    if(pdata_ctrl.send_ori_data_callback) {
+        pdata_ctrl.send_ori_data_callback(lmsg.msg, lmsg.command, lmsg.msglen, PTZ_ORI_DATA_TYPE_STATUS);
+    }
+}
+</code></pre>
+<p><code>app/ptz/ptz_app.cpp</code> 中注册了这些命令回调，并把 <strong>原始 PTZ 数据转成 ROS topic</strong>：</p>
+<p><code>503:515:src/app/ptz/ptz_app.cpp
+ros_app::ros_register_subscribe_cbk(ROS_PTZ_CTL_DATA, ptz_packet_ckb_handle);
+eth_ptz_ori_data_register(ptz_data_2_ros_data);
+eth_ptz_command_register(PTZ_COMMAND_DEV_STATUS,          ptz_dev_status);
+eth_ptz_command_register(PTZ_COMMAND_TARGET_INFO,         ptz_target_info);
+eth_ptz_command_register(PTZ_COMMAND_ATT_MSG,             ptz_pitch_azimuth);
+eth_ptz_command_register(PTZ_COMMAND_DEV_EXT_INFO,        ptz_dev_ext_info_0x08);
+eth_ptz_command_register(PTZ_COMMAND_LENSE_EXT_INFO,      ptz_lense_ext_info_0x0c);
+eth_ptz_command_register(PTZ_COMMAND_SYS_EXT_INFO,        ptz_sys_ext_info_0x15);
+eth_ptz_command_register(PTZ_COMMAND_TRAGET_MISSING_QS,   ptz_target_missing_qs_msg);</code></p>
+<ol start="5">
+<li><strong>PTZ 视频流</strong>：<br />
+   - PTZ 原始 RTSP 通常是设备自带（例如 <code>rtsp://192.168.2.4/...</code>）；<br />
+   - AGX 内部会再将图像通过 GStreamer 处理并写入 <code>ShmTransferFrame</code>（与 <code>alg_app</code> 共享内存）；<br />
+   - 同时也在本地 <code>9554</code> 端口提供二次 RTSP 输出（见 <code>get_ptz_dev_info()</code> 生成的 URL）。</li>
+</ol>
+<h3 id="43-sfl200sfl210">4.3 SFL200/SFL210 与各子设备：二层网关角色</h3>
+<p>当 SFL200/SFL210 在线时：<br />
+- 它既作为 <strong>C2 眼中的一个设备</strong>（AGX 把自己身份隐藏在其后）；<br />
+- 又作为 <strong>AGX 眼中的“下级网关”</strong>，管理 BPH110 激光、SRP200/210/230、SVH100、STP120 等子设备。</p>
+<p>数据通路典型模式：</p>
+<ul>
+<li><strong>子设备 → SFL200 → C2</strong>：设备到 AGX 的数据有一部分会被打包为 <code>alink_sentry_transfer_package_t</code>，通过 <code>alink_transfer_sfl200_to_c2()</code> 上报给 C2；</li>
+<li><strong>C2 → SFL200 → 子设备</strong>：C2 下发 <code>0xFD</code>（或 <code>0xF0</code>等）命令给 SFL200，SFL200 根据 <code>sn</code> 和 <code>protocol</code> 在本地子设备表中查找具体设备，并转发原始包。</li>
+</ul>
+<p>典型代码入口：<br />
+- <code>app/sfl200_app/sfl200_app.cpp</code>：<code>sfl200_origin_payload_data()</code>、<code>sentry_origin_payload_data()</code>、<code>svh100_origin_payload_data()</code>、<code>stp120_origin_payload_data()</code>；<br />
+- <code>src/inc/sfl200.h</code>：<code>sfl200_message_t</code>、<code>sfl200AlinkHead0xF0_t</code> 及一系列 0xF0 子消息结构体定义。</p>
+<h3 id="44-ros-gnss">4.4 其他通过 ROS 接入的设备（GNSS、电子围栏、干扰机等）</h3>
+<p>这些设备大多：<br />
+- 驱动层在 <code>ros_ws/src/*</code> 下实现（如 <code>gnss_b3</code>、<code>electronic_fence</code>、<code>spoofer</code> 等）；<br />
+- AGX 主程序通过 <code>ros_app</code> 订阅其 ROS Topic，随后用 <code>alink_upload_*</code> 上报 C2；<br />
+- C2 的控制指令由 <code>srv/alink/command/*</code> 模块接收后，转换为相应 ROS Topic 下发给驱动节点。</p>
+<p>这类链路的“物理协议”取决于各自驱动实现（串口/以太网/MQTT 等），在本工程中主要关心的是 <strong>“ROS ↔ alink ↔ C2” 的逻辑桥接关系</strong>。</p>
+<hr />
+<h2 id="_2">五、调试 / 排查建议</h2>
+<ul>
+<li><strong>C2 ↔ AGX 组网阶段</strong>：</li>
+<li>抓 UDP <code>1800/1810</code>，确认是否有 <code>0xBA/0xBB/0xBC</code> 往来；</li>
+<li>
+<p>对照 <code>eth_link.c</code> / <code>eth_protocol_handler()</code> 日志，看是否正确识别 SN 并创建 TCP client。</p>
+</li>
+<li>
+<p><strong>C2 ↔ AGX 数据阶段</strong>：</p>
+</li>
+<li>抓 TCP <code>19005</code>（或 C2 下发的 port），确认 alink 帧完整性（magic/长度/CRC）；</li>
+<li>
+<p>关注 <code>c2_network_cbk_data()</code> 是否报 <code>iLength &lt;= 0</code> 或 <code>alink_package_integrity_check()</code> 返回异常。</p>
+</li>
+<li>
+<p><strong>AGX ↔ 雷达/SFL100/STP120/SVH100/TracerP</strong>：</p>
+</li>
+<li>抓 UDP <code>1800/1810</code>（设备口），看设备是否回应 LOOKUP_RESP（0xBB），以及 AGX 是否回 REQUEST_CONNECT（0xBC）；</li>
+<li>抓对应的 TCP 端口（从 18070 起），对照 <code>radar_network_cbk_connect()</code> / <code>radar_network_cbk_data()</code> 日志；</li>
+<li>
+<p>确认 <code>alink_order_payload_op_register()</code> 是否注册成功（用于 0xFD/0xFE 透传）。</p>
+</li>
+<li>
+<p><strong>PTZ</strong>：</p>
+</li>
+<li>抓 UDP <code>9966</code>，确认控制/状态帧收发是否正常；</li>
+<li>
+<p>抓 RTSP <code>9554</code>（AGX 本地推流）和 PTZ 原始 RTSP，看视频是否连通。</p>
+</li>
+<li>
+<p><strong>SFL200 模式切换</strong>：</p>
+</li>
+<li>检查 SQLite <code>dev_cfg</code> 表里 SFL200/SFL210 的 <code>online</code> 字段；</li>
+<li>对照 <code>get_sfl200_online_status()</code> / <code>get_sfl210_online_status()</code> 是否如预期；</li>
+<li>注意部分代码用 <code>static bool is_sfl200_online = get_sfl200_online_status();</code> 缓存，只在进程启动时评估一次。</li>
+</ul>
+<hr />
+<h2 id="_3">六、小结</h2>
+<ul>
+<li><strong>C2 ↔ AGX</strong>：基于 <code>netcon_protocol</code> 的 UDP 自动组网（0xBA/0xBB/0xBC），TCP 之上跑 <code>alink</code>（V1/V2），支持“AGX 直连”和“经 SFL200 代理”两种模式；</li>
+<li><strong>AGX ↔ 子设备</strong>：以太网设备统一走 <code>eth_link_server + radar_network + alink</code>，PTZ 走 UDP + 自定义协议 + RTSP，其他设备多通过 ROS 接入；</li>
+<li><strong>透传机制</strong>：大量使用 <code>0xFD</code> + <code>alink_transfer_package_t(sn+protocol+cmdlen+payload)</code> 做“C2 ↔ 子设备”原始报文透传，AGX/SFL200 作为网关负责 SN 路由和协议转换。</li>
+</ul></article>
+    <script>
+        // Sync theme with parent page
+        try {
+            var parentTheme = window.parent.document.documentElement.getAttribute('data-theme');
+            if (parentTheme) document.documentElement.setAttribute('data-theme', parentTheme);
+            // Listen for theme changes
+            var observer = new MutationObserver(function(mutations) {
+                mutations.forEach(function(m) {
+                    if (m.attributeName === 'data-theme') {
+                        var t = window.parent.document.documentElement.getAttribute('data-theme');
+                        if (t) document.documentElement.setAttribute('data-theme', t);
+                    }
+                });
+            });
+            observer.observe(window.parent.document.documentElement, { attributes: true });
+        } catch(e) {}
+    </script>
+</body>
+</html>

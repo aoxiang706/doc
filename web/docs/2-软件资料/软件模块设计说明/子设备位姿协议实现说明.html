@@ -1,0 +1,861 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>实现 0x73 子设备位姿查询/设置协议</title>
+    <link rel="stylesheet" href="../../css/markdown.css">
+</head>
+<body>
+    <article class="markdown-body"><hr />
+<p>name: 电子围栏实现0x73子设备位姿协议<br />
+overview: 在 alink_system 模块中新增 0x73 协议处理，支持 C2 查询/设置子设备位姿参数，覆盖 STF200(电侦)、SDH100(小雷达)、DPH120/130(中程雷达)、PTZ 等子设备类型。<br />
+todos:<br />
+  - id: struct-def<br />
+    content: 在 alink_system.h 中定义 0x73 请求/响应结构体 (alink_subdev_pose_req_t, alink_subdev_pose_item_t, alink_subdev_pose_resp_t)<br />
+    status: completed<br />
+  - id: register-cmd<br />
+    content: 在 alink_system.cpp 的 alink_system_init() 中注册 0x73 命令<br />
+    status: completed<br />
+  - id: query-impl<br />
+    content: "实现 cmd=1 查询逻辑: 遍历 g_subDevCfgApi 所有子设备，填充响应数组"<br />
+    status: completed<br />
+  - id: set-save<br />
+    content: "实现 cmd=2 设置逻辑: 解析请求参数，保存到 g_subDevCfgApi.updateBySn()"<br />
+    status: completed<br />
+  - id: set-stf200<br />
+    content: "实现 STF200 位姿下发: 新增 PB PositionOrientationConfig 编码和发送函数"<br />
+    status: completed<br />
+  - id: set-sdh100<br />
+    content: "实现 SDH100 位姿下发: 复用 alink_upload_cmd_set_radar_att_v2_to_dest 发送经纬高"<br />
+    status: completed<br />
+  - id: set-dph<br />
+    content: "实现 DPH120/130 位姿下发: DPH120/DPH130 均更新全部6参数(LLA+azimuth_angle+roll_angle+pitch_angle，heading→azimuth_angle)，通过 ros_app_publish_radar_param_set 发送"<br />
+    status: completed<br />
+  - id: fix-bug<br />
+    content: (可选) 修复 convertDevAttrParamToAlinkMsg 中 local_heading/pitch/roll 赋值错误<br />
+    status: completed<br />
+isProject: false</p>
+<hr />
+<h1 id="0x73">实现 0x73 子设备位姿查询/设置协议</h1>
+<h2 id="_1">一、协议结构设计</h2>
+<h3 id="c2-agx-100">请求 (C2 -&gt; AGX, 100 字节)</h3>
+<ul>
+<li>cmd (uint8_t, 1字节): 命令选项，1=查询所有子设备位姿，2=设置指定子设备位姿</li>
+<li>sn (char[32], 32字节): 子设备SN</li>
+<li>type (uint8_t, 1字节): 子设备类型，参照附录A</li>
+<li>longitude (double, 8字节): 经度</li>
+<li>latitude (double, 8字节): 纬度</li>
+<li>altitude (float, 4字节): 绝对海拔高度</li>
+<li>heading (float, 4字节): 方位角（与地理正北的方位角）</li>
+<li>rolling (float, 4字节): 横滚角</li>
+<li>pitching (float, 4字节): 俯仰角</li>
+<li>reserve (uint8_t[34], 34字节): 预留</li>
+</ul>
+<h3 id="agx-c2">响应 (AGX -&gt; C2)</h3>
+<p>固定头部（6字节）:</p>
+<ul>
+<li>result (int32_t, 4字节): 0=成功，其他=失败</li>
+<li>cmd (uint8_t, 1字节): 回传原始命令选项</li>
+<li>num (uint8_t, 1字节): 返回的设备个数</li>
+</ul>
+<p>设备数组（99字节 * num）:</p>
+<ul>
+<li>sn (uint8_t[32], 32字节): 设备SN</li>
+<li>type (uint8_t, 1字节): 设备类型</li>
+<li>longitude (double, 8字节): 经度</li>
+<li>latitude (double, 8字节): 纬度</li>
+<li>altitude (float, 4字节): 绝对海拔高度</li>
+<li>heading (float, 4字节): 方位角</li>
+<li>rolling (float, 4字节): 横滚角</li>
+<li>pitching (float, 4字节): 俯仰角</li>
+<li>reserve (uint8_t[34], 34字节): 预留</li>
+</ul>
+<p>各 cmd 响应行为:</p>
+<ul>
+<li>cmd=1 查询: result=0, num=子设备总数, list填充所有子设备位姿, 总长度 = 6 + 99*num</li>
+<li>cmd=2 设置: result=0(成功)/负数(失败), num=0, 不带设备数据, 总长度 = 6</li>
+</ul>
+<h2 id="_2">二、雷达型号命名说明</h2>
+<ul>
+<li><strong>DPH100</strong> 是中程雷达的<strong>对外统一型号</strong>，内部分为两个子型号：</li>
+<li><strong>DPH120</strong> — 中程机扫雷达（内部型号），枚举 <code>DEV_TYPE_RADAR_DPH120 = 12</code></li>
+<li><strong>DPH130</strong> — 中程四面阵雷达（内部型号），枚举 <code>DEV_TYPE_RADAR_DPH130 = 13</code></li>
+<li><strong>SDH100</strong> — 小雷达（近程雷达），枚举 <code>DEV_TYPE_RADAR_SDH100 = 1</code>，与 DPH 系列是完全不同的产品</li>
+<li>代码中 <code>DEV_TYPE_RADAR_DPH100 = 8</code> 为历史遗留枚举，实际不再使用</li>
+</ul>
+<h2 id="ssf">三、SSF一体化设备规则（王志强提出）</h2>
+<h3 id="_3">王志强原始要求</h3>
+<blockquote>
+<p>"这个设计给分体预留的，目前ptz的经纬度和俯偏滚以及雷达的经纬度没参与计算，只是显示。按一体化处理<br />
+保留系统和子设备的定位和定姿信息<br />
+雷达及ptz经纬度置灰（不可修改），填充与系统的经纬度一样的数值<br />
+ptz俯偏滚置灰（不可修改），默认0°"</p>
+</blockquote>
+<h3 id="_4">背景</h3>
+<p>0x73协议最初设计是<strong>给分体式设备预留</strong>的，允许C2独立配置每个子设备的经纬高和姿态角。目前SSF系列为一体式设备（子设备与主设备固定在同一机体上），子设备的物理位置与主设备相同。SRP系列暂不做一体化处理。</p>
+<h3 id="_5">一体式主设备列表</h3>
+<p>仅以下SSF系列主设备按一体化规则处理：</p>
+<table>
+<thead>
+<tr>
+<th>系列</th>
+<th>主设备</th>
+<th>ALINK ID</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Spotter</td>
+<td>SSF100</td>
+<td>0x1b</td>
+</tr>
+<tr>
+<td>Spotter Pro</td>
+<td>SSF200</td>
+<td>0x23</td>
+</tr>
+<tr>
+<td>Spotter Pro</td>
+<td>SSF210</td>
+<td>0x24</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>注</strong>: SRP系列（SRP100/SRP200/SRP210）暂不做一体化处理。SFL/Sentry/BPH等也不在一体化范围内。</p>
+</blockquote>
+<h3 id="_6">一体化规则</h3>
+<ol>
+<li><strong>雷达/PTZ子设备经纬高 = 系统全局经纬高</strong>（即0x71/0x72设置值），C2侧置灰不可修改</li>
+<li><strong>雷达子设备俯偏滚：用户可正常配置</strong>，C2侧SSF系列不置灰，AGX不做限制</li>
+<li><strong>PTZ子设备俯仰/横滚/方位角 = 0°</strong>，C2侧置灰不可控制</li>
+<li><strong>STF200(电侦TracerMatrix)除外</strong> — STF200可能为分体式独立AGX设备，作为子设备接入电子围栏，因此保留独立位姿设置能力</li>
+</ol>
+<h3 id="_7">受影响的子设备类型</h3>
+<table>
+<thead>
+<tr>
+<th>子设备类型</th>
+<th>经纬高处理</th>
+<th>姿态角(heading/rolling/pitching)处理</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>雷达 (SDH100/DPH120/DPH130)</td>
+<td>填充系统全局经纬高，C2置灰</td>
+<td><strong>用户可配置</strong>，AGX不做限制</td>
+</tr>
+<tr>
+<td>PTZ (耐杰/和普全系列)</td>
+<td>填充系统全局经纬高，C2置灰</td>
+<td>强制为0°，C2置灰</td>
+</tr>
+<tr>
+<td>STF200 (电侦)</td>
+<td><strong>不受一体化规则约束</strong></td>
+<td><strong>不受一体化规则约束</strong></td>
+</tr>
+<tr>
+<td>其他设备</td>
+<td>仅存AGX本地</td>
+<td>仅存AGX本地</td>
+</tr>
+</tbody>
+</table>
+<h3 id="_8">代码实现</h3>
+<p>在 <code>alink_system.cpp</code> 中通过内联判断 SSF 设备类型（与 <code>alink_target.c</code> 保持一致风格）：</p>
+<pre><code class="language-c">int32_t agx_type = get_agx_device_type();
+bool isSSF = (ALINK_DEV_ID_SSF100 == agx_type || ALINK_DEV_ID_SSF200 == agx_type ||
+              ALINK_DEV_ID_SSF210 == agx_type);
+</code></pre>
+<p>辅助函数 <code>isRadarSubDev(devType)</code> 和 <code>isPtzSubDev(devType)</code> 用于判断子设备类型。</p>
+<p><strong>cmd=1 查询</strong>: 若主设备为SSF且子设备为雷达/PTZ（非STF200），用 <code>g_hostDevCfgApi.getRadarV()</code> 获取系统全局经纬高覆盖返回值。PTZ子设备额外将heading/rolling/pitching返回0。雷达姿态角返回设备自身存储的值（不覆盖）。</p>
+<p><strong>cmd=2 设置</strong>: 若主设备为SSF且目标子设备为雷达/PTZ（非STF200），经纬高强制使用系统全局值。PTZ姿态角强制0°。雷达姿态角使用C2下发的值（用户可配置）。</p>
+<h2 id="_9">四、各子设备位姿写入能力分析</h2>
+<pre><code class="language-mermaid">flowchart TD
+    subgraph cmd2 [cmd=2 设置流程]
+        A[C2 发送 0x73 cmd=2] --&gt; INT{&quot;SSF系列?\n(SSF100/SSF200/SSF210)&quot;}
+        INT --&gt;|&quot;是 且 雷达/PTZ\n(STF200除外)&quot;| OVR[&quot;SSF一体化覆盖:\n经纬高 = 系统全局经纬高\n雷达姿态 = C2下发值(可配)\nPTZ姿态 = 0°&quot;]
+        INT --&gt;|否 或 STF200| PASS[使用C2下发的原始值]
+        OVR --&gt; B
+        PASS --&gt; B
+        B[AGX 保存到 g_subDevCfgApi] --&gt; C{设备类型判断}
+        C --&gt;|STF200| D[&quot;PB: PositionOrientationConfig 0x0040\n经纬高 + yaw/pitch/roll\n全部6参数下发&quot;]
+        C --&gt;|SDH100| E[&quot;PB: RadarC2Config 0xB0\n经纬高 + heading/rolling/pitching\n全部6参数下发&quot;]
+        C --&gt;|&quot;DPH120\n(中程机扫)&quot;| F1[&quot;ROS: ros_app_publish_radar_param_set\n经纬高 + 姿态角（6参数全部）\nheading→azimuth_angle(方位架设角)&quot;]
+        C --&gt;|&quot;DPH130\n(中程四面阵)&quot;| F2[&quot;ROS: ros_app_publish_radar_param_set\n经纬高 + 姿态角（6参数全部）\nheading→azimuth_angle(阵面方位架设角)&quot;]
+        C --&gt;|PTZ/其他| G[&quot;仅保存在 AGX 配置中\n（设备不支持接收位姿）&quot;]
+    end
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>子设备</th>
+<th>枚举值</th>
+<th>能否写入设备</th>
+<th>写入机制</th>
+<th>写入内容</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>STF200 (TracerMatrix/电侦)</td>
+<td>24</td>
+<td>能(全部)</td>
+<td>PB <code>PositionOrientationConfig</code> (0x0040)</td>
+<td>经纬高 + 姿态角（6参数全部）</td>
+<td>需新增发送函数</td>
+</tr>
+<tr>
+<td>SDH100 (小雷达/近程)</td>
+<td>1</td>
+<td>能(全部)</td>
+<td><code>alink_upload_cmd_set_radar_att_v2_to_dest</code></td>
+<td>经纬高 + 姿态角（6参数全部）</td>
+<td>已有函数</td>
+</tr>
+<tr>
+<td>DPH120 (中程机扫，对外DPH100)</td>
+<td>12</td>
+<td>能(全部)</td>
+<td><code>ros_app_publish_radar_param_set</code></td>
+<td>经纬高 + 姿态角（6参数全部）</td>
+<td>heading→azimuth_angle(方位架设角)</td>
+</tr>
+<tr>
+<td>DPH130 (中程四面阵，对外DPH100)</td>
+<td>13</td>
+<td>能(全部)</td>
+<td><code>ros_app_publish_radar_param_set</code></td>
+<td>经纬高 + 姿态角（6参数全部）</td>
+<td>heading→azimuth_angle(阵面方位架设角)</td>
+</tr>
+<tr>
+<td>PTZ 耐杰/和普</td>
+<td>2,9,23,30,33</td>
+<td>不能</td>
+<td>无位姿设置 API</td>
+<td>无</td>
+<td>仅存 AGX</td>
+</tr>
+</tbody>
+</table>
+<h2 id="_10">五、核心实现文件</h2>
+<h3 id="51-srcsrvalinkcommandsystemalink_systemhsrcsrvalinkcommandsystemalink_systemh">5.1 结构体定义 — <code>[src/srv/alink/command/system/alink_system.h](src/srv/alink/command/system/alink_system.h)</code></h3>
+<p>新增请求/响应结构体：</p>
+<p>alink_subdev_pose_req_t;</p>
+<p>alink_subdev_pose_item_t;  // 99 bytes</p>
+<p>alink_subdev_pose_resp_t;</p>
+<h3 id="52-srcsrvalinkcommandsystemalink_systemcppsrcsrvalinkcommandsystemalink_systemcpp">5.2 命令注册 — <code>[src/srv/alink/command/system/alink_system.cpp](src/srv/alink/command/system/alink_system.cpp)</code></h3>
+<p>在 <code>alink_system_init()</code> 中（在 0x74 注册之后）:</p>
+<ul>
+<li>新增 <code>static alink_cmd_list_t sAlinkCmd_subdevPose;</code></li>
+<li><code>sAlinkCmd_subdevPose.cmd_type = ALINK_DEV_ID_C2;</code></li>
+<li><code>alink_register_cmd(&amp;sAlinkCmd_subdevPose, 0x73, 0, alink_subdev_pose);</code></li>
+</ul>
+<h3 id="53-alink_subdev_pose">5.3 回调实现 — 同文件新增 <code>alink_subdev_pose()</code></h3>
+<h4 id="cmd1">cmd=1 查询所有子设备位姿</h4>
+<pre><code>1. g_subDevCfgApi.readList(subDevList) 获取所有子设备
+2. 判断当前主设备是否为 SSF 系列，若是则读取系统全局经纬高 (g_hostDevCfgApi.getRadarV)
+3. 遍历在线子设备，填充 resp-&gt;list[i] 的 sn/type/longitude/latitude/altitude/heading/rolling/pitching
+4. SSF一体化覆盖（STF200除外）：
+   - 雷达/PTZ子设备：经纬高覆盖为系统全局值
+   - PTZ子设备：heading/rolling/pitching 额外覆盖为 0
+   - 雷达子设备：heading/rolling/pitching 保持设备存储值不覆盖
+5. resp-&gt;num = 实际设备数
+6. resp-&gt;result = 0
+7. psResp-&gt;wCount = sizeof(result) + sizeof(cmd) + sizeof(num) + num * sizeof(alink_subdev_pose_item_t)
+</code></pre>
+<p>字段映射（<code>DevAttrParam</code> -&gt; <code>alink_subdev_pose_item_t</code>）:</p>
+<ul>
+<li><code>longitude</code> -&gt; <code>longitude</code></li>
+<li><code>latitude</code> -&gt; <code>latitude</code></li>
+<li><code>altitude</code> -&gt; <code>altitude</code></li>
+<li><code>global_heading</code> -&gt; <code>heading</code></li>
+<li><code>global_roll</code> -&gt; <code>rolling</code></li>
+<li><code>global_pitch</code> -&gt; <code>pitching</code></li>
+</ul>
+<h4 id="cmd2">cmd=2 设置指定子设备位姿</h4>
+<pre><code>1. 从 req 解析 SN、type 和位姿参数
+2. g_subDevCfgApi.getBySn(sn, dev) 获取当前配置
+3. SSF一体化覆盖（STF200除外）：
+   - 雷达/PTZ子设备：经纬高强制使用系统全局值 (g_hostDevCfgApi.getRadarV)
+   - PTZ子设备：heading/rolling/pitching 强制为 0
+   - 雷达子设备：heading/rolling/pitching 使用 C2 下发值（用户可配）
+4. 用覆盖后的值更新 dev 的位姿字段
+5. g_subDevCfgApi.updateBySn(dev) 持久化到配置
+6. 根据 type 判断是否需要写入设备:
+   - STF200: 调用 sendPoseToSTF200()
+   - SDH100: 调用 sendPoseToSDH100()
+   - DPH120/DPH130: 读取当前雷达配置，更新 LLA + azimuth_angle + roll_angle + pitch_angle（6参数全部，heading→azimuth_angle），调用 ros_app_publish_radar_param_set()
+7. resp-&gt;result = 0(成功）或负数（失败），resp-&gt;cmd = 2，resp-&gt;num = 0
+8. psResp-&gt;wCount = sizeof(result) + sizeof(cmd) + sizeof(num) = 6 字节
+</code></pre>
+<h3 id="54">5.4 各设备写入实现细节</h3>
+<h4 id="stf200-pb">STF200 — 新增 PB 包注册（复用已有发送通道）</h4>
+<p><strong>为什么不能纯透传</strong>: 0x73 是二进制结构体格式，STF200 期望 Protobuf 编码的 <code>PositionOrientationConfig</code>，两者格式不同，AGX 必须做格式转换后发送。</p>
+<p><strong>底层通道已存在</strong>: <code>alink.c</code> 中 <code>ALINK_DEV_ID_STF200</code> 已有完整的 <code>sUpload_stf200</code> 发送通道（注册/发送/定向发送），只需新增一个 PB 包注册即可使用。</p>
+<p><strong>实现方式</strong>: 参考 SDH100 发送 <code>RadarC2Config</code> PB 的模式（<code>sAlinkPackage_cmd_set_radar_att_v2</code>，<code>cmd_type = ALINK_DEV_ID_RADAR_V2</code>，通过 <code>sUpload_server_v2</code> 通道），STF200 用 <code>ALINK_DEV_ID_STF200</code> 走 <code>sUpload_stf200</code> 通道：</p>
+<ol>
+<li>在 <code>alink_system.cpp</code> 中新增 <code>static alink_package_list_t sAlinkPackage_stf200_pose;</code></li>
+<li>设置 <code>sAlinkPackage_stf200_pose.cmd_type = ALINK_DEV_ID_STF200;</code> → 走 <code>sUpload_stf200</code> 通道</li>
+<li><code>alink_register_package(&amp;sAlinkPackage_stf200_pose, 0x40, 0, system_pkg_stf200_pose);</code></li>
+<li>编码回调 <code>system_pkg_stf200_pose</code>（约 15 行）: 使用 nanopb 编码 <code>PositionOrientationConfig</code></li>
+<li>通过 <code>alink_upload_package_to_dest(&amp;sAlinkPackage_stf200_pose, &amp;pbMsg, devInfo.dev_id)</code> 发送到指定 STF200</li>
+</ol>
+<p>字段映射（0x73 → PositionOrientationConfig PB）:</p>
+<ul>
+<li><code>update_mode = 2</code> (更新)</li>
+<li><code>longitude/latitude/altitude</code> → 直接映射</li>
+<li><code>heading</code> → <code>yaw</code></li>
+<li><code>rolling</code> → <code>roll</code></li>
+<li><code>pitching</code> → <code>pitch</code></li>
+<li><code>setting_mode = 3</code> (网络-上位机获取)</li>
+</ul>
+<h4 id="sdh100">SDH100 — 复用现有函数</h4>
+<p>复用已有 <code>alink_upload_cmd_set_radar_att_v2_to_dest()</code> 函数，构造 <code>RadarC2Config</code> PB 消息：</p>
+<ul>
+<li>填入 <code>has_longitude/has_latitude/has_altitude = true</code> + 经纬高值</li>
+<li>填入 <code>has_heading/has_pitching/has_rolling = true</code> + 姿态角值</li>
+<li>通过 <code>find_device_info_by_sn</code> 获取 socket ID 后发送</li>
+</ul>
+<p><code>RadarC2Config</code> 完整支持全部 6 个字段。校准流程 <code>send_calibration_data_2_radar()</code>（<code>alink_track.cpp</code> L771-806）已验证可向 SDH100 下发经纬高 + heading/pitching/rolling。0x74 仅发经纬高是其简化实现，0x73 应发送全部位姿参数。</p>
+<h4 id="dph120dph130">DPH120/DPH130 — 区别处理</h4>
+<p><strong>字段语义逐项分析:</strong></p>
+<p>0x73 的 heading/rolling/pitching 与 DPH 雷达参数的映射关系：</p>
+<ul>
+<li>0x73 <code>rolling</code> → DPH <code>roll_angle</code>（阵面安装横滚角），描述雷达物理安装的左右倾斜</li>
+<li>0x73 <code>pitching</code> → DPH <code>pitch_angle</code>（阵面安装俯仰角），描述雷达物理安装的前后倾斜</li>
+<li>0x73 <code>heading</code> → DPH <code>azimuth_angle</code>（阵面方位架设角 / PTZ法线与雷达法线夹角），DPH120 和 DPH130 均适用</li>
+<li>DPH <code>north_angle</code>（校北角）= 雷达自身校准参数，0x73 <strong>不修改此字段</strong></li>
+</ul>
+<p><strong>DPH120（机扫，1个雷达）与 DPH130（四面阵，4个雷达）:</strong></p>
+<ul>
+<li>DPH120 只有1个雷达面板，DPH130 有4个面板（每个面板有独立 SN）</li>
+<li>0x73 按 SN 区分，DPH130 每个前端可独立设置</li>
+<li><strong>两者在 0x73 中行为一致</strong>：均写入全部 6 参数</li>
+</ul>
+<p><strong>heading → azimuth_angle 映射说明:</strong></p>
+<ul>
+<li>C2 在 0x73 的 heading 字段中填入的实际上就是阵面方位架设角（DPH120 即 PTZ法线与雷达法线夹角），映射到 <code>azimuth_angle</code></li>
+<li>DPH120: <code>azimuth_angle</code> 不写入雷达命令帧（<code>dhp120MsgCmd_t</code> 无此字段），保存在 AGX 本地 JSON 配置中，用于 0xA7 查询时的坐标转换（<code>绝对方位角 = azimuth_angle + mark_parm.heading</code>）</li>
+<li>DPH130: <code>azimuth_angle</code> 写入雷达命令帧（<code>pRadar-&gt;azimuth_angle = pCfg-&gt;azimuth_angle * 10</code>），即阵面方位架设角（精度0.1°，0~360°）</li>
+<li><code>north_angle</code>（校北角）是雷达自身校准参数，0x73 不修改</li>
+</ul>
+<p><strong>各型号写入策略（已确认）:</strong></p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>DPH120（1个雷达）</th>
+<th>DPH130（4个雷达）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>longitude/latitude/altitude</td>
+<td><strong>写入</strong></td>
+<td><strong>写入</strong></td>
+</tr>
+<tr>
+<td>heading</td>
+<td><strong>写入</strong>（→azimuth_angle 方位架设角）</td>
+<td><strong>写入</strong>（→azimuth_angle 阵面方位架设角）</td>
+</tr>
+<tr>
+<td>rolling</td>
+<td><strong>写入</strong>（→roll_angle 阵面横滚角）</td>
+<td><strong>写入</strong>（→roll_angle 阵面横滚角）</td>
+</tr>
+<tr>
+<td>pitching</td>
+<td><strong>写入</strong>（→pitch_angle 阵面俯仰角）</td>
+<td><strong>写入</strong>（→pitch_angle 阵面俯仰角）</td>
+</tr>
+</tbody>
+</table>
+<p><strong>实现方式:</strong></p>
+<ol>
+<li>6参数保存到 <code>g_subDevCfgApi.updateBySn()</code>（SSF设备上经纬高为系统全局值、PTZ姿态为0°的覆盖后的值）</li>
+<li>从 <code>readRadarConfigFromJsonBySN()</code> 读取当前完整雷达配置（保留所有现有参数不变）</li>
+<li>根据设备类型更新对应字段:</li>
+</ol>
+<ul>
+<li><strong>DPH120/DPH130</strong>: 更新 <code>lot/lat/height</code> + <code>azimuth_angle/roll_angle/pitch_angle</code>（6个参数全部，heading→azimuth_angle），保留 <code>north_angle</code> 不变</li>
+</ul>
+<ol start="4">
+<li>调用 <code>ros_app_publish_radar_param_set()</code> 发布到 ROS</li>
+<li><strong>同步写入 <code>config_calibrate.yaml</code></strong>（与 0xA6 <code>alink_radar_param_set_req</code> 保持一致）:<br />
+   - 写入 <code>local_roll = rolling</code>, <code>local_pitch = pitching</code>, <code>local_yaw = heading</code><br />
+   - 调用 <code>midrange_ensure_default_calibration_records()</code> 确保标定记录存在<br />
+   - 标定系统依赖此文件中的 <code>local_roll/local_pitch/local_yaw</code> 进行标定计算（参见 <code>alink_track.cpp</code>）</li>
+</ol>
+<p><strong>查询数据源说明:</strong></p>
+<p>所有设备类型的 cmd=1 查询，基础数据从 AGX 本地的 <code>g_subDevCfgApi</code>（<code>DevAttrParam</code>）读取，不实时查询设备。</p>
+<p><strong>但在 SSF 系列上</strong>，cmd=1 返回的值会被一体化规则覆盖：雷达/PTZ 子设备的经纬高覆盖为系统全局值，PTZ 子设备的姿态角覆盖为 0°，雷达子设备的姿态角保持设备存储值。因此 SSF 设备上查询返回的值可能与 <code>g_subDevCfgApi</code> 中存储的值不同。</p>
+<p>但 <code>g_subDevCfgApi</code> 并非纯静态配置，部分设备的状态上报会<strong>动态刷新</strong>其中的数据，因此查询返回的是<strong>最新值</strong>（而非固定返回 0x73 设置时的值）。</p>
+<p>各设备对 <code>g_subDevCfgApi</code> 的回写情况:</p>
+<table>
+<thead>
+<tr>
+<th>设备</th>
+<th>LLA 是否被设备上报刷新</th>
+<th>姿态角是否被设备上报刷新</th>
+<th>回写代码位置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SDH100 (小雷达)</td>
+<td>是（<code>RadarState</code> PB 状态上报时覆盖）</td>
+<td>否</td>
+<td><code>alink_track.cpp</code> <code>track_pkg_attitude_v2()</code></td>
+</tr>
+<tr>
+<td>STF200 (电侦)</td>
+<td>否（AGX 对 STF200 做透传，不解析状态）</td>
+<td>否</td>
+<td>无</td>
+</tr>
+<tr>
+<td>BPH110 (激光)</td>
+<td>是（参数上报时覆盖）</td>
+<td>是（yaw/pitch/roll 均覆盖）</td>
+<td><code>ros_app.cpp</code> <code>cb_sub_dataLaserParamResp()</code></td>
+</tr>
+<tr>
+<td>DPH120/130 (中程雷达)</td>
+<td>否</td>
+<td>否</td>
+<td>无</td>
+</tr>
+<tr>
+<td>PTZ</td>
+<td>否</td>
+<td>否</td>
+<td>无</td>
+</tr>
+</tbody>
+</table>
+<p>影响: 0x73 cmd=2 设置 SDH100 的 LLA 后，如果设备 GPS 随后上报了不同的 LLA，<code>g_subDevCfgApi</code> 会被覆盖，cmd=1 查询返回的将是设备上报的最新值，而非之前 0x73 设置的值。这是<strong>预期行为</strong>（已确认）。</p>
+<p><strong>生效时机:</strong></p>
+<p>DPH120: 经纬高和 rollAngle/pitchAngle 通过 <code>InitCmdFrame()</code> 从本地配置读取，在下次发送命令帧时生效（切换模式/伺服操作等），不是下次开机。<code>SyncParamToDevice()</code> 只同步高度门限/速度/距离等参数，不含经纬高和姿态角。</p>
+<p>DPH130: <code>HandleConfig</code> 中若雷达非待机模式，立即调用 <code>SendRadarsUpdateParamToDevice()</code> 下发。DPH130 的经纬高统一使用 <code>pCfg_0</code>（第一个面板的配置），4个面板共用同一位置。待机模式下仅保存本地。</p>
+<h4 id="ptz-agx">PTZ / 其他不支持写入的设备 — 仅存 AGX</h4>
+<ul>
+<li>调用 <code>g_subDevCfgApi.updateBySn(dev)</code> 保存</li>
+<li>不下发到设备</li>
+</ul>
+<h3 id="55">5.5 头文件声明</h3>
+<p>在 <code>[src/srv/alink/command/system/alink_system.h](src/srv/alink/command/system/alink_system.h)</code> 中声明必要的外部函数（如果 STF200 发送需要从外部调用）。</p>
+<h2 id="0xa6-0x73">六、0xA6 与 0x73 协议的关系（中程雷达参数设置通道）</h2>
+<h3 id="_11">历史背景</h3>
+<p>在 0x73 协议之前，中程雷达（DPH120/DPH130）的参数设置通过以下协议完成：</p>
+<table>
+<thead>
+<tr>
+<th>协议</th>
+<th>用途</th>
+<th>C2 页面</th>
+<th>包含字段</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>0xA6</strong> (<code>alink_radar_param_set_req</code>)</td>
+<td>雷达全量参数配置</td>
+<td>雷达配置页面</td>
+<td>经纬高 + 姿态角 + 频点/静默区/量程/门限等<strong>所有参数</strong></td>
+</tr>
+<tr>
+<td><strong>0xA7</strong> (<code>alink_radar_param_req</code>)</td>
+<td>雷达参数查询</td>
+<td>雷达配置页面</td>
+<td>返回完整 <code>msgRadarParam_t</code></td>
+</tr>
+<tr>
+<td><strong>0x71/0x72</strong></td>
+<td>系统全局位置设置</td>
+<td>系统设置页面</td>
+<td>系统经纬高 + heading/rolling/pitching</td>
+</tr>
+<tr>
+<td><strong>0x74</strong> (<code>alink_sync_dev_position</code>)</td>
+<td>位置同步</td>
+<td>—</td>
+<td>仅经纬高，且<strong>不支持</strong> DPH120/DPH130</td>
+</tr>
+</tbody>
+</table>
+<h3 id="srp-c2-0xa60x73">SRP 系列各型号 C2 雷达配置页面行为（0xA6，0x73 之前）</h3>
+<blockquote>
+<p><strong>注</strong>: 0x73 之前，只有<strong>雷达</strong>子设备支持经纬高/俯偏滚配置（通过 0xA6）。PTZ 和 STF200 以前没有位姿配置入口。</p>
+</blockquote>
+<table>
+<thead>
+<tr>
+<th>SRP 型号</th>
+<th>C2 雷达配置页面 — 经纬高</th>
+<th>C2 雷达配置页面 — 俯偏滚</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>SRP100</strong></td>
+<td><strong>开放</strong>，用户可配置</td>
+<td><strong>开放</strong>，用户可配置</td>
+</tr>
+<tr>
+<td><strong>SRP200</strong></td>
+<td><strong>不开放</strong>，C2 不展示（0xA6 全量透传时 LLA 随配置原值写入）</td>
+<td><strong>开放</strong>，用户可配置</td>
+</tr>
+<tr>
+<td><strong>SRP210</strong></td>
+<td><strong>开放</strong>，用户可配置</td>
+<td><strong>开放</strong>，用户可配置</td>
+</tr>
+</tbody>
+</table>
+<p>0xA6 使用的 <code>msgRadarParam_t</code> 包含全部字段（含经纬高），即使 C2 不展示某些字段，通过 0xA7 查询获取当前值后原样回传，AGX 侧全量透传，因此所有参数实际上都会通过 0xA6 写入雷达。</p>
+<h3 id="ssf-srp">SSF 系列与 SRP 系列对齐（仅雷达子设备）</h3>
+<p>SSF 系列在<strong>雷达配置页面（0xA6）</strong> 上保持与对应 SRP 型号一致的行为。0x73 新增了位姿页面，SSF 一体化规则仅在 0x73 层面生效（经纬高显示系统全局值且置灰）。</p>
+<table>
+<thead>
+<tr>
+<th>SSF 型号</th>
+<th>对应 SRP</th>
+<th>0xA6 经纬高</th>
+<th>0xA6 俯偏滚</th>
+<th>0x73 经纬高</th>
+<th>0x73 俯偏滚</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>SSF100</strong></td>
+<td>SRP100</td>
+<td><strong>开放</strong>（与 SRP100 一致）</td>
+<td><strong>开放</strong></td>
+<td>置灰，使用系统全局值</td>
+<td>不置灰，可配</td>
+</tr>
+<tr>
+<td><strong>SSF200</strong></td>
+<td>SRP200</td>
+<td><strong>不开放</strong>（与 SRP200 一致）</td>
+<td><strong>开放</strong></td>
+<td>置灰，使用系统全局值</td>
+<td>不置灰，可配</td>
+</tr>
+<tr>
+<td><strong>SSF210</strong></td>
+<td>SRP210</td>
+<td><strong>开放</strong>（与 SRP210 一致）</td>
+<td><strong>开放</strong></td>
+<td>置灰，使用系统全局值</td>
+<td>不置灰，可配</td>
+</tr>
+</tbody>
+</table>
+<p><strong>AGX 侧能力</strong>: 0xA6 和 0x73 最终都走 <code>ros_app_publish_radar_param_set</code>，AGX 保留全部写入能力，不做字段过滤。C2 置灰是 C2 侧的 UI 控制。两个通道均会同步写入 <code>config_calibrate.yaml</code>（<code>local_roll/local_pitch/local_yaw</code>），确保标定系统数据一致。</p>
+<blockquote>
+<p><strong>PTZ / STF200</strong>: 以前没有位姿配置入口。0x73 新增后，STF200 支持全部 6 参数下发；SSF 系列 PTZ 按一体化规则处理（经纬高=系统全局，俯偏滚默认 0°），保存在 AGX 本地，不下发到 PTZ 设备。</p>
+</blockquote>
+<h3 id="_12">全局俯偏滚与雷达安装角的区别</h3>
+<p>系统全局俯偏滚（<code>mark_parm</code>，0x71/0x72 设置）与雷达安装角（0xA6 设置）是<strong>不同含义</strong>的参数：</p>
+<ul>
+<li><code>mark_parm.heading</code> = 系统整体朝向（与正北夹角）</li>
+<li><code>azimuth_angle</code> = 雷达面板与 PTZ 法线的夹角（相对安装角），关系：<code>绝对方位角 = azimuth_angle + mark_parm.heading</code></li>
+<li><code>mark_parm.rolling/pitching</code> = 整个平台的横滚/俯仰</li>
+<li><code>roll_angle/pitch_angle</code> = 雷达面板的安装横滚/俯仰（用于波束扫描补偿）</li>
+</ul>
+<p>两者独立配置，没有自动同步机制。SSF 一体化规则只同步经纬高，不同步俯偏滚，是合理的设计。</p>
+<h2 id="_13">七、各设备写入参数一览</h2>
+<h3 id="0xa6-0x73_1">0xA6 通道（雷达配置页面，0x73 之前已有）</h3>
+<p>0xA6 是雷达全量参数配置协议，<code>msgRadarParam_t</code> 包含经纬高 + 俯偏滚 + 所有其他雷达参数，AGX 全量透传给雷达 ROS 节点。</p>
+<table>
+<thead>
+<tr>
+<th><strong>设备</strong></th>
+<th><strong>经纬高</strong></th>
+<th><strong>俯偏滚</strong></th>
+<th><strong>备注</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>DPH120</strong> (中程机扫)</td>
+<td>写入（lot/lat/height）</td>
+<td>写入（roll_angle/pitch_angle/azimuth_angle/north_angle）</td>
+<td>C2 页面是否展示经纬高取决于主设备型号</td>
+</tr>
+<tr>
+<td><strong>DPH130</strong> (中程四面阵)</td>
+<td>写入（lot/lat/height，每前端独立）</td>
+<td>写入（roll_angle/pitch_angle/azimuth_angle，每前端独立）</td>
+<td>同上</td>
+</tr>
+<tr>
+<td><strong>SDH100</strong> (小雷达)</td>
+<td>通过 <code>RadarC2Config</code> PB</td>
+<td>通过 <code>RadarC2Config</code> PB</td>
+<td>完整支持 6 参数</td>
+</tr>
+<tr>
+<td>PTZ / STF200</td>
+<td>—</td>
+<td>—</td>
+<td>0xA6 不涉及这些设备</td>
+</tr>
+</tbody>
+</table>
+<h3 id="0x73_1">0x73 通道（子设备位姿页面，新增）</h3>
+<p>0x73 是新增的子设备位姿协议，按 SN 区分设备，支持查询和设置。以前只有雷达能通过 0xA6 配置位姿，0x73 扩展到了 STF200 和 SDH100，PTZ 仍仅保存 AGX 本地。</p>
+<table>
+<thead>
+<tr>
+<th><strong>设备</strong></th>
+<th><strong>AGX 本地保存</strong></th>
+<th><strong>0x73 下发到设备</strong></th>
+<th><strong>未下发</strong></th>
+<th><strong>备注</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>STF200</strong> (电侦)</td>
+<td>全部 6 参数</td>
+<td>经纬高 + 姿态角（6参数全部），PB <code>PositionOrientationConfig</code></td>
+<td>无</td>
+<td>0x73 新增能力，以前无配置入口</td>
+</tr>
+<tr>
+<td><strong>SDH100</strong> (小雷达)</td>
+<td>全部 6 参数</td>
+<td>经纬高 + 姿态角（6参数全部），PB <code>RadarC2Config</code></td>
+<td>无</td>
+<td></td>
+</tr>
+<tr>
+<td><strong>DPH120</strong> (中程机扫)</td>
+<td>全部 6 参数</td>
+<td>经纬高 + 姿态角（6参数全部）</td>
+<td>无</td>
+<td>heading→azimuth_angle(PTZ法线夹角)，姿态角也可由 0xA6 独立设置</td>
+</tr>
+<tr>
+<td><strong>DPH130</strong> (中程四面阵)</td>
+<td>全部 6 参数</td>
+<td>经纬高 + 姿态角（6参数全部）</td>
+<td>无</td>
+<td>heading→azimuth_angle(阵面方位架设角)，姿态角也可由 0xA6 独立设置</td>
+</tr>
+<tr>
+<td><strong>PTZ</strong> (耐杰/和普)</td>
+<td>全部 6 参数</td>
+<td><strong>不下发</strong>（设备无位姿设置 API）</td>
+<td></td>
+<td>SSF: 经纬高=系统全局，俯偏滚=0°；以前无配置入口</td>
+</tr>
+</tbody>
+</table>
+<h2 id="ssf0x73-srp0x73">八、SSF（0x73）与 SRP（0x73 之前）对设备的效果对比</h2>
+<p>以下表格对比 SSF 系列通过 0x73 设置/查询雷达位姿，与以前 SRP 系列（无 0x73，仅通过 0xA6/0x74/标定流程）的效果是否一致。</p>
+<h3 id="_14">设置（下发到设备）</h3>
+<table>
+<thead>
+<tr>
+<th>对比项</th>
+<th>SDH100（小雷达）</th>
+<th>DPH120（中程机扫）</th>
+<th>DPH130（中程四面阵）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>SRP 对应型号</strong></td>
+<td>SRP100/SRP200/SRP210</td>
+<td>SRP210</td>
+<td>SRP200</td>
+</tr>
+<tr>
+<td><strong>SSF 对应型号</strong></td>
+<td>SSF100/SSF200/SSF210</td>
+<td>SSF210</td>
+<td>SSF200</td>
+</tr>
+<tr>
+<td><strong>SRP 设置通道</strong></td>
+<td>0x74 仅 LLA；标定流程 6 参数</td>
+<td>0xA6 全量参数</td>
+<td>0xA6 全量参数</td>
+</tr>
+<tr>
+<td><strong>SSF 设置通道</strong></td>
+<td>0x73 → <code>sendPoseToSDH100()</code></td>
+<td>0x73 → <code>sendPoseToDPH()</code></td>
+<td>0x73 → <code>sendPoseToDPH()</code></td>
+</tr>
+<tr>
+<td><strong>下发函数</strong></td>
+<td><code>alink_upload_cmd_set_radar_att_v2_to_dest</code>（PB <code>RadarC2Config</code>）</td>
+<td><code>ros_app_publish_radar_param_set</code></td>
+<td><code>ros_app_publish_radar_param_set</code></td>
+</tr>
+<tr>
+<td><strong>SRP 与 SSF 下发函数</strong></td>
+<td><strong>相同</strong></td>
+<td><strong>相同</strong></td>
+<td><strong>相同</strong></td>
+</tr>
+<tr>
+<td><strong>经纬高</strong></td>
+<td>✅ 两者均写入</td>
+<td>✅ 两者均写入（SSF 使用系统全局值）</td>
+<td>✅ 两者均写入（SSF 使用系统全局值）</td>
+</tr>
+<tr>
+<td><strong>heading</strong></td>
+<td>✅ SRP: PB <code>heading</code>；SSF: PB <code>heading</code></td>
+<td>✅ SRP: <code>azimuth_angle</code>；SSF: <code>heading→azimuth_angle</code></td>
+<td>✅ SRP: <code>azimuth_angle</code>；SSF: <code>heading→azimuth_angle</code></td>
+</tr>
+<tr>
+<td><strong>rolling</strong></td>
+<td>✅ 两者均写入</td>
+<td>✅ 两者均写入 <code>roll_angle</code></td>
+<td>✅ 两者均写入 <code>roll_angle</code></td>
+</tr>
+<tr>
+<td><strong>pitching</strong></td>
+<td>✅ 两者均写入</td>
+<td>✅ 两者均写入 <code>pitch_angle</code></td>
+<td>✅ 两者均写入 <code>pitch_angle</code></td>
+</tr>
+<tr>
+<td><strong>north_angle</strong></td>
+<td>不涉及</td>
+<td>SRP: 0xA6 下发 C2 值；SSF: 保留 JSON 原值</td>
+<td>SRP: 0xA6 下发 C2 值；SSF: 保留 JSON 原值</td>
+</tr>
+<tr>
+<td><strong>config_calibrate.yaml</strong></td>
+<td>不涉及</td>
+<td>✅ 两者均写入 <code>local_roll/pitch/yaw</code></td>
+<td>✅ 两者均写入 <code>local_roll/pitch/yaw</code></td>
+</tr>
+<tr>
+<td><strong>midrange_ensure</strong></td>
+<td>不涉及</td>
+<td>✅ 两者均调用</td>
+<td>✅ 两者均调用</td>
+</tr>
+<tr>
+<td><strong>设备收到的数据</strong></td>
+<td><strong>一致</strong></td>
+<td><strong>一致</strong>（6 个位姿参数）</td>
+<td><strong>一致</strong>（6 个位姿参数）</td>
+</tr>
+</tbody>
+</table>
+<h3 id="_15">查询</h3>
+<table>
+<thead>
+<tr>
+<th>对比项</th>
+<th>SDH100（小雷达）</th>
+<th>DPH120（中程机扫）</th>
+<th>DPH130（中程四面阵）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>SRP 查询通道</strong></td>
+<td>无独立查询（设备状态上报刷新）</td>
+<td>0xA7 → <code>readRadarConfigFromJsonBySN</code> 返回完整 <code>msgRadarParam_t</code></td>
+<td>同 DPH120</td>
+</tr>
+<tr>
+<td><strong>SSF 查询通道</strong></td>
+<td>0x73 cmd=1 → <code>g_subDevCfgApi</code></td>
+<td>0x73 cmd=1 → <code>g_subDevCfgApi</code></td>
+<td>同 DPH120</td>
+</tr>
+<tr>
+<td><strong>SSF 经纬高</strong></td>
+<td>系统全局值（一体化覆盖）</td>
+<td>系统全局值（一体化覆盖）</td>
+<td>系统全局值（一体化覆盖）</td>
+</tr>
+<tr>
+<td><strong>SSF 姿态角</strong></td>
+<td><code>g_subDevCfgApi</code> 存储值</td>
+<td><code>g_subDevCfgApi</code> 存储值</td>
+<td><code>g_subDevCfgApi</code> 存储值</td>
+</tr>
+<tr>
+<td><strong>备注</strong></td>
+<td>0xA7 仍可用于 DPH 全量参数查询，0x73 查询仅返回 6 个位姿参数</td>
+<td>同左</td>
+<td>同左</td>
+</tr>
+</tbody>
+</table>
+<h3 id="_16">结论</h3>
+<table>
+<thead>
+<tr>
+<th>雷达型号</th>
+<th>下发到设备效果</th>
+<th>标定 YAML 同步</th>
+<th>总体结论</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>SDH100</strong></td>
+<td><strong>一致</strong> — 同一 PB 格式、同一下发函数、6 参数</td>
+<td>不涉及</td>
+<td>✅ <strong>完全一致</strong></td>
+</tr>
+<tr>
+<td><strong>DPH120</strong></td>
+<td><strong>一致</strong> — 同一 ROS 函数、6 位姿参数</td>
+<td>✅ 已补齐</td>
+<td>✅ <strong>完全一致</strong></td>
+</tr>
+<tr>
+<td><strong>DPH130</strong></td>
+<td><strong>一致</strong> — 同一 ROS 函数、6 位姿参数</td>
+<td>✅ 已补齐</td>
+<td>✅ <strong>完全一致</strong></td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>注</strong>: <code>north_angle</code>（校北角）在 0x73 路径中不修改，保留 JSON 配置原值。0xA6 通道仍可用，<code>north_angle</code> 可继续通过 0xA6 独立设置。0x73 保留原值不影响设备行为。</p>
+<p><strong>TODO（SDH100 标定 YAML）</strong>: 目前 <code>config_calibrate.yaml</code> 仅中程雷达（DPH120/DPH130）使用，<code>sendPoseToSDH100()</code> 未写入此文件。据国栋反馈，后续所有雷视（含近程 SDH100）都将使用 <code>config_calibrate.yaml</code> 做标定。<strong>当 SDH100 接入标定流程时，需在 <code>sendPoseToSDH100()</code> 中补充写入 <code>config_calibrate.yaml</code></strong>（参照 <code>sendPoseToDPH()</code> 的实现）。</p>
+</blockquote></article>
+    <script>
+        // Sync theme with parent page
+        try {
+            var parentTheme = window.parent.document.documentElement.getAttribute('data-theme');
+            if (parentTheme) document.documentElement.setAttribute('data-theme', parentTheme);
+            // Listen for theme changes
+            var observer = new MutationObserver(function(mutations) {
+                mutations.forEach(function(m) {
+                    if (m.attributeName === 'data-theme') {
+                        var t = window.parent.document.documentElement.getAttribute('data-theme');
+                        if (t) document.documentElement.setAttribute('data-theme', t);
+                    }
+                });
+            });
+            observer.observe(window.parent.document.documentElement, { attributes: true });
+        } catch(e) {}
+    </script>
+</body>
+</html>

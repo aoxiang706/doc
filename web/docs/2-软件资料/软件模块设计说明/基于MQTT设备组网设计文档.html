@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>基于 MQTT + PB 的设备组网设计文档</title>
+    <link rel="stylesheet" href="../../css/markdown.css">
+</head>
+<body>
+    <article class="markdown-body"><h1 id="mqtt-pb">基于 MQTT + PB 的设备组网设计文档</h1>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>版本</td>
+<td>v2.8</td>
+</tr>
+<tr>
+<td>日期</td>
+<td>2026-04-10</td>
+</tr>
+<tr>
+<td>状态</td>
+<td>设计稿</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="1">1. 概述</h2>
+<p><strong>场景</strong>：以 <strong>AGX 为网关</strong>，在 AGX 上部署 <strong>MQTT Broker</strong>，多个子设备作为 <strong>MQTT 客户端</strong> 接入局域网，实现 <strong>设备发现、自动注册、网关按类型/设备订阅业务主题</strong>。子设备可同时或分阶段配置 <strong>云上 MQTT</strong>（OTA、运维等），与 AGX 侧为独立连接；本设计边界为 <strong>AGX Broker 上的主题与流程</strong>，消息编码统一采用 <strong>Protobuf（PB）二进制</strong>。</p>
+<p><strong>设计目标</strong></p>
+<table>
+<thead>
+<tr>
+<th>目标</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>统一入口</td>
+<td>子设备优先连 AGX Broker，由网关应用完成发现、登记与订阅。</td>
+</tr>
+<tr>
+<td>可发现</td>
+<td>子设备经 <code>**sys/</code> 公共广播**（多类设备共用主题）上报信息，无需网关按型号预配。</td>
+</tr>
+<tr>
+<td>可扩展</td>
+<td><strong>系统公共</strong>与<strong>设备特性消息</strong>分层；<code>thing/product/{device_sn}/</code> 下可扩展子主题，网关可用通配订阅。</td>
+</tr>
+<tr>
+<td>云协同</td>
+<td>云参数与 AGX 参数并存；可选 Broker <strong>bridge</strong> 到云。</td>
+</tr>
+</tbody>
+</table>
+<p><strong>角色</strong></p>
+<ul>
+<li><strong>Broker（AGX）</strong>：如 Mosquitto/EMQX，监听局域网；<strong>默认端口等见 §5</strong>。  </li>
+<li><strong>网关应用</strong>：作为 MQTT <strong>客户端</strong>须配置 <strong>Broker 地址</strong>、端口及认证等（见 <strong>§5.2</strong>）；连本机 Broker；订阅 <code>**sys/</code> 广播<strong> 做发现；支持</strong>自动/手动<strong>注册子设备；按已注册设备的 <code>device_type</code>、<code>device_sn</code> </strong>订阅<strong>其 <code>**thing/</code></strong> 下业务主题（<strong>MQTT 订阅</strong>，非与子设备另建传输层连接）；依心跳/状态判离线并取消订阅；可选黑名单。  </li>
+<li><strong>子设备</strong>：作为 MQTT <strong>客户端</strong>须配置 <strong>Broker 地址</strong>（AGX 的 IP）、端口及认证等（见 <strong>§5.2</strong>）；连 AGX Broker；上线向广播主题发设备信息，状态等走 <strong>设备消息</strong> 主题。</li>
+</ul>
+<hr />
+<h2 id="2">2. 组网系统架构</h2>
+<p><strong>逻辑拓扑</strong></p>
+<pre><code class="language-mermaid">flowchart LR
+    subgraph cloud [可选云上MQTT]
+        CloudBroker[云Broker]
+    end
+    subgraph agx [AGX]
+        Broker[本地Broker]
+        Gw[网关应用]
+        Broker &lt;--&gt;|本机/回环| Gw
+    end
+    subgraph dev [子设备]
+        D1[设备1]
+        D2[设备2]
+    end
+    D1 --&gt;|MQTT| Broker
+    D2 --&gt;|MQTT| Broker
+    D1 -.-&gt;|可选| CloudBroker
+    D2 -.-&gt;|可选| CloudBroker
+</code></pre>
+<hr />
+<h2 id="3">3. 主题和消息定义</h2>
+<h3 id="31">3.1 主题命名空间</h3>
+<p>主题分为两类：<code>**sys/</code> 系统公共消息<strong> 与 <code>**thing/</code> 设备特性消息</strong>。</p>
+<ul>
+<li><code>**sys/</code>（系统公共消息）<strong>：面向</strong>多类设备共用<strong>的</strong>系统级、公共能力<strong>，与具体型号、私域业务无关。例如：全网上线广播、注册登记确认、遗嘱/下线、OTA/对时等</strong>公共功能**，均可放在 <code>sys/</code> 下统一约定，各类设备复用同一套主题与报文头，网关侧一次订阅即可覆盖多厂商/多类型终端。</li>
+<li><code>**thing/</code>（设备特性消息）<strong>：按</strong>设备实例<strong> <code>device_sn</code> 隔离，承载</strong>单设备私域**状态、请求与应答等业务数据。</li>
+</ul>
+<h4 id="311-sys">3.1.1 系统公共消息（<code>sys/</code>）</h4>
+<p><strong>定位</strong>：多类设备通用；<strong>不</strong>在主题中区分具体业务型号（除按 <code>device_sn</code> 做下行单播等必要路径外）。典型用途：发现与上线广播、登记结果回执、可选遗嘱/下线，以及后续扩展的<strong>公共系统功能</strong>。</p>
+<table>
+<thead>
+<tr>
+<th>主题</th>
+<th>发送者 -&gt; 订阅者</th>
+<th>消息体</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>sys/product/skyfend/broadcast</code></td>
+<td>子设备 -&gt; 网关</td>
+<td><strong>broadcast message</strong></td>
+<td>公共广播：所有设备共用该主题，上报上线与能力，便于网关发现</td>
+</tr>
+<tr>
+<td><code>sys/product/{device_sn}/register_ack</code></td>
+<td>网关 -&gt; 子设备</td>
+<td><strong>register_ack message</strong></td>
+<td>公共登记能力：网关对单设备下发注册登记结果（可选），单设备订阅</td>
+</tr>
+</tbody>
+</table>
+<p>后续若扩展 <strong>OTA、时间同步、远程参数</strong> 等<strong>跨设备类型的公共能力</strong>，建议仍挂在 <code>sys/product/...</code> 或统一 <code>sys/...</code> 命名空间下，与 <code>thing/product/{device_sn}/</code> 下的<strong>单设备业务</strong>区分。</p>
+<h4 id="312-thingproductdevice_sn">3.1.2 <strong>设备特性消息</strong>（<code>thing/product/{device_sn}/…</code>）（可选示例）</h4>
+<p>按子设备维度隔离，<code>**device_sn</code><strong> 与铭牌/配置一致；与 <code>**sys/</code> 公共消息</strong> 互补——私域业务、单设备数据走本分支。</p>
+<table>
+<thead>
+<tr>
+<th>主题</th>
+<th>发送者 -&gt; 订阅者</th>
+<th>消息体</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>thing/product/{device_sn}/state</code></td>
+<td>子设备 -&gt; 网关</td>
+<td><strong>state message</strong></td>
+<td>设备状态数据上报</td>
+</tr>
+<tr>
+<td><code>thing/product/{device_sn}/requests</code></td>
+<td>子设备 -&gt; 网关</td>
+<td><strong>requests message</strong></td>
+<td>设备发起请求</td>
+</tr>
+<tr>
+<td><code>thing/product/{device_sn}/requests_reply</code></td>
+<td>网关 -&gt; 子设备</td>
+<td><strong>requests_reply message</strong></td>
+<td>对请求的应答</td>
+</tr>
+</tbody>
+</table>
+<p>若后续增加遥测等，仍在 <code>thing/product/{device_sn}/</code> 下扩展。</p>
+<h3 id="32-pb">3.2 消息体（PB）定义</h3>
+<p>各类型均遵循：<strong>先字段说明表，再示例 Protobuf</strong>；外层结构统一为 <strong>§3.2.0 通用报文头</strong>，<code>**sys/</code>** 与 <code>**thing/**</code> 共用。</p>
+<h4 id="320-payload">3.2.0 通用报文头（所有主题 Payload 外层一致）</h4>
+<p>MQTT 消息体为 <strong>Protobuf（PB）二进制消息</strong>，直接使用具体消息结构（如 <code>Broadcast</code> 或 <code>RegisterAck</code>），每个结构都包含公共头部 <code>Header</code>。<strong>本项目为 C/C++，无需 Java 生成选项。</strong></p>
+<p><strong>字段说明</strong></p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>类型</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>tid</code></td>
+<td>string</td>
+<td>Transaction ID，事务 ID（UUID），单次请求/发布内唯一，便于链路追踪</td>
+</tr>
+<tr>
+<td><code>bid</code></td>
+<td>string</td>
+<td>Business ID，业务 ID（UUID）；可与订单/会话等关联；无则可用全 0 或与 <code>tid</code> 同值</td>
+</tr>
+<tr>
+<td><code>frame_id</code></td>
+<td>uint64</td>
+<td>帧序号（发送端本地递增计数）；用于去重、排序和链路排障</td>
+</tr>
+<tr>
+<td><code>timestamp</code></td>
+<td>uint64</td>
+<td>毫秒时间戳（Unix epoch ms）</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>MQTT Payload 采用 Protobuf 二进制编码，主题不变。上报时将具体消息结构（如 <code>Broadcast</code> 或 <code>RegisterAck</code>）序列化后作为 MQTT 消息体发送，每个消息携带公共头部 <code>header</code>。</p>
+</blockquote>
+<p><strong>Protobuf 定义示例</strong></p>
+<pre><code class="language-proto">syntax = &quot;proto3&quot;;
+package common;
+
+message Header {
+  string tid = 1;
+  string bid = 2;
+  uint64 frame_id = 3;
+  uint64 timestamp = 4;
+}
+
+message Broadcast {
+  Header header = 1;
+  string device_sn = 2;
+  uint32 device_type = 3;
+  string model = 4;
+  string vendor = 5;
+  string fw_version = 6;
+  string ip = 7;
+}
+
+message RegisterAck {
+  Header header = 1;
+  bool status = 2;
+  string message = 3;
+}
+</code></pre>
+<blockquote>
+<p>说明：Protobuf 消息直接序列化后作为 MQTT Payload，每个具体消息都包含公共头部 <code>header</code>。</p>
+</blockquote>
+<h4 id="321-broadcast-messagesysproductskyfendbroadcast">3.2.1 <strong>broadcast message</strong>（<code>sys/product/skyfend/broadcast</code>）</h4>
+<p><code>**sys/</code> 公共广播**：任意类型子设备均发布至此主题（如每 3 秒周期发布），网关统一订阅即可发现多类设备。</p>
+<p><code>**payload</code> 内字段说明**</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>类型</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>device_sn</code></td>
+<td>string</td>
+<td>设备序列号</td>
+</tr>
+<tr>
+<td><code>device_type</code></td>
+<td>uint32</td>
+<td>设备类型（产品约定枚举）</td>
+</tr>
+<tr>
+<td><code>model</code></td>
+<td>string</td>
+<td>设备型号</td>
+</tr>
+<tr>
+<td><code>vendor</code></td>
+<td>string</td>
+<td>可选；厂商</td>
+</tr>
+<tr>
+<td><code>fw_version</code></td>
+<td>string</td>
+<td>固件版本（Firmware，<code>x.y.z</code> 等）</td>
+</tr>
+<tr>
+<td><code>ip</code></td>
+<td>string</td>
+<td>设备当前 IP</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>示例：使用 Protobuf 文本格式表示，下行 MQTT Payload 为 <code>Broadcast</code> 的 Protobuf 二进制编码。</p>
+</blockquote>
+<pre><code class="language-protobuf">Broadcast {
+  header {
+    tid: &quot;xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxx&quot;
+    bid: &quot;xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxx&quot;
+    frame_id: 1001
+    timestamp: 1234567890123
+  }
+  device_sn: &quot;SN001&quot;
+  device_type: 119
+  vendor: &quot;skyfend&quot;
+  model: &quot;HEP10&quot;
+  fw_version: &quot;v1.2.3&quot;
+  ip: &quot;192.168.1.100&quot;
+}
+</code></pre>
+<h4 id="322-register_ack-messagesysproductdevice_snregister_ack">3.2.2 <strong>register_ack message（可选）</strong>（<code>sys/product/{device_sn}/register_ack</code>）</h4>
+<p><code>**sys/</code> 公共注册登记回执<strong>：网关对指定设备下发注册登记结果，与 </strong>broadcast<strong> 同属系统公共能力，</strong>不**写入 <code>thing/product/…</code> 业务主题。</p>
+<p><code>**payload</code> 内字段说明**</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>类型</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>status</code></td>
+<td>bool</td>
+<td>注册登记结果</td>
+</tr>
+<tr>
+<td><code>message</code></td>
+<td>string</td>
+<td>可选；说明文案</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>示例：使用 Protobuf 文本格式表示，下行 MQTT Payload 为 <code>RegisterAck</code> 的 Protobuf 二进制编码。</p>
+</blockquote>
+<pre><code class="language-protobuf">RegisterAck {
+  header {
+    tid: &quot;xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxx&quot;
+    bid: &quot;xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxx&quot;
+    frame_id: 22017
+    timestamp: 1234567890123
+  }
+  status: true
+  message: &quot;success&quot;
+}
+</code></pre>
+<hr />
+<h2 id="4">4. 启动流程、交互时序</h2>
+<h3 id="41">4.1 启动流程</h3>
+<h4 id="agx">网关侧（AGX）</h4>
+<pre><code class="language-mermaid">stateDiagram-v2
+    [*] --&gt; BrokerUp: Broker 已启动
+    BrokerUp --&gt; Init: 连接本机 Broker
+    Init --&gt; Discover: 订阅 broadcast；恢复注册表(可选)
+    Discover --&gt; Register: 自动/手动注册
+    Register --&gt; Subscribed: 订阅 thing/{device_sn}/...
+    Subscribed --&gt; Ack: 可选发送 register_ack
+    Ack --&gt; Subscribed: 继续运行
+    Subscribed --&gt; OfflineCheck: broadcast/state 超时或 LWT
+    OfflineCheck --&gt; Unsubscribed: 取消该设备业务订阅
+    Unsubscribed --&gt; Discover: 回到发现循环
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><strong>启动 MQTT Broker</strong>：在 AGX 启动本机 Broker（如 <code>0.0.0.0:1883</code> 或 TLS 端口）。</td>
+</tr>
+<tr>
+<td>2</td>
+<td><strong>连接并初始化订阅</strong>：网关作为 MQTT 客户端连接本机 Broker，订阅 <code>sys/product/skyfend/broadcast</code>；若有持久化注册表可同步恢复。</td>
+</tr>
+<tr>
+<td>3</td>
+<td><strong>发现在线子设备</strong>：接收周期 <code>broadcast</code> 消息，维护实时在线子设备列表。</td>
+</tr>
+<tr>
+<td>4</td>
+<td><strong>注册子设备</strong>：若设备未注册，则按策略加入注册列表；若设备已存在，则仅更新设备状态。自动注册策略（默认）直接入列；手动注册策略模式，由 Web/运维确认后入列。</td>
+</tr>
+<tr>
+<td>5</td>
+<td><strong>订阅业务主题</strong>：对已注册设备订阅 <code>thing/product/{device_sn}/...</code>，开始接收状态、请求等设备业务消息。</td>
+</tr>
+<tr>
+<td>6</td>
+<td><strong>通知注册结果（可选）</strong>：若启用注册反馈，网关发布 <code>sys/product/{device_sn}/register_ack</code> 通知子设备注册结果。</td>
+</tr>
+<tr>
+<td>7</td>
+<td><strong>离线或手动删除处理</strong>：已注册设备，若自动离线或用户手动删除，则取消订阅该设备业务主题，并更新在线状态。依据周期 <code>broadcast</code>（默认）、<code>state</code> 心跳超时或 LWT 判定离线；</td>
+</tr>
+<tr>
+<td>8</td>
+<td><strong>设备黑名单（可选）</strong>：对已注册设备可加入黑名单，加入后不再订阅该设备主题消息。</td>
+</tr>
+</tbody>
+</table>
+<h4 id="_1">子设备侧</h4>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><strong>配置 MQTT 客户端</strong>：设置 <code>server_addr</code>、<code>server_port</code> 及认证参数（见 <strong>§5.2</strong>、<strong>§5.3</strong>）。</td>
+</tr>
+<tr>
+<td>2</td>
+<td><strong>上线广播</strong>：连接 Broker 成功后，周期发布 <code>sys/product/skyfend/broadcast</code>（如每 3 秒）用于被网关发现。</td>
+</tr>
+<tr>
+<td>3</td>
+<td><strong>状态与回执处理</strong>：持续上报 <code>thing/product/{device_sn}/state</code>（状态/心跳）；可选接收注册结果时订阅 <code>sys/product/{device_sn}/register_ack</code>。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="42">4.2 交互时序</h3>
+<pre><code class="language-mermaid">sequenceDiagram
+    participant Dev as 子设备
+    participant Brk as Broker
+    participant Gw as 网关
+    Gw-&gt;&gt;Brk: CONNECT(本机 Broker)
+    Gw-&gt;&gt;Brk: SUBSCRIBE sys/product/skyfend/broadcast
+    Note over Gw,Brk: 可选恢复持久化注册表与业务订阅
+    Dev-&gt;&gt;Brk: 连接 Broker
+    loop 周期上报
+        Dev-&gt;&gt;Brk: PUBLISH sys/.../broadcast
+        Dev-&gt;&gt;Brk: PUBLISH thing/.../state
+    end
+    Brk-&gt;&gt;Gw: broadcast
+    Gw-&gt;&gt;Gw: 发现设备并执行注册策略
+    alt 自动注册（默认）
+        Gw-&gt;&gt;Gw: 新设备入列或刷新在线状态
+        Gw-&gt;&gt;Brk: SUBSCRIBE thing/product/{device_sn}/#
+    else 手动模式
+        Note over Gw: Web 添加入列后再 SUBSCRIBE
+    end
+    opt 可选：通知注册结果
+        Gw-&gt;&gt;Brk: PUBLISH sys/product/{device_sn}/register_ack
+        Brk-&gt;&gt;Dev: register_ack
+    end
+    Brk-&gt;&gt;Gw: 投递 state/请求等业务消息
+    Note over Gw: broadcast/state 超时或 LWT -&gt; UNSUBSCRIBE + 标记离线
+</code></pre>
+<hr />
+<h2 id="5-mqtt">5. MQTT 服务默认配置</h2>
+<p>本章给出 <strong>AGX 本机 Broker</strong>（如 Mosquitto、EMQX 等）及 <strong>MQTT 客户端</strong>的<strong>建议默认值</strong>，现场可按安全与运维要求调整；与<strong>云上 MQTT</strong> 无关。</p>
+<p><strong>网关应用</strong>与<strong>子设备</strong>均为 MQTT <strong>客户端</strong>，连接前<strong>必须配置 Broker 地址</strong>（<code>server_addr</code>）及端口；二者连<strong>同一台 Broker</strong> 时，<strong>端口、TLS、用户名密码、协议版本等应一致</strong>，仅 <code>**server_addr</code><strong> 的取值因运行位置不同（见 </strong>§5.3**）。</p>
+<h3 id="51-mqtt-broker">5.1 MQTT Broker（服务端）</h3>
+<table>
+<thead>
+<tr>
+<th>配置项</th>
+<th>建议默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>监听地址</td>
+<td><code>0.0.0.0</code></td>
+<td>局域网内子设备可访问；仅本机可用 <code>127.0.0.1</code></td>
+</tr>
+<tr>
+<td>明文端口</td>
+<td><code>1883</code></td>
+<td>标准 MQTT</td>
+</tr>
+<tr>
+<td>TLS 端口（可选）</td>
+<td><code>8883</code></td>
+<td>生产环境建议启用 TLS，证书与密钥由部署配置</td>
+</tr>
+<tr>
+<td>协议版本</td>
+<td>MQTT 3.1.1</td>
+<td>客户端需与 Broker 一致</td>
+</tr>
+<tr>
+<td>匿名登录</td>
+<td><strong>关闭（建议）</strong></td>
+<td>关闭后，<strong>所有客户端</strong>（网关与子设备）均须在连接时提供 <strong>用户名/密码</strong>（或 <strong>TLS 客户端证书</strong>），并在 Broker 侧配置 ACL</td>
+</tr>
+<tr>
+<td>最大连接数</td>
+<td>由产品定义</td>
+<td>需大于「子设备数 + 网关应用连接数」余量</td>
+</tr>
+<tr>
+<td>消息持久化 / 会话</td>
+<td>按 Broker 能力配置</td>
+<td>遗嘱、QoS1 等依赖持久化时需开启对应选项</td>
+</tr>
+</tbody>
+</table>
+<h3 id="52-mqtt">5.2 MQTT 客户端（网关与子设备：地址、端口与认证）</h3>
+<p><strong>任何 MQTT 客户端在 <code>CONNECT</code> 前都必须配置</strong>：<strong>Broker 地址</strong> <code>server_addr</code>、<strong>端口</strong> <code>server_port</code>（及按需 TLS、账号等）；<strong>未配置地址则无法连接</strong>。</p>
+<table>
+<thead>
+<tr>
+<th>配置项</th>
+<th>建议默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>server_addr</code></td>
+<td><strong>必填</strong></td>
+<td><strong>Broker 主机地址</strong>（IP 或域名）。<strong>网关</strong>：<code>127.0.0.1</code> 或 <code>localhost</code>；<strong>子设备</strong>：AGX <strong>局域网 IP</strong>（见 <strong>§5.3</strong>）。</td>
+</tr>
+<tr>
+<td><code>server_port</code></td>
+<td><code>1883</code>（明文）或与 Broker 一致</td>
+<td>与 §5.1 一致；若启用 TLS 一般为 <code>8883</code></td>
+</tr>
+<tr>
+<td><code>username</code></td>
+<td><strong>按 Broker 账号配置填写</strong></td>
+<td><strong>生产环境建议必填</strong>；与 <code>password</code> 成对</td>
+</tr>
+<tr>
+<td><code>password</code></td>
+<td><strong>按 Broker 账号配置填写</strong></td>
+<td><strong>生产环境建议必填</strong>；勿硬编码进版本库，由安全配置或出厂下发</td>
+</tr>
+<tr>
+<td>TLS / CA</td>
+<td>若启用 <code>8883</code></td>
+<td>客户端校验服务端证书；双向认证时另配客户端证书</td>
+</tr>
+<tr>
+<td><code>keepalive</code></td>
+<td><code>60</code>（秒，示例）</td>
+<td>与 Broker <code>max_keepalive</code> 等限制匹配</td>
+</tr>
+<tr>
+<td><code>clean_session</code></td>
+<td>按产品</td>
+<td>持久会话为 <code>false</code> 时需 Broker 支持</td>
+</tr>
+<tr>
+<td><code>client_id</code></td>
+<td>全局唯一</td>
+<td>网关如 <code>gateway-agx</code>；子设备建议含 <code>device_sn</code> 或产品规则</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>开发/调试</strong>：若 Broker <strong>临时允许匿名连接</strong>，<code>username</code> / <code>password</code> 可留空，但须与 §5.1「匿名登录」策略一致；<strong>转产或现场部署前</strong>应改为账号认证并关闭匿名。</p>
+</blockquote>
+<h3 id="53-server_addr">5.3 <code>server_addr</code> 填写说明</h3>
+<p>网关与子设备<strong>都要配置地址</strong>；区别仅在于 Broker 相对客户端的位置。</p>
+<table>
+<thead>
+<tr>
+<th>客户端</th>
+<th>建议 <code>server_addr</code></th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>网关应用</strong></td>
+<td><code>127.0.0.1</code> 或 <code>localhost</code></td>
+<td>Broker 部署在 AGX 本机，走回环即可</td>
+</tr>
+<tr>
+<td><strong>子设备</strong></td>
+<td>AGX <strong>局域网 IP</strong>（如 <code>192.168.1.x</code>）</td>
+<td>经局域网访问 AGX 上的 Broker；<strong>不能</strong>填 <code>127.0.0.1</code>（会指向子设备自身）</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="_2">附录：缩略语</h2>
+<table>
+<thead>
+<tr>
+<th>缩写</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>AGX</td>
+<td>网关硬件平台（如 Jetson AGX）</td>
+</tr>
+<tr>
+<td>Broker</td>
+<td>MQTT 服务端</td>
+</tr>
+<tr>
+<td>LWT</td>
+<td>Last Will and Testament（遗嘱）</td>
+</tr>
+<tr>
+<td>QoS</td>
+<td>服务质量等级</td>
+</tr>
+<tr>
+<td>tid</td>
+<td>Transaction ID，事务标识（UUID）</td>
+</tr>
+<tr>
+<td>bid</td>
+<td>Business ID，业务标识（UUID）</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<p><strong>文档结束</strong></p></article>
+    <script>
+        // Sync theme with parent page
+        try {
+            var parentTheme = window.parent.document.documentElement.getAttribute('data-theme');
+            if (parentTheme) document.documentElement.setAttribute('data-theme', parentTheme);
+            // Listen for theme changes
+            var observer = new MutationObserver(function(mutations) {
+                mutations.forEach(function(m) {
+                    if (m.attributeName === 'data-theme') {
+                        var t = window.parent.document.documentElement.getAttribute('data-theme');
+                        if (t) document.documentElement.setAttribute('data-theme', t);
+                    }
+                });
+            });
+            observer.observe(window.parent.document.documentElement, { attributes: true });
+        } catch(e) {}
+    </script>
+</body>
+</html>

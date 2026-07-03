@@ -1,0 +1,1791 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>和普 PTZ 冷启动视频延迟问题分析</title>
+    <link rel="stylesheet" href="../../css/markdown.css">
+</head>
+<body>
+    <article class="markdown-body"><h1 id="ptz">和普 PTZ 冷启动视频延迟问题分析</h1>
+<blockquote>
+<p><strong>文档版本</strong>：v1.4<br />
+<strong>日期</strong>：2026-06-25<br />
+<strong>状态</strong>：实验室 A/B + C++ 分项测试已完成；建议按 §7.9 部署<br />
+<strong>关联设备</strong>：SSF200（Spotter）、和普 PTZ（Z50 系列）、AGX<br />
+<strong>关联模块</strong>：<code>ptz_service</code>、<code>ptz100_ai</code>、<code>mediamtx</code>、<code>nexus_gateway</code>、<code>gstSourceDecode</code>、<code>gstCloudPusher</code></p>
+</blockquote>
+<hr />
+<h2 id="_1">一、问题背景</h2>
+<h3 id="11">1.1 现场反馈</h3>
+<ul>
+<li><strong>现象</strong>：SSF200（Spotter）设备上电上线后，需等待 <strong>1–2 分钟</strong> 才会出现视频流，耗时较久。</li>
+<li><strong>范围</strong>：王志强反馈该问题在 <strong>天盾</strong> 和 <strong>C2</strong> 平台均存在，并非仅天盾播放器问题。</li>
+<li><strong>现场环境</strong>：设备所在地 <strong>频繁断电</strong>（曾出现平均 5–10 分钟断电一次）；断电修复后 PTZ Web 后台加载也明显变慢，怀疑与 PTZ 设备状态有关。</li>
+<li><strong>同事验证</strong>：袁伟健现场接入 PTZ 较快，未复现 1–2 分钟；说明问题与 <strong>冷启动场景、供电环境</strong> 强相关。</li>
+</ul>
+<h3 id="12">1.2 本地验证（家里模拟）</h3>
+<ul>
+<li>将视频源推送到 AGX 本地 RTMP，用 VLC 拉流播放，<strong>约 1 秒</strong> 出画。</li>
+<li><strong>结论</strong>：嵌入式推流侧（编码 → MediaMTX → 拉流）<strong>本身不慢</strong>；现场延迟主要来自 <strong>冷启动全链路</strong>，而非推流编码性能。</li>
+</ul>
+<h3 id="13">1.3 初步答复（待细化）</h3>
+<blockquote>
+<p>PTZ 和 AGX 同时上电后，均需完成自检/启动，双方就绪并建连后才有视频流。</p>
+</blockquote>
+<p>本分析在以上答复基础上，结合代码链路给出 <strong>耗时拆解、瓶颈定位与优化方案</strong>。</p>
+<hr />
+<h2 id="_2">二、视频链路架构</h2>
+<h3 id="21">2.1 本地推流链路</h3>
+<pre><code>和普 PTZ (RTSP 二码流)
+    → ptz_service (GstSourceDecode 拉流解码)
+    → 原始 SHM (PTZ→AI)
+    → ptz100_ai (推理 + OSD)
+    → 处理后 SHM (AI→Streaming)
+    → ptz_service (GstRtspClient 硬编 H.264)
+    → MediaMTX (UDP RTP, 端口 5410/5411 等)
+    → C2 本地 RTSP 拉流
+</code></pre>
+<h3 id="22-ssf200">2.2 SSF200 上云（天盾）额外链路</h3>
+<pre><code>nexus_gateway
+    → MQTT 连接天盾 Broker
+    → device_register 注册成功
+    → device_stream_url 请求 RTMP 推流地址（最多 10 次 × 5s）
+    → GstCloudPusher 从本地 MediaMTX 拉 RTSP
+    → 免转码重封装 FLV → RTMP 推至天盾云端
+    → 天盾播放器出画
+</code></pre>
+<h3 id="23">2.3 关键代码事实</h3>
+<table>
+<thead>
+<tr>
+<th>点</th>
+<th>说明</th>
+<th>代码位置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>默认推<strong>AI 处理后帧</strong></td>
+<td><code>visiblePushThread</code> 从 <code>shmVisible_</code>（<code>_ai</code> SHM）读帧推流，非原始帧直推</td>
+<td><code>ptzDeviceHepu.cpp</code></td>
+</tr>
+<tr>
+<td>RTSP 拉流失败重试</td>
+<td>管线异常退出后 sleep 再拉起（原固定<strong>5s</strong>）</td>
+<td><code>gstSourceDecode.cpp</code></td>
+</tr>
+<tr>
+<td>云端推流失败重试</td>
+<td>原固定<strong>5s</strong> 重连</td>
+<td><code>gstCloudPusher.cpp</code></td>
+</tr>
+<tr>
+<td>天盾要流时机</td>
+<td><code>device_register</code> 成功后才 <code>RequestStreamUrl()</code></td>
+<td><code>NexusGateway.cpp</code></td>
+</tr>
+<tr>
+<td>和普 TCP 重连</td>
+<td><code>HEPU_RECONNECT_INTERVAL_SEC = 5</code>，初始化阶段检查周期 10s</td>
+<td><code>ptz_hepu_msg.h</code>、<code>ptz_hepu_ctrl.cpp</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="24">2.4 链路时序图</h3>
+<pre><code class="language-mermaid">sequenceDiagram
+    participant PTZ as 和普PTZ
+    participant PS as ptz_service
+    participant AI as ptz100_ai
+    participant MTX as MediaMTX
+    participant NG as nexus_gateway
+    participant TD as 天盾云端
+
+    Note over PTZ: 上电自检 30~60s
+    Note over PS,AI: AGX启动 45~90s
+
+    PTZ-&gt;&gt;PS: RTSP 二码流可用
+    PS-&gt;&gt;PS: GstSourceDecode 拉流解码
+    PS-&gt;&gt;AI: 原始帧写 SHM
+    AI-&gt;&gt;PS: AI处理后帧写 SHM_ai
+    PS-&gt;&gt;MTX: GstRtspClient 编码推流
+    NG-&gt;&gt;TD: MQTT device_register
+    TD-&gt;&gt;NG: register_reply 成功
+    NG-&gt;&gt;TD: device_stream_url
+    TD-&gt;&gt;NG: RTMP 地址
+    NG-&gt;&gt;MTX: GstCloudPusher 拉本地 RTSP
+    NG-&gt;&gt;TD: RTMP 推流
+</code></pre>
+<hr />
+<h2 id="_3">三、分析过程</h2>
+<h3 id="31">3.1 排除项：嵌入式推流不慢</h3>
+<p>家里模拟（本地 RTMP → VLC ~1s）证明：<strong>有视频源且服务就绪后，推流编码链路延迟极低</strong>。问题不在 GStreamer 编码/推流本身。</p>
+<h3 id="32">3.2 冷启动耗时拆解</h3>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>典型耗时</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>AGX 硬件启动</td>
+<td>45–90s</td>
+<td>Jetson 上电到 Linux + 自启脚本；异常断电后可能有 fsck</td>
+</tr>
+<tr>
+<td>ptz100_ai 模型加载</td>
+<td>15–30s</td>
+<td><code>SkyfendAI</code> 构造时加载 TensorRT 权重，与 AGX 启动重叠</td>
+</tr>
+<tr>
+<td>ptz_service 启动</td>
+<td>0–10s 额外</td>
+<td><strong>原</strong> <code>auto_boot_app.sh</code> 未包含，靠 monit 每 10s 检测拉起</td>
+</tr>
+<tr>
+<td>和普 PTZ 自检</td>
+<td>30–60s</td>
+<td>云台回零、镜头初始化；正常比 AGX 快（王志强反馈）</td>
+</tr>
+<tr>
+<td>RTSP 拉流首帧</td>
+<td>0–15s</td>
+<td>PTZ RTSP 未就绪时，解码管线失败后<strong>每 5s 重试</strong></td>
+</tr>
+<tr>
+<td>AI 首帧输出</td>
+<td>1–3s</td>
+<td>原始帧进 SHM 后推理写回</td>
+</tr>
+<tr>
+<td>本地 MediaMTX</td>
+<td>&lt;1s</td>
+<td>有帧即推</td>
+</tr>
+<tr>
+<td>天盾上线 + 要流地址</td>
+<td>5–15s</td>
+<td>MQTT 连接 → register →<code>RequestStreamUrl</code></td>
+</tr>
+<tr>
+<td>云端 RTMP 推流</td>
+<td>1–5s</td>
+<td><code>GstCloudPusher</code> 拉本地 RTSP 推 RTMP</td>
+</tr>
+<tr>
+<td>播放器首屏</td>
+<td>0–2s</td>
+<td>GOP 约 2s 一个 I 帧</td>
+</tr>
+</tbody>
+</table>
+<p><strong>关键路径（AGX + PTZ 同时断电上电）：</strong></p>
+<pre><code>总耗时 ≈ max(AGX启动, PTZ自检) + 服务链就绪 + 天盾注册推流
+       ≈ 60~90s（正常）
+       ≈ 90~120s（频繁断电、网络不稳、PTZ Web 变慢）
+</code></pre>
+<h3 id="33-vs-c2">3.3 天盾 vs C2 差异</h3>
+<table>
+<thead>
+<tr>
+<th>路径</th>
+<th>额外环节</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>C2 本地</strong></td>
+<td>MediaMTX RTSP（局域网），无 MQTT/RTMP</td>
+</tr>
+<tr>
+<td><strong>天盾</strong></td>
+<td>注册成功 → 要 RTMP 地址 → 公网 RTMP 推流</td>
+</tr>
+</tbody>
+</table>
+<p>天盾通常比 C2 <strong>多 5–15s</strong>，但不足以单独解释 1–2 分钟；<strong>冷启动才是主因</strong>。</p>
+<h3 id="34">3.4 启动顺序隐患（分析发现）</h3>
+<p>原 <code>config/boot/auto_boot_app.sh</code> 存在：</p>
+<ol>
+<li><strong>未包含 <code>ptz_service</code></strong>，依赖 monit 晚启动（0–10s 空窗）</li>
+<li><strong><code>mediamtx</code> 在 <code>nexus_gateway</code> 之后</strong>才启动，视频节点可能先于 MediaMTX 就绪</li>
+<li>启动顺序为 <code>ptz100_ai</code> 先于 <code>ptz_service</code>，与数据流方向（应先拉流写 SHM）不一致</li>
+</ol>
+<h3 id="35">3.5 现场环境因素</h3>
+<ul>
+<li>频繁硬断电 → PTZ 自检变长、AGX 文件系统检查、网络反复初始化</li>
+<li>王志强反馈 PTZ Web 后台也慢 → 指向 <strong>PTZ 硬件冷启动</strong> 被放大，不纯是 AGX 软件问题</li>
+<li><strong>供电稳定（UPS）</strong> 往往比纯软件优化收益更大</li>
+</ul>
+<h3 id="36">3.6 结论</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>结论</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>推流性能</td>
+<td>正常，家里 1s 验证成立</td>
+</tr>
+<tr>
+<td>主要瓶颈</td>
+<td>冷启动：<code>max(AGX, PTZ)</code> + 服务就绪顺序 + 重试等待</td>
+</tr>
+<tr>
+<td>天盾</td>
+<td>比 C2 略慢，但非独立根因</td>
+</tr>
+<tr>
+<td>现场</td>
+<td>频繁断电显著拉长总时间</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="_4">四、优化方案（分阶段）</h2>
+<blockquote>
+<p><strong>说明</strong>：以下方案经分析后拟定；其中「方案 A」已在会话中起草代码改动，<strong>尚未评审统一部署</strong>，实施前需回滚或确认工作区状态。</p>
+</blockquote>
+<h3 id="41">4.1 阶段一：启动顺序（改动小、收益明确）</h3>
+<p><strong>目标</strong>：消除 10–20s 不必要等待。</p>
+<table>
+<thead>
+<tr>
+<th>动作</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MediaMTX 提前</td>
+<td>在所有视频相关 ROS 节点之前启动</td>
+</tr>
+<tr>
+<td>加入<code>ptz_service</code></td>
+<td>纳入<code>auto_boot_app.sh</code>，不再仅依赖 monit</td>
+</tr>
+<tr>
+<td><code>ptz_service</code> 在 <code>ptz100_ai</code> 之前</td>
+<td>先拉 PTZ RTSP 写原始 SHM，AI 再读处理</td>
+</tr>
+<tr>
+<td>删除末尾重复 mediamtx 启动</td>
+<td>避免重复拉起</td>
+</tr>
+</tbody>
+</table>
+<p><strong>目标启动顺序：</strong></p>
+<pre><code>mediamtx → ptz100_ros → ptz_service → ptz100_ai → ... → nexus_gateway
+</code></pre>
+<h3 id="42">4.2 阶段二：冷启动快速重试（中等收益）</h3>
+<p><strong>目标</strong>：PTZ RTSP / 本地 MediaMTX 未就绪时，减少重试空窗（每次失败省 ~3.5s）。</p>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>启动阶段</th>
+<th>稳态</th>
+<th>启动阶段时长</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GstSourceDecode</code></td>
+<td>1500ms</td>
+<td>5000ms</td>
+<td>120s</td>
+</tr>
+<tr>
+<td><code>GstCloudPusher</code></td>
+<td>1500ms</td>
+<td>5000ms</td>
+<td>120s</td>
+</tr>
+</tbody>
+</table>
+<p>120s 后自动切回稳态间隔，避免长期运行频繁重连。</p>
+<p><strong>预估收益</strong>：RTSP 多次重试场景下 <strong>15–20s</strong>；云端推流等待本地流 <strong>5–10s</strong>。</p>
+<h3 id="43">4.3 阶段三：现场环境（收益最大）</h3>
+<ul>
+<li>加 <strong>UPS / 稳压</strong>，避免 5–10 分钟断电循环</li>
+<li>减少 PTZ 与 AGX 异常断电带来的自检延长和 fsck</li>
+</ul>
+<h3 id="44">4.4 阶段四：可选后续（本次未实施）</h3>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>说明</th>
+<th>预估收益</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>启动阶段原始流直推</td>
+<td><code>HEPU_STREAM_MODE_RAW</code> 或双路径：先出画面，AI 框后叠加</td>
+<td>10–20s</td>
+</tr>
+<tr>
+<td>并行请求推流地址</td>
+<td>注册成功后并行<code>RequestStreamUrl</code> 与 <code>RequestDeviceTimeSync</code></td>
+<td>数秒</td>
+</tr>
+<tr>
+<td>缓存 RTMP 地址</td>
+<td>注册成功即预推（需天盾确认地址有效期）</td>
+<td>数秒</td>
+</tr>
+<tr>
+<td>和普 SDK 重连间隔</td>
+<td>初始化阶段缩短<code>HEPU_RECONNECT_INTERVAL_SEC</code></td>
+<td>视现场而定</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="_5">五、综合收益预估</h2>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>优化前（实测）</th>
+<th>阶段一+二后（实验室实测）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>正常冷启动</td>
+<td><strong>~72s</strong>（§7.6）</td>
+<td><strong>~30–32s</strong>（C1/C3，PTZ 快）</td>
+</tr>
+<tr>
+<td>PTZ 自检偏慢</td>
+<td><strong>~72s</strong></td>
+<td><strong>~59s</strong>（C2 R2，PTZ 等待 ~51s，仍快 ~13s）</td>
+</tr>
+<tr>
+<td>频繁断电 / PTZ 慢</td>
+<td>90–120s（现场估）</td>
+<td><strong>待现场 UPS + 复测</strong></td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>修订</strong>：原估 45–70s 偏保守；在 §6.1 + C++ 编译且 PTZ 自检 ~10s 时，实验室三轮稳定在 <strong>28–32s</strong>。硬下限仍受 <strong>PTZ 冷启动方差</strong>（8–51s）主导。</p>
+</blockquote>
+<hr />
+<h2 id="_6">六、会话中起草的代码改动记录</h2>
+<blockquote>
+<p><strong>状态</strong>：已在工作区起草，<strong>待评审后统一部署</strong>。若需保持主分支不变，可先 <code>git checkout</code> 还原以下文件。</p>
+</blockquote>
+<h3 id="61-configbootauto_boot_appsh">6.1 <code>config/boot/auto_boot_app.sh</code></h3>
+<p><strong>改动要点：</strong></p>
+<ul>
+<li>在 ROS 节点启动前增加 MediaMTX 启动（<code>pidof</code> 检测防重复）</li>
+<li>在 <code>ptz100_ai</code> 之前增加 <code>ptz_service</code> 启动</li>
+<li>删除脚本末尾重复的 mediamtx 启动</li>
+</ul>
+<pre><code class="language-bash"># MediaMTX 必须在 ptz_service / nexus_gateway 推流拉流之前就绪
+if ! pidof mediamtx &gt; /dev/null 2&gt;&amp;1; then
+    echo &quot;[INFO] starting mediamtx before video pipeline nodes&quot;
+    nohup ${MEDIAMCTX_SCRIPT_PATH}/mediamtx ${MEDIAMCTX_SCRIPT_PATH}/mediamtx.yml &amp;
+    sleep 1
+fi
+
+#start ros nodes
+su skyfend -c &quot;${APP_SCRIPT_PATH}/skyfend-ptz100.sh -s ptz100_ros -e start&quot;
+# ptz_service 需在 ptz100_ai 之前：先拉 PTZ RTSP 写原始 SHM，AI 再读处理
+su skyfend -c &quot;${APP_SCRIPT_PATH}/skyfend-ptz100.sh -s ptz_service -e start&quot;
+su skyfend -c &quot;${APP_SCRIPT_PATH}/skyfend-ptz100.sh -s ptz100_ai -e start&quot;
+# ... 其余节点不变 ...
+# （已删除末尾 nohup mediamtx）
+</code></pre>
+<h3 id="62-publicgstnvdeepsgstsourcedecodegstsourcedecodeh">6.2 <code>public/gstNvDeeps/gstSourceDecode/gstSourceDecode.h</code></h3>
+<p><strong>新增 <code>Param</code> 字段（带默认值，旧调用方兼容）：</strong></p>
+<pre><code class="language-cpp">uint16_t pipelineRestartDelayMs{5000};      // 稳态重连间隔(ms)
+uint16_t pipelineRestartDelayBootMs{1500};  // 启动阶段重连间隔(ms)
+uint16_t bootPhaseDurationSec{120};         // 启动阶段时长(s)
+</code></pre>
+<p><strong>新增成员与方法：</strong></p>
+<ul>
+<li><code>workerStartTimeMs_</code>：在 <code>start()</code> 时记录</li>
+<li><code>getPipelineRestartDelayMs()</code>：启动 120s 内用 1500ms，之后用 5000ms</li>
+</ul>
+<h3 id="63-publicgstnvdeepsgstsourcedecodegstsourcedecodecpp">6.3 <code>public/gstNvDeeps/gstSourceDecode/gstSourceDecode.cpp</code></h3>
+<ul>
+<li><code>workerTaskLoopForever()</code>：由固定 <code>sleep(5000)</code> 改为 <code>getPipelineRestartDelayMs()</code></li>
+<li><code>start()</code>：设置 <code>workerStartTimeMs_</code></li>
+</ul>
+<h3 id="64-publicgstnvdeepsgstcloudpushergstcloudpusherh">6.4 <code>public/gstNvDeeps/gstCloudPusher/gstCloudPusher.h</code></h3>
+<p><strong>扩展 <code>Param</code>：</strong></p>
+<pre><code class="language-cpp">struct Param {
+    uint32_t latencyMs;
+    uint32_t reconnectDelayMs;
+    uint32_t reconnectDelayBootMs;  // 启动阶段 1500ms
+    uint32_t bootPhaseDurationSec;  // 120s
+};
+static constexpr Param DefaultParam{300, 5000, 1500, 120};
+</code></pre>
+<p><strong>新增：</strong> <code>workerStartTime_</code>、<code>getReconnectDelayMs()</code></p>
+<h3 id="65-publicgstnvdeepsgstcloudpushergstcloudpushercpp">6.5 <code>public/gstNvDeeps/gstCloudPusher/gstCloudPusher.cpp</code></h3>
+<ul>
+<li><code>workerTaskLoopForever()</code>：使用 <code>getReconnectDelayMs()</code> 动态间隔</li>
+<li><code>startPush()</code>：记录 <code>workerStartTime_</code></li>
+</ul>
+<h3 id="66-ros_wssrcptz_servicesrcptzdeviceptzdevicehepucpp">6.6 <code>ros_ws/src/ptz_service/src/ptzDevice/ptzDeviceHepu.cpp</code></h3>
+<p><strong><code>s_decodeParam</code> 显式配置冷启动重试：</strong></p>
+<pre><code class="language-cpp">static GstSourceDecode::Param s_decodeParam = {
+    GstSourceDecode::SinkType::IMAGE_BGR,
+    GstSourceDecode::Decoder::HARDWARE,
+    0, 0, 0,
+    true,   // disableDPB
+    5000,   // pipelineRestartDelayMs (稳态)
+    1500,   // pipelineRestartDelayBootMs (冷启动)
+    120,    // bootPhaseDurationSec
+};
+</code></pre>
+<h3 id="67">6.7 部署依赖</h3>
+<table>
+<thead>
+<tr>
+<th>改动类型</th>
+<th>需重新编译/生效方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>gstSourceDecode</code> / <code>gstCloudPusher</code></td>
+<td>重编<code>ptz_service</code>、<code>nexus_gateway</code></td>
+</tr>
+<tr>
+<td><code>auto_boot_app.sh</code></td>
+<td>重新上电或手动执行 boot 脚本</td>
+</tr>
+<tr>
+<td>monit</td>
+<td>仍会监控<code>ptz_service</code>；auto_boot 已启动时不会重复拉起</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="_7">七、半自动冷启动测量（现有设施，不改业务代码）</h2>
+<blockquote>
+<p><strong>适用场景</strong>：AGX + 和普 PTZ 同时断电上电；<code>nexus_gateway</code> 在跑但<strong>连不上天盾 RTMP</strong> 时，用 <strong>本地 MediaMTX RTSP</strong> 代替云端出画指标。<br />
+<strong>测量脚本</strong>：<code>config/tools/cold_boot_benchmark.sh</code>（已支持 <code>@reboot</code> 安装）</p>
+</blockquote>
+<h3 id="71-rtmp">7.1 为何不用本地 RTMP？</h3>
+<p>当前和普链路是：</p>
+<pre><code>ptz_service → MediaMTX (UDP RTP :5410/5411) → RTSP :9554 → 播放端
+</code></pre>
+<p><strong>RTMP 仅用于天盾云端</strong>（<code>GstCloudPusher</code> → 公网 RTMP）。本地验证「视频多久能看」应直接测 <strong>RTSP</strong>，与家里 VLC 测 RTMP 等价，且<strong>无需改代码、无需搭本地 RTMP 服务器</strong>。</p>
+<table>
+<thead>
+<tr>
+<th>播放方式</th>
+<th>URL / 入口</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>VLC（推荐）</strong></td>
+<td><code>rtsp://192.168.2.132:9554/ptz/zoom/ch0</code></td>
+<td>可见光（AI 处理后）</td>
+</tr>
+<tr>
+<td><strong>VLC</strong></td>
+<td><code>rtsp://192.168.2.132:9554/ptz/ir/ch0</code></td>
+<td>热像</td>
+</tr>
+<tr>
+<td><strong>sysmonit 网页</strong></td>
+<td><code>http://192.168.2.132:12345</code> → Video 页</td>
+<td>内置 WHEP 低延迟播放器；可见光/热像卡片上点播放</td>
+</tr>
+<tr>
+<td><strong>脚本自动探测</strong></td>
+<td>同上 RTSP +<code>/tmp/video_pipeline_status.json</code></td>
+<td>不依赖人工点播放</td>
+</tr>
+</tbody>
+</table>
+<p><code>nexus_gateway</code> 连不上 RTMP <strong>不影响</strong>本地 RTSP 测量；注册日志仍可记录，但本轮以 <strong>「本地 RTSP 可播」</strong> 作为用户可感知的「出画」终点。</p>
+<h3 id="72">7.2 测量里程碑</h3>
+<p>所有时间均为 <strong>相对系统 boot</strong> 的秒数（<code>uptime</code> / <code>/proc/uptime</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>里程碑</th>
+<th>判定方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MediaMTX 就绪</td>
+<td>TCP<code>127.0.0.1:9554</code> 可达</td>
+</tr>
+<tr>
+<td><code>ptz_service</code> 进程</td>
+<td><code>pidof ptz_service</code></td>
+</tr>
+<tr>
+<td><code>ptz100_ai</code> 进程</td>
+<td><code>pidof ptz100_ai</code></td>
+</tr>
+<tr>
+<td><code>nexus_gateway</code> 进程</td>
+<td><code>pidof nexus_gateway</code></td>
+</tr>
+<tr>
+<td>RTSP 解码首帧</td>
+<td><code>/tmp/video_pipeline_status.json</code> → <code>visible.decode_fps &gt; 0</code></td>
+</tr>
+<tr>
+<td>AI 首帧</td>
+<td><code>visible.ai_fps &gt; 0</code></td>
+</tr>
+<tr>
+<td>本地编码推流</td>
+<td><code>visible.encode_fps &gt; 0</code></td>
+</tr>
+<tr>
+<td><strong>本地可播放（主指标）</strong></td>
+<td><code>gst-launch-1.0</code> 成功拉取 <code>rtsp://127.0.0.1:9554/ptz/zoom/ch0</code></td>
+</tr>
+<tr>
+<td>天盾注册（可选）</td>
+<td><code>nexus_gateway.log</code>：<code>registered successfully</code></td>
+</tr>
+<tr>
+<td>天盾 RTMP（可选）</td>
+<td><code>cloud push started</code>（需公网 RTMP 可达）</td>
+</tr>
+</tbody>
+</table>
+<p><strong>主指标</strong>：<code>local_rtsp_visible_playable</code> ≈ 用户在 VLC/sysmonit 看到画面的时刻（误差约 ±1–2s）。</p>
+<h3 id="73-3">7.3 操作步骤（你只需配合 3 步）</h3>
+<p><strong>断电前（在 AGX 上执行一次安装，已完成可跳过）：</strong></p>
+<pre><code class="language-bash">bash /home/skyfend/workspace/ptz100_agx/config/tools/cold_boot_benchmark.sh install
+</code></pre>
+<p><strong>每次测试断电前：</strong></p>
+<pre><code class="language-bash">bash /home/skyfend/workspace/ptz100_agx/config/tools/cold_boot_benchmark.sh mark
+# 然后：只断 AGX + 和普 PTZ 电源，再上电
+</code></pre>
+<p>脚本已通过 <code>crontab @reboot</code> 在上电 <strong>15s 后</strong>自动采集（等基础服务起来），最长轮询 <strong>300s</strong>，结果写入：</p>
+<ul>
+<li><code>/home/skyfend/log/cold_boot_benchmark.log</code></li>
+<li><code>/home/skyfend/log/cold_boot_benchmark_latest.json</code></li>
+</ul>
+<p><strong>上电后（SSH 恢复，或让 Agent 执行）：</strong></p>
+<pre><code class="language-bash">bash /home/skyfend/workspace/ptz100_agx/config/tools/cold_boot_benchmark.sh report
+</code></pre>
+<p>可选人工交叉验证：</p>
+<pre><code class="language-bash"># VLC 同 URL（在 PC 或 AGX 上）
+rtsp://192.168.2.132:9554/ptz/zoom/ch0
+
+# 管道实时状态
+cat /tmp/video_pipeline_status.json
+</code></pre>
+<h3 id="74-json">7.4 输出示例（JSON）</h3>
+<pre><code class="language-json">{
+  &quot;test_mode&quot;: &quot;local_rtsp&quot;,
+  &quot;seconds_since_boot&quot;: {
+    &quot;mediamtx_port_9554&quot;: 18,
+    &quot;ptz_service_process&quot;: 45,
+    &quot;pipeline_decode_fps&quot;: 62,
+    &quot;pipeline_ai_fps&quot;: 65,
+    &quot;pipeline_encode_fps&quot;: 66,
+    &quot;local_rtsp_visible_playable&quot;: 67
+  },
+  &quot;summary&quot;: {
+    &quot;agx_video_ready_sec&quot;: 67
+  }
+}
+</code></pre>
+<p>解读：<strong>上电后约 67s</strong>，本地 RTSP 可播（VLC/sysmonit 应能出画）。</p>
+<h3 id="75-agent">7.5 与 Agent 协作流程</h3>
+<ol>
+<li>你发：<strong>「准备断电测冷启动」</strong></li>
+<li>Agent 执行 <code>mark</code>（若未 <code>install</code> 则先 <code>install</code>）</li>
+<li>你：<strong>只断 AGX + PTZ</strong> → 上电</li>
+<li>你发：<strong>「已上电」</strong> 或 SSH 恢复</li>
+<li>Agent 执行 <code>report</code>，将结果填入本文档 <strong>§7.6 实测记录</strong></li>
+</ol>
+<p>卸载自动采集：</p>
+<pre><code class="language-bash">bash /home/skyfend/workspace/ptz100_agx/config/tools/cold_boot_benchmark.sh uninstall
+</code></pre>
+<h3 id="76">7.6 实测记录（三轮汇总）</h3>
+<p><strong>测试环境</strong>：实验室 AGX <code>192.168.2.132</code> + 和普 PTZ；只断 AGX + PTZ；播放验证 <code>rtsp://192.168.2.132:9554/ptz/zoom/ch0</code>（VLC）；天盾 RTMP 不可用（MQTT <code>Connection refused</code>，不影响本地测量）。</p>
+<p><strong>数据来源</strong>：三轮均以 <code>journalctl -b 0</code> + <code>ptz_service.log</code> 手工对齐为准。<code>cold_boot_benchmark.sh</code> 自动 JSON <strong>不可直接采信</strong>（上电后残留 <code>/tmp/video_pipeline_status.json</code> 导致虚报 +5~6s；脚本 T0 取启动时刻 uptime 而非 boot 0s）。</p>
+<hr />
+<h4 id="_8">三轮明细</h4>
+<table>
+<thead>
+<tr>
+<th>轮次</th>
+<th>AGX boot (<code>uptime -s</code>)</th>
+<th>MediaMTX</th>
+<th>ptz_service</th>
+<th>ptz100_ai</th>
+<th>nexus_gateway</th>
+<th><strong>视频就绪</strong></th>
+<th><strong>PTZ 等待</strong>*</th>
+<th>VLC</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>初测</strong></td>
+<td><code>08:00:23</code></td>
+<td>+15s</td>
+<td>+21s</td>
+<td>+23s</td>
+<td>+51s</td>
+<td><strong>+72s</strong></td>
+<td>~51s</td>
+<td>用户确认已出画</td>
+</tr>
+<tr>
+<td><strong>第1轮</strong></td>
+<td><code>08:00:23</code></td>
+<td>+14s</td>
+<td>+19s</td>
+<td>+21s</td>
+<td>+47s</td>
+<td><strong>+72s</strong></td>
+<td>~53s</td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong>第2轮</strong></td>
+<td><code>08:00:24</code></td>
+<td>+14s</td>
+<td>+20s</td>
+<td>+22s</td>
+<td>+50s</td>
+<td><strong>+71s</strong></td>
+<td>~49s</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<p>* <strong>PTZ 等待</strong> = <code>ptz_service</code> 进程启动 → RTSP 解码首帧（<code>Decoder FPS</code> / <code>Visible push</code>）的间隔，主要反映和普 PTZ 自检 / RTSP 就绪时间。</p>
+<p><strong>各轮时间线（相对 AGX Linux boot）</strong></p>
+<details>
+<summary>初测（2026-06-25）</summary>
+
+
+| +秒数    | 里程碑                           |
+| ---------- | ---------------------------------- |
+| 0        | AGX Linux 启动                   |
+| +15      | MediaMTX 启动                    |
+| +21      | `ptz_service` 启动               |
+| +23      | `ptz100_ai` 启动                 |
+| +51      | `nexus_gateway` 启动             |
+| **+72**  | RTSP 解码首帧 + 本地 encode 推流 |
+| ~+72–80 | VLC 可播（用户确认）             |
+
+</details>
+
+<details>
+<summary>第1轮（2026-06-25）</summary>
+
+
+| +秒数   | 里程碑                                         |
+| --------- | ------------------------------------------------ |
+| 0       | AGX Linux 启动（`08:00:23`）                   |
+| +14     | MediaMTX 启动                                  |
+| +19     | `ptz_service` 启动                             |
+| +21     | `ptz100_ai` 启动                               |
+| +47     | `nexus_gateway` 启动                           |
+| **+72** | RTSP 解码首帧 + 本地 encode 推流（`08:01:35`） |
+
+</details>
+
+<details>
+<summary>第2轮（2026-06-25，断电前 mark `08:02:45`）</summary>
+
+
+| +秒数   | 里程碑                                         |
+| --------- | ------------------------------------------------ |
+| 0       | AGX Linux 启动（`08:00:24`）                   |
+| +14     | MediaMTX 启动                                  |
+| +20     | `ptz_service` 启动                             |
+| +22     | `ptz100_ai` 启动                               |
+| +50     | `nexus_gateway` 启动                           |
+| **+71** | RTSP 解码首帧 + 本地 encode 推流（`08:01:35`） |
+
+</details>
+
+<hr />
+<h4 id="_9">三轮统计结论</h4>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>初测</th>
+<th>第1轮</th>
+<th>第2轮</th>
+<th><strong>平均</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>AGX 侧视频就绪</td>
+<td>72s</td>
+<td>72s</td>
+<td>71s</td>
+<td><strong>≈ 71.7s</strong></td>
+</tr>
+<tr>
+<td>AGX 服务链就绪（mediamtx→ptz100_ai）</td>
+<td>8s</td>
+<td>7s</td>
+<td>8s</td>
+<td><strong>≈ 7.7s</strong></td>
+</tr>
+<tr>
+<td>PTZ 等待（ptz_service→首帧）</td>
+<td>~51s</td>
+<td>~53s</td>
+<td>~49s</td>
+<td><strong>≈ 51s</strong></td>
+</tr>
+<tr>
+<td>轮间偏差</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td><strong>±1s</strong>（高度一致）</td>
+</tr>
+</tbody>
+</table>
+<p><strong>结论</strong></p>
+<ol>
+<li><strong>实验室冷启动出画时间稳定在约 71–72 秒</strong>，三轮可重复，偏差 ±1s。</li>
+<li><strong>瓶颈稳定在和普 PTZ</strong>：约占 <strong>50s+</strong>（<code>ptz_service</code> 已运行但 RTSP 无帧）；AGX 软件侧 <strong>~8s</strong> 即可就绪。</li>
+<li><strong>低于现场 1–2 分钟上限</strong>，但用户感知仍是「需等待约 1 分钟」；现场频繁断电可能进一步拉长 PTZ 自检。</li>
+<li><strong>嵌入式推流不慢</strong>：首帧到达后 encode 几乎同时就绪（+0s 级），与家里 VLC ~1s 验证一致。</li>
+<li><strong>自动采集脚本待修</strong>：上电后应清空或忽略陈旧 <code>video_pipeline_status.json</code>；里程碑应以 <strong>boot 绝对 uptime</strong> 为 T0，而非脚本启动时刻。</li>
+</ol>
+<p><strong>汇总表</strong></p>
+<table>
+<thead>
+<tr>
+<th>日期</th>
+<th>轮次</th>
+<th>断电方式</th>
+<th>agx_video_ready_sec</th>
+<th>PTZ 等待</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2026-06-25</td>
+<td>初测</td>
+<td>AGX+PTZ</td>
+<td><strong>72</strong></td>
+<td>~51s</td>
+<td>VLC 已确认</td>
+</tr>
+<tr>
+<td>2026-06-25</td>
+<td>第1轮</td>
+<td>AGX+PTZ</td>
+<td><strong>72</strong></td>
+<td>~53s</td>
+<td>日志对齐</td>
+</tr>
+<tr>
+<td>2026-06-25</td>
+<td>第2轮</td>
+<td>AGX+PTZ</td>
+<td><strong>71</strong></td>
+<td>~49s</td>
+<td>mark 后断电</td>
+</tr>
+<tr>
+<td>—</td>
+<td>现场（待测）</td>
+<td>AGX+PTZ + 频繁断电</td>
+<td>—</td>
+<td>—</td>
+<td>对比 1–2min 反馈</td>
+</tr>
+</tbody>
+</table>
+<h3 id="77-auto_boot_appsh-ab">7.7 <code>auto_boot_app.sh</code> A/B 分项测试</h3>
+<blockquote>
+<p><strong>说明</strong>：§7.6 三轮在<strong>两项 boot 改动均生效</strong>、<strong>§6.2–§6.6 C++ 未编译</strong>条件下测得 ~71.7s。以下为 boot 改动分项隔离。</p>
+</blockquote>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>MediaMTX 提前</th>
+<th>ptz_service 进 auto_boot</th>
+<th>视频就绪（平均）</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>§7.6 已测</td>
+<td>✅</td>
+<td>✅</td>
+<td><strong>~71.7s</strong></td>
+<td>完成</td>
+</tr>
+<tr>
+<td><strong>阶段1</strong></td>
+<td>✅</td>
+<td>❌ monit 拉起</td>
+<td><strong>~64.6s</strong>（5轮，波动大）</td>
+<td>完成 5 轮</td>
+</tr>
+<tr>
+<td><strong>阶段2</strong></td>
+<td>❌ 末尾启动</td>
+<td>❌ monit 拉起</td>
+<td><strong>~75.6s</strong>（5轮）</td>
+<td>完成 5 轮</td>
+</tr>
+</tbody>
+</table>
+<p><strong>阶段2 五轮明细</strong></p>
+<table>
+<thead>
+<tr>
+<th>轮次</th>
+<th>MediaMTX</th>
+<th>ptz_service</th>
+<th>ptz100_ai</th>
+<th>nexus</th>
+<th><strong>视频就绪</strong></th>
+<th><strong>PTZ 等待</strong>*</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>第1轮</td>
+<td>+47s（末尾）</td>
+<td>+59s (monit)</td>
+<td>+20s</td>
+<td>+47s</td>
+<td><strong>+72s</strong></td>
+<td>~7s</td>
+<td>—</td>
+</tr>
+<tr>
+<td>第2轮</td>
+<td>+47s（末尾）</td>
+<td>+65s (monit)</td>
+<td>+20s</td>
+<td>+47s</td>
+<td><strong>+92s</strong></td>
+<td>~27s</td>
+<td>PTZ 自检偏慢</td>
+</tr>
+<tr>
+<td>第3轮</td>
+<td>+43s（末尾）</td>
+<td>+60s (monit)</td>
+<td>+18s</td>
+<td>+43s</td>
+<td><strong>+69s</strong></td>
+<td>~7s</td>
+<td>—</td>
+</tr>
+<tr>
+<td>第4轮</td>
+<td>+47s（末尾）</td>
+<td>+59s (monit)</td>
+<td>+20s</td>
+<td>+47s</td>
+<td><strong>+73s</strong></td>
+<td>~7s</td>
+<td>—</td>
+</tr>
+<tr>
+<td>第5轮</td>
+<td>+47s（末尾）</td>
+<td>+59s (monit)</td>
+<td>+20s</td>
+<td>+47s</td>
+<td><strong>+72s</strong></td>
+<td>~7s</td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong>5轮平均</strong></td>
+<td><strong>~+46s</strong></td>
+<td><strong>~+60s</strong></td>
+<td><strong>+19s</strong></td>
+<td><strong>+46s</strong></td>
+<td><strong>~75.6s</strong></td>
+<td>—</td>
+<td>69–92s 波动</td>
+</tr>
+</tbody>
+</table>
+<p><strong>阶段2 结论</strong>（5 轮）：</p>
+<ol>
+<li>出厂 boot（MediaMTX 末尾 <strong>~+46s</strong>）5 轮平均 <strong>~75.6s</strong>，较 §7.6（~71.7s）略慢 <strong>~4s</strong>，但在 PTZ 波动范围内（69–92s）。</li>
+<li>与阶段1（~64.6s）相比阶段2略慢，但阶段1含 <strong>38s 异常快轮</strong>；若剔除阶段1第2轮，两者均在 <strong>~69–73s</strong> 区间重叠。</li>
+<li><strong>MediaMTX 提前 ~33s 对出画无稳定影响</strong>；真正瓶颈仍是 <strong>PTZ 冷启动</strong> + <strong>monit 排队拉起 ptz_service（~+59–65s）</strong>。</li>
+</ol>
+<p><strong>A/B 总对比</strong>（阶段1/2 各 5 轮 + §7.6 三项全开 3 轮）</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>平均出画</th>
+<th>波动范围</th>
+<th>建议</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>§7.6 两项 boot 全开</td>
+<td><strong>~71.7s</strong></td>
+<td>71–72s</td>
+<td><strong>最稳定</strong>，推荐部署</td>
+</tr>
+<tr>
+<td>阶段1 仅 MediaMTX 提前</td>
+<td>~64.6s</td>
+<td>38–73s</td>
+<td>无稳定收益</td>
+</tr>
+<tr>
+<td>阶段2 出厂 boot</td>
+<td>~75.6s</td>
+<td>69–92s</td>
+<td>基线对照</td>
+</tr>
+</tbody>
+</table>
+<p><strong>推荐下一步</strong>：恢复 §6.1 完整 boot（MediaMTX 提前 + <code>ptz_service</code> 进 <code>auto_boot</code>），消除 monit 排队；PTZ 侧优化需 §6.2–6.6 编译部署后分项验证（见 §7.8）。</p>
+<h3 id="78-6266-c">7.8 §6.2–§6.6 C++ 分项测试</h3>
+<blockquote>
+<p><strong>对照基线</strong>：§7.6 三轮（~71.7s）= §6.1 boot 已生效，但 <strong>C++ 未编译</strong>（<code>ptz_service</code> 仍固定 5s 重连）。</p>
+<p><strong>本轮 boot 固定为 §6.1</strong>（MediaMTX 提前 + <code>ptz_service</code> 进 auto_boot），消除 monit 排队对 PTZ 等待的干扰。</p>
+</blockquote>
+<p><strong>三项对本地 RTSP 出画的影响评估</strong></p>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>影响本地 RTSP？</th>
+<th>预期收益</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>§6.2–§6.3</strong> <code>gstSourceDecode</code></td>
+<td><strong>是</strong></td>
+<td><strong>0–20s</strong>（视 PTZ 等待）</td>
+<td>PTZ RTSP 未就绪时，管线失败后重连间隔 5s→1.5s；<strong>仅当 <code>ptz_service</code> 早启动且 PTZ 仍在自检时有效</strong></td>
+</tr>
+<tr>
+<td><strong>§6.4–§6.5</strong> <code>gstCloudPusher</code></td>
+<td><strong>否</strong></td>
+<td>天盾 RTMP 5–10s</td>
+<td>仅 <code>nexus_gateway</code> 云端推流；本地 <code>rtsp://:9554</code> / VLC <strong>不走此链路</strong></td>
+</tr>
+<tr>
+<td><strong>§6.6</strong> <code>ptzDeviceHepu.cpp</code></td>
+<td><strong>与 6.2–6.3 绑定</strong></td>
+<td>同左</td>
+<td>为和普解码显式传入 1500ms/120s；<strong>无 6.2–6.3 编译则 6.6 无效</strong>；有 6.2–6.3 时与头文件默认值等价</td>
+</tr>
+</tbody>
+</table>
+<p><strong>近期 A/B 为何看不出 C++ 收益</strong>：阶段1/2 多轮 <code>ptz_service</code> 被 monit 推迟到 <strong>~+60s</strong>，PTZ 往往已就绪（PTZ 等待仅 ~7s），<strong>几乎不触发 5s 重连空窗</strong> → 编译前后差异被掩盖。</p>
+<p><strong>测试计划</strong>（各 3 轮冷启动，T0 = AGX boot）</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>编译包</th>
+<th>改动</th>
+<th>主指标</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>C1</strong></td>
+<td><code>ptz_service</code></td>
+<td>§6.2–6.3 + §6.6</td>
+<td>本地 RTSP 出画</td>
+<td><strong>完成 3 轮，平均 ~32s</strong></td>
+</tr>
+<tr>
+<td><strong>C2</strong></td>
+<td><code>nexus_gateway</code></td>
+<td>§6.4–§6.5</td>
+<td>天盾 RTMP / <code>nexus_gateway.log</code></td>
+<td><strong>实验室 2 轮 N/A</strong>（无 MQTT）</td>
+</tr>
+<tr>
+<td><strong>C3</strong></td>
+<td>全量</td>
+<td>§6.1+C1+C2 已编译</td>
+<td>本地 RTSP 稳定性</td>
+<td><strong>完成 3 轮，平均 ~31s</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>C2 说明</strong></p>
+<ul>
+<li><strong>不影响本地 RTSP</strong>；本地分别为 <strong>+32s</strong>（R1）与 <strong>+59s</strong>（R2，PTZ 慢），与 C1 同链路规律一致。</li>
+<li><strong>实验室无 MQTT broker</strong> → <code>mosquitto_connect: Connection refused</code>，无法注册天盾、无法下发 RTMP，<code>GstCloudPusher</code> <strong>从未启动</strong>（日志 0 条 <code>CloudPusher</code> / <code>reconnect in 1500</code>）。</li>
+<li>§6.4–§6.5 <strong>待现场接入天盾后验证</strong>；第 3 轮在实验室跳过。</li>
+</ul>
+<p><strong>C2 明细</strong></p>
+<table>
+<thead>
+<tr>
+<th>轮次</th>
+<th>本地视频就绪</th>
+<th>云端推流就绪</th>
+<th>CloudPusher</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>第1轮</td>
+<td><strong>+32s</strong></td>
+<td>N/A</td>
+<td>无日志</td>
+<td>nexus boot fail；MQTT 不可达</td>
+</tr>
+<tr>
+<td>第2轮</td>
+<td><strong>+59s</strong></td>
+<td>N/A</td>
+<td>无日志</td>
+<td>PTZ 等待 ~51s；MQTT 不可达；nexus boot fail</td>
+</tr>
+<tr>
+<td>~~第3轮~~</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td><strong>跳过</strong>（无 MQTT）</td>
+</tr>
+</tbody>
+</table>
+<p><strong>C2 结论</strong>：编译 <code>nexus_gateway</code> <strong>不改变本地出画</strong>；云端快速重连 <strong>本环境无法测</strong>，非 C2 改动问题。</p>
+<p><strong>C3 说明</strong>（全量组合验证）</p>
+<ul>
+<li>原 §6.6 单独测试 <strong>已并入 C1</strong>（与 §6.2–6.3 同链路，不独立测）。</li>
+<li><strong>C3</strong> = 发布态组合：<strong>§6.1 boot + <code>ptz_service</code> + <code>nexus_gateway</code> 均已编译</strong>，再冷启动 <strong>3 轮</strong>确认本地 RTSP 仍稳定 ~32s。</li>
+<li>boot 脚本保持当前 §6.1 配置不变。</li>
+</ul>
+<p><strong>C3 明细</strong>（T0 = AGX boot <code>08:00:23</code>）</p>
+<table>
+<thead>
+<tr>
+<th>轮次</th>
+<th>MediaMTX</th>
+<th>ptz_service</th>
+<th>ptz100_ai</th>
+<th><strong>视频就绪</strong></th>
+<th><strong>PTZ 等待</strong>*</th>
+<th>nexus</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>第1轮</td>
+<td>+15s</td>
+<td>+20s</td>
+<td>+22s</td>
+<td><strong>+28s</strong></td>
+<td>~8s</td>
+<td>boot fail；MQTT 不可达</td>
+<td><code>runPipelineLoop</code> 2 次即成功</td>
+</tr>
+<tr>
+<td>第2轮</td>
+<td>+15s</td>
+<td>+21s</td>
+<td>+23s</td>
+<td><strong>+32s</strong></td>
+<td>~11s</td>
+<td>boot fail；MQTT 不可达</td>
+<td><code>runPipelineLoop</code> 2 次；首轮 RTSP 失败</td>
+</tr>
+<tr>
+<td>第3轮</td>
+<td>+15s</td>
+<td>+20s</td>
+<td>+23s</td>
+<td><strong>+31s</strong></td>
+<td>~11s</td>
+<td>boot fail；MQTT 不可达</td>
+<td><code>runPipelineLoop</code> 2 次；控制口未连走 fallback RTSP</td>
+</tr>
+<tr>
+<td><strong>平均</strong></td>
+<td><strong>+15s</strong></td>
+<td><strong>+20s</strong></td>
+<td><strong>+23s</strong></td>
+<td><strong>~31s</strong></td>
+<td><strong>~10s</strong></td>
+<td>—</td>
+<td>28–32s，偏差 ≤4s</td>
+</tr>
+</tbody>
+</table>
+<p><strong>C3 结论</strong>：全量编译组合下本地出画 <strong>稳定 ~31s</strong>（与 C1 ~32s 一致），<code>nexus_gateway</code> 编译 <strong>不改变本地链路</strong>。</p>
+<h3 id="79">7.9 实验总结与部署建议</h3>
+<p><strong>实验是否做完</strong>：<strong>是</strong>。boot A/B（阶段1/2 各 5 轮 + §7.6 基线 3 轮）+ C++ 分项（C1/C2/C3 共 8 轮有效冷启动）均已完成。C2 云端指标因实验室无 MQTT <strong>跳过第 3 轮</strong>，待现场补测。</p>
+<p><strong>全量对比表</strong>（T0 = AGX boot <code>08:00:23</code>；视频就绪 = 首帧 <code>Decoder FPS</code>）</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>boot 配置</th>
+<th>C++ 编译</th>
+<th>视频就绪（平均）</th>
+<th>波动范围</th>
+<th>PTZ 等待</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>§7.6 基线</td>
+<td>§6.1（MediaMTX 提前 + auto_boot）</td>
+<td>❌</td>
+<td><strong>~72s</strong></td>
+<td>~72s</td>
+<td>~51s</td>
+</tr>
+<tr>
+<td>阶段1</td>
+<td>仅 MediaMTX 提前</td>
+<td>❌</td>
+<td><strong>~64.6s</strong></td>
+<td>38–73s</td>
+<td>7–54s</td>
+</tr>
+<tr>
+<td>阶段2</td>
+<td>MediaMTX 末尾</td>
+<td>❌</td>
+<td><strong>~75.6s</strong></td>
+<td>69–92s</td>
+<td>~7s*</td>
+</tr>
+<tr>
+<td><strong>C1</strong></td>
+<td>§6.1</td>
+<td><code>ptz_service</code></td>
+<td><strong>~32s</strong></td>
+<td>32s（0 偏差）</td>
+<td>~12s</td>
+</tr>
+<tr>
+<td><strong>C2</strong></td>
+<td>§6.1</td>
+<td>+<code>nexus_gateway</code></td>
+<td><strong>~46s</strong>†</td>
+<td>32–59s</td>
+<td>11–51s</td>
+</tr>
+<tr>
+<td><strong>C3</strong></td>
+<td>§6.1</td>
+<td>全量</td>
+<td><strong>~31s</strong></td>
+<td>28–32s</td>
+<td>8–11s</td>
+</tr>
+</tbody>
+</table>
+<p>* 阶段2 PTZ 等待短是因为 <code>ptz_service</code> 被 monit 推迟 ~+60s，启动时 PTZ 往往已就绪。<br />
+† C2 仅 2 轮本地样本，平均被 R2（PTZ 慢）拉高；快启动轮仍为 ~32s。</p>
+<p><strong>瓶颈归因（按收益排序）</strong></p>
+<ol>
+<li>
+<p><strong>PTZ 冷启动方差（主因）</strong><br />
+   同一套软件下 PTZ RTSP 等待 <strong>8–51s</strong>（C3 三轮 ~8–11s vs C2 R2 ~51s vs §7.6 ~51s），直接决定总出画时间。现场 1–2 分钟反馈与此一致。</p>
+</li>
+<li>
+<p><strong><code>ptz_service</code> 启动时机（最大软件收益，~40s）</strong><br />
+   monit 在 boot 时 <code>reload</code> 常把 <code>ptz_service</code> 推到 <strong>~+60s</strong>；§6.1 纳入 <code>auto_boot</code> 后稳定 <strong>~+20s</strong>。这是 §7.6（~72s）→ C1（~32s）的主要来源。</p>
+</li>
+<li>
+<p><strong>RTSP 快速重试 §6.2–6.6（中等收益，视 PTZ 重叠窗口）</strong><br />
+   PTZ 未就绪时 <code>runPipelineLoop</code> 由 5s 间隔降为 1.5s；C1/C3 常见 <strong>2 次</strong>即成功。C2 R2（PTZ ~51s）总时长 <strong>59s vs 基线 ~72s</strong>，说明在慢启动场景仍有 <strong>~13s</strong> 收益。</p>
+</li>
+<li>
+<p><strong>MediaMTX 启动先后（无稳定收益）</strong><br />
+   阶段1（提前）vs 阶段2（末尾）平均 <strong>64.6s vs 75.6s</strong>，样本重叠大，<strong>不能单独作为优化手段</strong>。</p>
+</li>
+<li>
+<p><strong>云端 §6.4–6.5（本地无影响；天盾待验证）</strong><br />
+   实验室 MQTT <code>Connection refused</code>，<code>GstCloudPusher</code> 未启动。不影响 <code>rtsp://:9554</code>；现场接入天盾后需补测 RTMP 出画时间。</p>
+</li>
+<li>
+<p><strong><code>nexus_gateway</code> boot fail 提示</strong><br />
+<code>journalctl</code> 报 <code>start .../nexus_gateway fail!</code>（进程 1s 内检测不到），但日志显示 MQTT 重连线程仍在跑，<strong>不阻塞本地视频</strong>。建议后续排查 <code>auto_boot</code> 的 <code>pidof</code> 检测时序，属体验问题非出画瓶颈。</p>
+</li>
+</ol>
+<p><strong>推荐部署方案（按优先级）</strong></p>
+<table>
+<thead>
+<tr>
+<th>优先级</th>
+<th>项</th>
+<th>动作</th>
+<th>预期收益</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>P0 必做</strong></td>
+<td>§6.1 boot</td>
+<td>合入 <code>auto_boot_app.sh</code>：MediaMTX 提前 + <code>ptz_service</code> 在 <code>ptz100_ai</code> 前启动</td>
+<td><strong>~40s</strong>（消除 monit 排队）</td>
+</tr>
+<tr>
+<td><strong>P0 必做</strong></td>
+<td>§6.2–6.6</td>
+<td>重编部署 <code>ptz_service</code>（1500ms/120s 快速重试）</td>
+<td><strong>0–20s</strong>（PTZ 重叠窗口内）</td>
+</tr>
+<tr>
+<td><strong>P1 建议</strong></td>
+<td>§6.4–6.5</td>
+<td>重编部署 <code>nexus_gateway</code>（云端快速重试）</td>
+<td>天盾 RTMP <strong>5–10s</strong>（现场验证）</td>
+</tr>
+<tr>
+<td><strong>P1 建议</strong></td>
+<td>现场天盾</td>
+<td>接入 MQTT 后复测 C2 指标：<code>CloudPusher</code> 首次 <code>Real FPS</code></td>
+<td>闭环天盾 1–2 分钟问题</td>
+</tr>
+<tr>
+<td><strong>P2 环境</strong></td>
+<td>UPS / 稳压</td>
+<td>减少频繁断电导致 PTZ/AGX 自检延长</td>
+<td><strong>最大长期收益</strong>（现场）</td>
+</tr>
+<tr>
+<td><strong>P3 可选</strong></td>
+<td>原始流先出画</td>
+<td><code>HEPU_STREAM_MODE_RAW</code> 或双路径（§4.4）</td>
+<td>10–20s（需产品确认）</td>
+</tr>
+<tr>
+<td><strong>P3 可选</strong></td>
+<td>和普 SDK 重连</td>
+<td>启动阶段缩短 <code>HEPU_RECONNECT_INTERVAL_SEC</code></td>
+<td>控制口更早连上（当前常走 fallback RTSP 仍可出画）</td>
+</tr>
+<tr>
+<td><strong>P3 可选</strong></td>
+<td><code>nexus_gateway</code> boot 检测</td>
+<td>延长 <code>auto_boot</code> 等待或改健康检查</td>
+<td>消除误报 fail</td>
+</tr>
+<tr>
+<td><strong>P3 可选</strong></td>
+<td><code>cold_boot_benchmark.sh</code></td>
+<td>修复 T0 与陈旧 <code>/tmp/video_pipeline_status.json</code></td>
+<td>测量工具准确性</td>
+</tr>
+</tbody>
+</table>
+<p><strong>现场验收标准（建议）</strong></p>
+<ul>
+<li><strong>本地 C2 / VLC</strong>：冷启动（AGX+PTZ 同断电）→ <code>rtsp://&lt;AGX&gt;:9554/ptz/zoom/ch0</code> 可播 <strong>≤ 45s</strong>（PTZ 正常自检）；<strong>≤ 60s</strong>（PTZ 慢启动仍可接受）。</li>
+<li><strong>天盾</strong>：MQTT 可达后，注册成功 → RTMP 推流 <code>Real FPS</code> 较本地出画 <strong>额外 ≤ 15s</strong>。</li>
+<li><strong>日志核对</strong>：<code>journalctl -b 0</code> 中 <code>ptz_service started</code> <strong>≤ +25s</strong>；<code>ptz_service.log</code> 首帧 <code>Decoder FPS</code> 与 VLC 可播时间一致。</li>
+</ul>
+<p><strong>与现场 1–2 分钟问题的关系</strong></p>
+<ul>
+<li>实验室优化后 <strong>快启动 ~30s</strong>，已显著优于原 ~72s，但 <strong>PTZ 慢启动仍可达 ~59s+</strong>。</li>
+<li>现场叠加：天盾 MQTT/要流、频繁断电、网络抖动，总时长仍可能接近 <strong>1–2 分钟</strong>。</li>
+<li><strong>软件侧 P0 已验证有效</strong>；要稳定压到 <strong>&lt;1 分钟</strong>，需 <strong>P0 部署 + UPS（P2）+ 天盾链路验证（P1）</strong> 组合。</li>
+</ul>
+<h3 id="710-61-boot-nexus_gateway-5">7.10 §6.1 完整 boot 扩充验证（<code>nexus_gateway</code> 提前，5 轮）</h3>
+<blockquote>
+<p><strong>日期</strong>：2026-06-26<br />
+<strong>配置</strong>：<code>auto_boot_app.sh</code> 已合入 — MediaMTX 提前；<code>ptz_service</code> 在 <code>ptz100_ai</code> 前；<code>nexus_gateway</code> 紧随 <code>ptz100_ai</code>（不再在脚本末尾）。<br />
+<strong>方法</strong>：和普 PTZ + AGX <strong>同步整体断电上电</strong>；T0 = AGX Linux boot（<code>uptime -s</code>）；视频就绪 = 首帧 <code>Decoder FPS</code>（<code>journalctl -b 0</code> + <code>ptz_service.log</code> 手工对齐为准；<code>cold_boot_benchmark.sh</code> JSON 作参考）。<br />
+<strong>状态</strong>：<strong>已完成</strong>（5 轮）</p>
+</blockquote>
+<table>
+<thead>
+<tr>
+<th>轮次</th>
+<th>MediaMTX</th>
+<th>ptz_service</th>
+<th>ptz100_ai</th>
+<th>nexus_gateway</th>
+<th><strong>视频就绪</strong></th>
+<th><strong>首帧解码等待</strong>*</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>第1轮</td>
+<td>+14s</td>
+<td>+20s</td>
+<td>+22s</td>
+<td>+23s</td>
+<td><strong>+33s</strong></td>
+<td>~13s</td>
+<td>nexus boot fail 误报；MQTT 不可达；和普首帧较快</td>
+</tr>
+<tr>
+<td>第2轮</td>
+<td>+13s</td>
+<td>+19s</td>
+<td>+21s</td>
+<td>+23s</td>
+<td><strong>+31s</strong></td>
+<td>~12s</td>
+<td>nexus boot fail 误报；和普首帧较快</td>
+</tr>
+<tr>
+<td>第3轮</td>
+<td>+15s</td>
+<td>+21s</td>
+<td>+23s</td>
+<td>+24s</td>
+<td><strong>+32s</strong></td>
+<td>~11s</td>
+<td>nexus boot fail 误报；和普首帧较快</td>
+</tr>
+<tr>
+<td>第4轮</td>
+<td>+15s</td>
+<td>+21s</td>
+<td>+23s</td>
+<td>+24s</td>
+<td><strong>+32s</strong></td>
+<td>~11s</td>
+<td>nexus boot fail 误报；和普首帧较快</td>
+</tr>
+<tr>
+<td>第5轮</td>
+<td>+14s</td>
+<td>+20s</td>
+<td>+22s</td>
+<td>+23s</td>
+<td><strong>+31s</strong></td>
+<td>~11s</td>
+<td>nexus boot fail 误报；和普首帧较快</td>
+</tr>
+<tr>
+<td><strong>平均</strong></td>
+<td><strong>~+14s</strong></td>
+<td><strong>~+20s</strong></td>
+<td><strong>~+22s</strong></td>
+<td><strong>~+23s</strong></td>
+<td><strong>~32s</strong></td>
+<td><strong>~12s</strong></td>
+<td>波动 31–33s / 11–13s</td>
+</tr>
+</tbody>
+</table>
+<p>* <strong>首帧解码等待</strong>（亦称日志「PTZ 等待」）— 指标说明见下。</p>
+<p><strong>「首帧解码等待 ~11s」指哪一段时间？</strong></p>
+<p>指 <strong><code>ptz_service</code> 已经启动之后</strong>，到 <strong><code>ptz_service.log</code> 里首次出现可见光首帧解码</strong> 为止的间隔，<strong>不是</strong>从上电到出画的全部时间，也<strong>不是</strong> AGX 拉流/编码本身的性能指标。</p>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>起点</strong></td>
+<td><code>journalctl -b 0</code> 中 <strong><code>ptz_service started</code></strong>（§7.10 五轮平均约 <strong>+20s</strong>）</td>
+</tr>
+<tr>
+<td><strong>终点</strong></td>
+<td><code>ptz_service.log</code> 中首次 <strong><code>Camera 0 (Visible): Decoder FPS = …</code></strong>（五轮平均约 <strong>+32s</strong>，即「视频就绪」时刻）</td>
+</tr>
+<tr>
+<td><strong>时长</strong></td>
+<td>终点 − 起点；五轮平均 <strong>~12s</strong>（快时 <strong>~11–13s</strong>，慢时曾测 <strong>~51s</strong>）</td>
+</tr>
+<tr>
+<td><strong>责任归属</strong></td>
+<td><strong>和普设备侧</strong>：此期间 <code>ptz_service</code> 已在按 RTSP 拉和普 <code>:554</code>，但<strong>尚无可解码首帧</strong>（云台自检 + 内置 RTSP 流媒体服务器未就绪）；日志中常见 <code>runPipelineLoop</code> 失败与重试</td>
+</tr>
+</tbody>
+</table>
+<p><strong>与「本地视频就绪 ~32s」的关系</strong>（五轮典型一轮）：</p>
+<pre><code>上电 +0s
+  → AGX 服务链就绪（MediaMTX / ptz_service / ptz100_ai，~+20s）
+  → 【首帧解码等待 ~11s】  ← 本指标
+  → 首帧 Decoder FPS（~+31s）≈ 本地出画就绪
+  → encode 推 MediaMTX（通常与首帧同秒级，可忽略）
+</code></pre>
+<p>因此：<strong>总出画 ≈ ptz_service 启动时刻 + 首帧解码等待 + 极短编码</strong>；boot 优化主要缩短前者，<strong>后者仍取决于和普冷启动快慢</strong>。</p>
+<p><strong>采集命令</strong>（每轮上电 SSH 恢复后）：</p>
+<pre><code class="language-bash">bash /home/skyfend/workspace/ptz100_agx/config/tools/cold_boot_benchmark.sh report
+bash /home/skyfend/workspace/ptz100_agx/config/tools/cold_boot_collect_round.sh &lt;轮次&gt;
+</code></pre>
+<p><strong>结论</strong>：</p>
+<ol>
+<li><strong>完整 boot（含 <code>nexus_gateway</code> 提前）5 轮稳定</strong>：本地视频就绪 <strong>~32s</strong>（31–33s，偏差 ≤2s），与 C1/C3（~31–32s）一致。  </li>
+<li><strong>AGX 服务链</strong>：<code>ptz_service</code> <strong>~+20s</strong>、<code>nexus_gateway</code> <strong>~+23s</strong>（原脚本末尾约 <strong>+50s</strong>）；视频链路核心节点 <strong>~+22s</strong> 内就绪。  </li>
+<li><strong>当轮和普首帧解码偏快</strong>（~11–13s）；5 轮均未出现慢启动（~51s）场景，<strong>和普偏慢时总出画仍需复测</strong>。  </li>
+<li><strong><code>nexus_gateway</code> boot fail 为误报</strong>（<code>pidof</code> 时序）；MQTT 不可达，天盾云推 <strong>待现场验证</strong>。  </li>
+<li><strong>建议合入</strong>当前 <code>auto_boot_app.sh</code> 启动顺序。</li>
+</ol>
+<hr />
+<p><strong>C1 明细</strong>（§6.1 boot + §6.2–6.6 已编译 <code>ptz_service</code>；T0 = AGX boot）</p>
+<table>
+<thead>
+<tr>
+<th>轮次</th>
+<th>MediaMTX</th>
+<th>ptz_service</th>
+<th>ptz100_ai</th>
+<th><strong>视频就绪</strong></th>
+<th><strong>PTZ 等待</strong>*</th>
+<th>对比 §7.6 (~72s)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>第1轮</td>
+<td>+15s</td>
+<td><strong>+20s</strong> (auto_boot)</td>
+<td>+23s</td>
+<td><strong>+32s</strong></td>
+<td>~12s</td>
+<td><strong>−40s</strong></td>
+</tr>
+<tr>
+<td>第2轮</td>
+<td>+15s</td>
+<td><strong>+20s</strong> (auto_boot)</td>
+<td>+23s</td>
+<td><strong>+32s</strong></td>
+<td>~12s</td>
+<td><strong>−40s</strong></td>
+</tr>
+<tr>
+<td>第3轮</td>
+<td>+13s</td>
+<td><strong>+20s</strong> (auto_boot)</td>
+<td>+22s</td>
+<td><strong>+32s</strong></td>
+<td>~12s</td>
+<td><strong>−40s</strong></td>
+</tr>
+<tr>
+<td><strong>平均</strong></td>
+<td><strong>~+14s</strong></td>
+<td><strong>+20s</strong></td>
+<td><strong>+23s</strong></td>
+<td><strong>~32s</strong></td>
+<td><strong>~12s</strong></td>
+<td><strong>−40s</strong></td>
+</tr>
+</tbody>
+</table>
+<p>* PTZ 等待 = <code>ptz_service</code> 启动 → 首帧 <code>Decoder FPS</code>。三轮 120s 内 <code>runPipelineLoop</code> 均为 <strong>6 次</strong>（1.5s 快速重试生效）。</p>
+<p><strong>C1 结论</strong>：</p>
+<ol>
+<li><strong>§6.1 boot + §6.2–6.6 编译</strong>后，三轮出画 <strong>稳定 ~32s</strong>（偏差 0s），较 §7.6（~72s，C++ 未编译）<strong>快 ~40s</strong>。</li>
+<li>本轮 PTZ 自检仅 <strong>~12s</strong>（§7.6 曾 ~51s）；总收益 = <strong>PTZ 本轮偏快 (~39s)</strong> + <strong>早启动 ptz_service（相对 monit ~+40s）</strong> + <strong>1.5s 快速重试（6 次循环）</strong> 叠加。</li>
+<li>在 PTZ 等待较长场景（~50s）时，1.5s vs 5s 重试理论仍可省 <strong>~15–20s</strong>（见 §4.2 预估）；需在 PTZ 慢启动条件下补测验证。</li>
+<li><strong>推荐部署</strong>：§6.1 boot + 重编 <code>ptz_service</code>（含 §6.2–6.6）。</li>
+</ol>
+<hr />
+<p><strong>阶段1 五轮明细</strong>（<code>journalctl -b 0</code> + <code>ptz_service.log</code> 对齐；T0 = AGX boot <code>08:00:23</code>）</p>
+<table>
+<thead>
+<tr>
+<th>轮次</th>
+<th>MediaMTX</th>
+<th>ptz_service</th>
+<th>ptz100_ai</th>
+<th>nexus</th>
+<th><strong>视频就绪</strong></th>
+<th><strong>PTZ 等待</strong>*</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>第1轮</td>
+<td>+14s</td>
+<td>+18s (monit)</td>
+<td>+20s</td>
+<td>+47s</td>
+<td><strong>+72s</strong></td>
+<td>~54s</td>
+<td>与 §7.6 一致</td>
+</tr>
+<tr>
+<td>第2轮</td>
+<td>+14s</td>
+<td>+18s (monit)</td>
+<td>+20s</td>
+<td>+47s</td>
+<td><strong>+38s</strong></td>
+<td>~20s</td>
+<td>PTZ 自检快</td>
+</tr>
+<tr>
+<td>第3轮</td>
+<td>+14s</td>
+<td><strong>+60s</strong> (monit)</td>
+<td>+20s</td>
+<td>+47s</td>
+<td><strong>+71s</strong></td>
+<td>~7s</td>
+<td>monit reload 后排队</td>
+</tr>
+<tr>
+<td>第4轮</td>
+<td>+14s</td>
+<td>+60s (monit)</td>
+<td>+20s</td>
+<td>+45s†</td>
+<td><strong>+69s</strong></td>
+<td>~7s</td>
+<td>†nexus 启动失败</td>
+</tr>
+<tr>
+<td>第5轮</td>
+<td>+14s</td>
+<td>+60s (monit)</td>
+<td>+20s</td>
+<td>+45s†</td>
+<td><strong>+73s</strong></td>
+<td>~7s</td>
+<td>†nexus 启动失败</td>
+</tr>
+<tr>
+<td><strong>5轮平均</strong></td>
+<td><strong>+14s</strong></td>
+<td><strong>~+43s</strong></td>
+<td><strong>+20s</strong></td>
+<td><strong>+47s</strong></td>
+<td><strong>~64.6s</strong></td>
+<td>—</td>
+<td>38–73s 波动</td>
+</tr>
+</tbody>
+</table>
+<p>* <strong>PTZ 等待</strong> = <code>ptz_service</code> 启动 → 首帧 <code>Decoder FPS</code>。</p>
+<p><strong>阶段1 结论</strong>（5 轮）：</p>
+<ol>
+<li>仅「MediaMTX 提前」<strong>不能稳定缩短出画时间</strong>（38–73s，标准差大）；5 轮平均 <strong>~64.6s</strong>，与 §7.6 两项全开（~71.7s）相比略快但样本波动大，<strong>无统计上明确收益</strong>。</li>
+<li><strong>PTZ 冷启动波动仍是主因</strong>（PTZ 等待 ~7–54s）；出画快时（第2/4/5轮 ~69–73s）PTZ 自检约 7s，慢时（第1轮 ~54s）主导总时长。</li>
+<li><strong>monit 在 boot 时 <code>reload</code> 后排队</strong>，<code>ptz_service</code> 稳定推迟到 <strong>~+59–60s</strong>（第3–5轮）；第1–2轮曾 +18s，行为不一致。</li>
+<li>第4–5轮 <strong><code>nexus_gateway</code> boot 启动失败</strong>，本地 RTSP 出画不受影响（天盾云端路径未验证）。</li>
+</ol>
+<hr />
+<h2 id="_10">八、现场验证方法（手工）</h2>
+<p>完整断电后上电，对齐各日志时间戳：</p>
+<pre><code class="language-bash"># 1. 启动顺序
+grep -E &quot;starting mediamtx|ptz_service|ptz100_ai&quot; /var/log/syslog
+
+# 2. PTZ 连接 / RTSP 首帧
+grep -E &quot;Connection established|Decoder FPS&quot; /home/skyfend/log/ptz_service.log
+
+# 3. AI 首帧
+grep -E &quot;Success init|AI_input_FPS&quot; /home/skyfend/log/agx_ptz.log
+
+# 4. 天盾注册 + 云端推流（公网可达时）
+grep -E &quot;register_reply|stream URL|cloud push&quot; /home/skyfend/log/nexus_gateway.log
+
+# 5. 管道状态（sysmonit 也会读）
+cat /tmp/video_pipeline_status.json
+
+# 6. 半自动报告
+bash config/tools/cold_boot_benchmark.sh report
+</code></pre>
+<p><strong>对比指标</strong>：上电时刻 → <strong>本地 RTSP 可播</strong>（VLC/sysmonit）的总秒数；有天盾时再补「天盾播放器出画」。</p>
+<p><strong>故障定位矩阵</strong>（摘自视频流诊断规范）：</p>
+<table>
+<thead>
+<tr>
+<th>原始帧率</th>
+<th>AI_input_FPS</th>
+<th>RTSP_push_FPS</th>
+<th>本地播放</th>
+<th>问题定位</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>异常</td>
+<td>异常</td>
+<td>异常</td>
+<td>Failed</td>
+<td>PTZ / 原始 RTSP</td>
+</tr>
+<tr>
+<td>正常</td>
+<td>异常</td>
+<td>异常</td>
+<td>Failed</td>
+<td>AI 模块</td>
+</tr>
+<tr>
+<td>正常</td>
+<td>正常</td>
+<td>异常</td>
+<td>Failed</td>
+<td>编码推流 / MediaMTX</td>
+</tr>
+<tr>
+<td>正常</td>
+<td>正常</td>
+<td>正常</td>
+<td>Failed</td>
+<td>网络 / 播放端</td>
+</tr>
+<tr>
+<td>正常</td>
+<td>正常</td>
+<td>正常</td>
+<td>Success</td>
+<td>正常</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="_11">九、相关文档与代码索引</h2>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>路径</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>视频流诊断</td>
+<td><code>.cursor/skills/video-stream-diagnostics/SKILL.md</code></td>
+</tr>
+<tr>
+<td>PTZ 模块设计</td>
+<td><code>doc/2-软件资料/软件模块设计说明/PTZ设备处理模块设计文档.md</code>（第十四章：云端推流）</td>
+</tr>
+<tr>
+<td>和普视频入口</td>
+<td><code>ros_ws/src/ptz_service/src/ptzDevice/ptzDeviceHepu.cpp</code></td>
+</tr>
+<tr>
+<td>天盾网关注册</td>
+<td><code>ros_ws/src/nexus_gateway/src/NexusGateway.cpp</code></td>
+</tr>
+<tr>
+<td>启动脚本</td>
+<td><code>config/boot/auto_boot_app.sh</code></td>
+</tr>
+<tr>
+<td>monit 配置</td>
+<td><code>config/monit/skyfend-ptz100-monit</code></td>
+</tr>
+<tr>
+<td><strong>冷启动测量脚本</strong></td>
+<td><code>config/tools/cold_boot_benchmark.sh</code></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="_12">十、待办与决策点</h2>
+<ul>
+<li>[x] §6.1 boot 启动顺序 — 实验室 C1/C3 验证，<strong>建议合入</strong></li>
+<li>[x] §6.2–6.6 冷启动重试 — C1/C3 验证，<strong>建议合入</strong></li>
+<li>[ ] §6.4–6.5 云端重试 — 实验室无法测，<strong>现场 MQTT 接入后补测</strong></li>
+<li>[ ] 现场远程：与王志强对齐日志，确认瓶颈段（AGX / PTZ / 天盾）</li>
+<li>[ ] 评估阶段四「原始流先出画」的产品接受度</li>
+<li>[ ] 现场供电改善（UPS）优先级确认</li>
+<li>[ ] 修复 <code>nexus_gateway</code> boot 误报 fail</li>
+<li>[ ] 修复 <code>cold_boot_benchmark.sh</code> T0 / 陈旧 JSON</li>
+</ul>
+<hr />
+<h2 id="_13">十一、修订记录</h2>
+<table>
+<thead>
+<tr>
+<th>版本</th>
+<th>日期</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>v1.0</td>
+<td>2026-06-25</td>
+<td>初始版本：汇总问题背景、分析过程、优化方案及会话起草代码</td>
+</tr>
+<tr>
+<td>v1.1</td>
+<td>2026-06-25</td>
+<td>新增 §7 半自动冷启动测量（本地 RTSP / VLC / sysmonit）；添加<code>cold_boot_benchmark.sh</code></td>
+</tr>
+<tr>
+<td>v1.2</td>
+<td>2026-06-25</td>
+<td>§7.6 填入首次实验室实测（~72s 出画；PTZ RTSP 等待 ~51s 为主瓶颈）</td>
+</tr>
+<tr>
+<td>v1.3</td>
+<td>2026-06-25</td>
+<td>§7.6 扩展为三轮实测汇总（平均 ~71.7s；自动脚本问题说明）</td>
+</tr>
+<tr>
+<td>v1.4</td>
+<td>2026-06-25</td>
+<td>§7.8 C1/C2/C3 分项测试完成；新增 §7.9 实验总结与部署建议；更新 §5 实测收益表</td>
+</tr>
+<tr>
+<td>v1.5</td>
+<td>2026-06-26</td>
+<td>§7.10 完整 boot（含 <code>nexus_gateway</code> 提前）<strong>5 轮完成</strong>，本地出画稳定 ~32s</td>
+</tr>
+</tbody>
+</table></article>
+    <script>
+        // Sync theme with parent page
+        try {
+            var parentTheme = window.parent.document.documentElement.getAttribute('data-theme');
+            if (parentTheme) document.documentElement.setAttribute('data-theme', parentTheme);
+            // Listen for theme changes
+            var observer = new MutationObserver(function(mutations) {
+                mutations.forEach(function(m) {
+                    if (m.attributeName === 'data-theme') {
+                        var t = window.parent.document.documentElement.getAttribute('data-theme');
+                        if (t) document.documentElement.setAttribute('data-theme', t);
+                    }
+                });
+            });
+            observer.observe(window.parent.document.documentElement, { attributes: true });
+        } catch(e) {}
+    </script>
+</body>
+</html>

@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>一、安装编译环境</title>
+    <link rel="stylesheet" href="../../css/markdown.css">
+</head>
+<body>
+    <article class="markdown-body"><h1 id="_1">一、安装编译环境</h1>
+<h1 id="1">1. 更新包列表</h1>
+<p>sudo apt update</p>
+<h1 id="2-protobuf-apt">2. 安装 protobuf 编译器（从 apt 仓库）</h1>
+<p>sudo apt install protobuf-compiler</p>
+<h1 id="3-nanopb">3. 安装 nanopb 及其依赖</h1>
+<p>sudo apt install python3-pip python3-protobuf<br />
+pip3 install nanopb</p>
+<h1 id="4-i">4. 验证安装i</h1>
+<h1 id="shell">清除 shell 的命令路径缓存</h1>
+<p>hash -r</p>
+<p>which protoc</p>
+<h1 id="usrbinprotoc">应该输出: /usr/bin/protoc</h1>
+<p>protoc --version</p>
+<h1 id="3203-ubuntu">应该输出版本号（可能比 3.20.3 更新或更旧，取决于 Ubuntu 版本）</h1>
+<p>which nanopb_generator</p>
+<h1 id="usrbinnanopb_generator">应该输出: /usr/bin/nanopb_generator</h1>
+<h1 id="5-tracermatrixtracermatrixprototracermatrixoptions">5. 编译生成文件示例（TracerMatrix目录下有：TracerMatrix.proto、TracerMatrix.options）</h1>
+<p>cd TracerMatrix<br />
+nanopb_generator TracerMatrix.proto</p></article>
+    <script>
+        // Sync theme with parent page
+        try {
+            var parentTheme = window.parent.document.documentElement.getAttribute('data-theme');
+            if (parentTheme) document.documentElement.setAttribute('data-theme', parentTheme);
+            // Listen for theme changes
+            var observer = new MutationObserver(function(mutations) {
+                mutations.forEach(function(m) {
+                    if (m.attributeName === 'data-theme') {
+                        var t = window.parent.document.documentElement.getAttribute('data-theme');
+                        if (t) document.documentElement.setAttribute('data-theme', t);
+                    }
+                });
+            });
+            observer.observe(window.parent.document.documentElement, { attributes: true });
+        } catch(e) {}
+    </script>
+</body>
+</html>

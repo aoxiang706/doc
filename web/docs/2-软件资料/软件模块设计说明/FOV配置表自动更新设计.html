@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FOV 配置表自动更新机制</title>
+    <link rel="stylesheet" href="../../css/markdown.css">
+</head>
+<body>
+    <article class="markdown-body"><h1 id="fov">FOV 配置表自动更新机制</h1>
+<h2 id="_1">一、需求说明</h2>
+<ol>
+<li>软件部署完成后，用户可手动修改运行配置文件参数，正常重启不丢失自定义配置。</li>
+<li>软件升级后，支持配置全量更新，兼容配置 Key 增删、Value 修改、结构迭代等所有变更场景。</li>
+</ol>
+<h2 id="_2">二、基础配置规则</h2>
+<h3 id="1">1、双文件机制</h3>
+<ul>
+<li><strong>出厂配置文件</strong>（升级同步更新）：<code>ptz100_agx/config/ptz/ptzHepuViewCfg.yaml</code></li>
+<li><strong>运行配置文件</strong>（可手动修改、业务生效）：<code>/home/skyfend/config/ptzHepuViewCfg.yaml</code></li>
+</ul>
+<h3 id="2">2、版本管控</h3>
+<p>所有配置文件顶层唯一管控字段 <strong>version</strong>，版本递增代表配置结构/内容发生变更，示例 "<strong>version:</strong> 1.0.0"</p>
+<h3 id="3">3、更新触发条件</h3>
+<p>运行配置文件不存在 <strong>或</strong> 运行配置文件 <code>version</code> != 出厂配置文件 <code>version</code>，触发全量覆盖更新。</p>
+<h3 id="4">4、用户配置保留规则</h3>
+<p>运行配置文件存在且版本号一致时，用户手动修改的配置永久保留，重启不重置。</p>
+<h2 id="_3">三、更新方案</h2>
+<h3 id="ptz_service">方案：ptz_service 服务启动校验（采用）</h3>
+<p><strong>执行时机</strong>：ptz_service 初始化启动阶段</p>
+<p><strong>执行流程</strong>：</p>
+<ol>
+<li>服务启动后检测运行配置文件是否存在；</li>
+<li>文件不存在：自动拷贝出厂配置文件生成运行配置文件；</li>
+<li>文件已存在：读取并对比出厂配置文件与运行配置文件的 version 版本号；</li>
+<li>版本一致：正常加载配置，服务持续运行；</li>
+<li>版本不一致：覆盖更新运行配置文件，随后加载最新配置继续运行。</li>
+</ol>
+<p><strong>时序流程</strong>：</p>
+<pre><code class="language-mermaid">flowchart TD
+    A[ptz_service 启动初始化] --&gt; B{运行配置文件是否存在?}
+    B --&gt;|不存在| C[拷贝出厂配置文件生成运行配置文件]
+    B --&gt;|存在| D[读取对比 version 版本号]
+    D --&gt; E{版本一致?}
+    E --&gt;|是| F[正常加载配置、业务运行]
+    E --&gt;|否| G[覆盖更新运行配置文件]
+    C --&gt; F
+    G --&gt; F
+</code></pre></article>
+    <script>
+        // Sync theme with parent page
+        try {
+            var parentTheme = window.parent.document.documentElement.getAttribute('data-theme');
+            if (parentTheme) document.documentElement.setAttribute('data-theme', parentTheme);
+            // Listen for theme changes
+            var observer = new MutationObserver(function(mutations) {
+                mutations.forEach(function(m) {
+                    if (m.attributeName === 'data-theme') {
+                        var t = window.parent.document.documentElement.getAttribute('data-theme');
+                        if (t) document.documentElement.setAttribute('data-theme', t);
+                    }
+                });
+            });
+            observer.observe(window.parent.document.documentElement, { attributes: true });
+        } catch(e) {}
+    </script>
+</body>
+</html>
