@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>翱翔 | 嵌入式开发</title>
+    <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<!-- ======================== Navigation ======================== -->
+<nav class="nav" id="nav">
+    <div class="nav-inner">
+        <a href="#hero" class="nav-logo">翱<span>翔</span></a>
+        <ul class="nav-links" id="navLinks">
+            <li><a href="#about">关于</a></li>
+            <li><a href="#skills">技术栈</a></li>
+            <li><a href="#projects">项目</a></li>
+            <li><a href="#documents">文档</a></li>
+            <li><a href="#experience">经验</a></li>
+        </ul>
+        <div class="nav-actions">
+            <button class="theme-toggle" id="themeToggle" title="切换主题" aria-label="切换深色/浅色主题">
+                <span class="theme-icon-light">☀️</span>
+                <span class="theme-icon-dark" style="display:none">🌙</span>
+            </button>
+            <button class="nav-hamburger" id="navHamburger" aria-label="菜单">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="3" y1="6" x2="21" y2="6"></line>
+                    <line x1="3" y1="12" x2="21" y2="12"></line>
+                    <line x1="3" y1="18" x2="21" y2="18"></line>
+                </svg>
+            </button>
+        </div>
+    </div>
+</nav>
+
+<!-- ======================== Hero ======================== -->
+<section class="hero" id="hero">
+    <div class="hero-content">
+        <p class="hero-greeting">你好，我是</p>
+        <h1 class="hero-name">翱翔</h1>
+        <p class="hero-title">
+            <span class="accent">嵌入式开发</span> 工程师
+        </p>
+        <div class="hero-tags">
+            <span class="hero-tag">Edge Computing</span>
+            <span class="hero-tag">AI Inference</span>
+            <span class="hero-tag">ROS2</span>
+            <span class="hero-tag">Computer Vision</span>
+            <span class="hero-tag">Multi-Device Integration</span>
+            <span class="hero-tag">Real-Time Systems</span>
+        </div>
+    </div>
+    <div class="hero-scroll-hint">
+        ↓ 向下滚动
+    </div>
+</section>
+
+<!-- ======================== About ======================== -->
+<section class="section" id="about">
+    <div class="section-inner fade-in">
+        <div class="section-header">
+            <p class="section-label">About</p>
+            <h2 class="section-title">关于我</h2>
+        </div>
+        <div class="about-text">
+            <p>
+                专注于<span class="about-highlight">嵌入式AI系统</span>与<span class="about-highlight">边缘计算</span>领域的开发工程师。
+                在 NVIDIA Jetson AGX 平台上深耕智能视觉系统，主导完成了从底层设备驱动到上层AI应用的全栈开发工作。
+            </p>
+            <p>
+                核心工作围绕<span class="about-highlight">反无人机智能系统 PTZ100 AGX</span>展开——一套集雷达感知、
+                视觉追踪、激光引导于一体的多传感器融合平台。系统采用 ROS2 Humble + C/C++17 混合架构，
+                集成 CUDA/TensorRT 推理引擎与 GStreamer 视频管线，实现了毫秒级目标检测与云台精准跟踪。
+            </p>
+            <p>
+                擅长处理复杂的技术难题：从 TCP CLOSE_WAIT 状态断流排查、PTZ跟踪抖动根因分析，
+                到冷启动视频延迟优化，均通过系统性方法定位根因并给出有效解决方案。
+            </p>
+        </div>
+    </div>
+</section>
+
+<!-- ======================== Skills ======================== -->
+<section class="section" id="skills">
+    <div class="section-inner fade-in">
+        <div class="section-header">
+            <p class="section-label">Skills</p>
+            <h2 class="section-title">技术栈</h2>
+            <p class="section-desc">多年嵌入式与AI开发积累的核心技术能力</p>
+        </div>
+        <div class="skills-grid">
+            <!-- 编程语言 -->
+            <div class="skill-category">
+                <div class="skill-category-header">
+                    <div class="skill-category-icon">{ }</div>
+                    <h3 class="skill-category-title">编程语言</h3>
+                </div>
+                <div class="skill-items">
+                    <span class="skill-badge">C <span class="level expert">精通</span></span>
+                    <span class="skill-badge">C++17 <span class="level expert">精通</span></span>
+                    <span class="skill-badge">Python <span class="level proficient">熟练</span></span>
+                    <span class="skill-badge">Bash <span class="level proficient">熟练</span></span>
+                    <span class="skill-badge">CMake <span class="level proficient">熟练</span></span>
+                </div>
+            </div>
+            <!-- AI / 视觉 -->
+            <div class="skill-category">
+                <div class="skill-category-header">
+                    <div class="skill-category-icon">🧠</div>
+                    <h3 class="skill-category-title">AI / 视觉</h3>
+                </div>
+                <div class="skill-items">
+                    <span class="skill-badge">CUDA <span class="level proficient">熟练</span></span>
+                    <span class="skill-badge">TensorRT <span class="level proficient">熟练</span></span>
+                    <span class="skill-badge">OpenCV <span class="level proficient">熟练</span></span>
+                    <span class="skill-badge">GStreamer <span class="level proficient">熟练</span></span>
+                    <span class="skill-badge">DeepStream <span class="level familiar">了解</span></span>
+                    <span class="skill-badge">FFmpeg <span class="level familiar">了解</span></span>
+                </div>
+            </div>
+            <!-- 框架 / 中间件 -->
+            <div class="skill-category">
+                <div class="skill-category-header">
+                    <div class="skill-category-icon">⚙️</div>
+                    <h3 class="skill-category-title">框架 / 中间件</h3>
+                </div>
+                <div class="skill-items">
+                    <span class="skill-badge">ROS2 Humble <span class="level proficient">熟练</span></span>
+                    <span class="skill-badge">Protobuf <span class="level proficient">熟练</span></span>
+                    <span class="skill-badge">MQTT <span class="level proficient">熟练</span></span>
+                    <span class="skill-badge">SQLite3 <span class="level proficient">熟练</span></span>
+                    <span class="skill-badge">zlog <span class="level familiar">了解</span></span>
+                    <span class="skill-badge">cJSON <span class="level familiar">了解</span></span>
+                </div>
+            </div>
+            <!-- 通信协议 -->
+            <div class="skill-category">
+                <div class="skill-category-header">
+                    <div class="skill-category-icon">📡</div>
+                    <h3 class="skill-category-title">通信协议</h3>
+                </div>
+                <div class="skill-items">
+                    <span class="skill-badge">TCP/UDP <span class="level expert">精通</span></span>
+                    <span class="skill-badge">Alink 自研 <span class="level expert">精通</span></span>
+                    <span class="skill-badge">Modbus <span class="level proficient">熟练</span></span>
+                    <span class="skill-badge">RTSP/RTMP <span class="level proficient">熟练</span></span>
+                    <span class="skill-badge">UART <span class="level proficient">熟练</span></span>
+                    <span class="skill-badge">Protobuf <span class="level proficient">熟练</span></span>
+                </div>
+            </div>
+            <!-- 平台 / 工具 -->
+            <div class="skill-category">
+                <div class="skill-category-header">
+                    <div class="skill-category-icon">🖥️</div>
+                    <h3 class="skill-category-title">平台 / 工具</h3>
+                </div>
+                <div class="skill-items">
+                    <span class="skill-badge">Jetson AGX <span class="level proficient">熟练</span></span>
+                    <span class="skill-badge">CMake <span class="level proficient">熟练</span></span>
+                    <span class="skill-badge">Git/GitLab <span class="level proficient">熟练</span></span>
+                    <span class="skill-badge">Docker <span class="level familiar">了解</span></span>
+                    <span class="skill-badge">CI/CD <span class="level familiar">了解</span></span>
+                    <span class="skill-badge">monit <span class="level familiar">了解</span></span>
+                </div>
+            </div>
+            <!-- 硬件接口 -->
+            <div class="skill-category">
+                <div class="skill-category-header">
+                    <div class="skill-category-icon">🔌</div>
+                    <h3 class="skill-category-title">硬件接口</h3>
+                </div>
+                <div class="skill-items">
+                    <span class="skill-badge">串口 UART <span class="level proficient">熟练</span></span>
+                    <span class="skill-badge">以太网 <span class="level proficient">熟练</span></span>
+                    <span class="skill-badge">RS485 <span class="level proficient">熟练</span></span>
+                    <span class="skill-badge">GNSS <span class="level familiar">了解</span></span>
+                    <span class="skill-badge">MEMS IMU <span class="level familiar">了解</span></span>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- ======================== Projects ======================== -->
+<section class="section" id="projects">
+    <div class="section-inner fade-in">
+        <div class="section-header">
+            <p class="section-label">Projects</p>
+            <h2 class="section-title">核心项目</h2>
+            <p class="section-desc">从架构设计到问题排查，深度参与的工程项目</p>
+        </div>
+        <div class="projects-grid">
+            <!-- Project 1: PTZ100 AGX -->
+            <div class="project-card">
+                <span class="project-card-number">01</span>
+                <div class="project-header">
+                    <h3 class="project-title">PTZ100 AGX 智能反无人机系统</h3>
+                    <p class="project-subtitle">多传感器融合 · AI目标追踪 · 统一指挥控制</p>
+                </div>
+                <p class="project-desc">
+                    基于 NVIDIA Jetson AGX 平台的智能反无人机系统，集成雷达感知、视觉追踪、
+                    激光测距与干扰设备控制。系统采用 ROS2 Humble + C/C++17 混合架构，
+                    通过自研 Alink 协议实现多设备统一管理与数据路由，支持 C2 指控平台远程操控。
+                </p>
+                <div class="project-features">
+                    <p class="project-features-title">核心能力</p>
+                    <ul>
+                        <li>多传感器融合：雷达 + 视觉协同感知，雷视标定与数据关联</li>
+                        <li>AI目标检测与追踪：CUDA/TensorRT 实时推理，PTZ云台精准引导</li>
+                        <li>统一通信链路：Alink自研协议，多设备数据路由与协议转换</li>
+                        <li>实时视频流：GStreamer 管线 + 共享内存零拷贝传输</li>
+                        <li>云端互联：MQTT设备组网，C2平台远程监控与指挥</li>
+                        <li>系统可靠性：monit进程守护，健康监测与自动恢复</li>
+                    </ul>
+                </div>
+                <div class="project-tech">
+                    <span class="project-tech-tag">C/C++17</span>
+                    <span class="project-tech-tag">ROS2 Humble</span>
+                    <span class="project-tech-tag">CUDA</span>
+                    <span class="project-tech-tag">TensorRT</span>
+                    <span class="project-tech-tag">GStreamer</span>
+                    <span class="project-tech-tag">OpenCV</span>
+                    <span class="project-tech-tag">SQLite3</span>
+                    <span class="project-tech-tag">CMake</span>
+                </div>
+            </div>
+
+            <!-- Project 2: NexusGateway -->
+            <div class="project-card">
+                <span class="project-card-number">02</span>
+                <div class="project-header">
+                    <h3 class="project-title">NexusGateway 云端直连模块</h3>
+                    <p class="project-subtitle">MQTT IoT · 四层架构 · 设备远程管理</p>
+                </div>
+                <p class="project-desc">
+                    设计并实现了设备与云平台的直连通信模块，采用 MQTT 协议构建四层架构
+                   （设备接入层、消息路由层、业务逻辑层、云端对接层），
+                    实现边缘设备的远程监控、配置下发和固件升级(OTA)能力。
+                </p>
+                <div class="project-features">
+                    <p class="project-features-title">核心能力</p>
+                    <ul>
+                        <li>四层架构设计：清晰的职责分离，高内聚低耦合</li>
+                        <li>MQTT消息路由：基于Topic的发布/订阅模式，支持多设备消息分发</li>
+                        <li>OTA升级服务：固件版本管理与增量更新</li>
+                        <li>设备影子：离线设备状态同步与配置缓存</li>
+                    </ul>
+                </div>
+                <div class="project-tech">
+                    <span class="project-tech-tag">C/C++17</span>
+                    <span class="project-tech-tag">MQTT</span>
+                    <span class="project-tech-tag">Protobuf</span>
+                    <span class="project-tech-tag">cJSON</span>
+                    <span class="project-tech-tag">SQLite3</span>
+                </div>
+            </div>
+
+            <!-- Project 3: 多设备通信与雷视融合 -->
+            <div class="project-card">
+                <span class="project-card-number">03</span>
+                <div class="project-header">
+                    <h3 class="project-title">多设备通信与雷视融合系统</h3>
+                    <p class="project-subtitle">Alink协议 · 以太网链路 · 雷视标定 · 数据融合</p>
+                </div>
+                <p class="project-desc">
+                    构建了完整的多设备通信框架，涵盖自研Alink二进制协议、以太网链路管理、
+                    以及雷达-视觉数据融合管线。系统支持雷达、PTZ、激光、MEMS惯导、
+                    温度传感器等多种异构设备的统一接入与协同工作。
+                </p>
+                <div class="project-features">
+                    <p class="project-features-title">核心能力</p>
+                    <ul>
+                        <li>Alink自研协议：二进制帧结构，支持设备注册、心跳、数据上报与指令下发</li>
+                        <li>以太网链路管理：自动重连、多链路冗余、链路状态监测</li>
+                        <li>雷视标定：雷达坐标系与视觉坐标系的精确映射与数据关联</li>
+                        <li>多设备SDK：激光测距、MEMS惯导、GNSS定位、温度监测等</li>
+                        <li>FOV配置：视场角自动更新与设备位姿协议实现</li>
+                    </ul>
+                </div>
+                <div class="project-tech">
+                    <span class="project-tech-tag">C/C++17</span>
+                    <span class="project-tech-tag">TCP/UDP</span>
+                    <span class="project-tech-tag">Modbus</span>
+                    <span class="project-tech-tag">UART</span>
+                    <span class="project-tech-tag">RS485</span>
+                    <span class="project-tech-tag">OpenCV</span>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- ======================== Documents ======================== -->
+<section class="section documents-section" id="documents">
+    <div class="section-inner fade-in">
+        <div class="section-header">
+            <p class="section-label">Documents</p>
+            <h2 class="section-title">技术文档</h2>
+            <p class="section-desc">项目架构设计、通信协议、问题排查等完整技术文档</p>
+        </div>
+
+        <!-- Featured Documents -->
+        <div class="doc-featured">
+            <h3 class="doc-featured-title">⭐ 精选文档</h3>
+            <div class="doc-featured-grid" id="docFeaturedGrid">
+                <!-- 由 doc-loader.js 动态填充 -->
+            </div>
+        </div>
+
+        <!-- Document Browser -->
+        <div class="doc-browser">
+            <div class="doc-sidebar" id="docSidebar">
+                <!-- 由 doc-loader.js 动态填充目录树 -->
+            </div>
+            <div class="doc-viewer">
+                <div class="doc-viewer-header" id="docViewerHeader" style="display:none">
+                    <span class="doc-viewer-title" id="docViewerTitle"></span>
+                    <span class="doc-viewer-format" id="docViewerFormat"></span>
+                </div>
+                <div class="doc-viewer-body" id="docViewerBody">
+                    <div class="doc-viewer-placeholder">
+                        <div class="doc-viewer-placeholder-icon">📂</div>
+                        <p class="doc-viewer-placeholder-text">从左侧目录选择文档查看</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- ======================== Experience ======================== -->
+<section class="section" id="experience">
+    <div class="section-inner fade-in">
+        <div class="section-header">
+            <p class="section-label">Experience</p>
+            <h2 class="section-title">问题排查与优化经验</h2>
+            <p class="section-desc">系统性分析方法论与实战案例</p>
+        </div>
+        <div class="timeline">
+            <!-- Experience 1 -->
+            <div class="timeline-item">
+                <div class="timeline-dot"></div>
+                <div class="timeline-date">问题排查</div>
+                <h3 class="timeline-title">SpotterPro 天盾视频断流 CLOSE-WAIT 排查修复</h3>
+                <p class="timeline-desc">
+                    天盾视频流出现持续断流，排查发现大量 TCP 连接处于 CLOSE_WAIT 状态无法释放。
+                    通过系统级网络状态分析、GStreamer 管线状态追踪，定位到服务端未正确关闭连接导致的资源泄漏。
+                    修复后连接异常率降至 0，视频流稳定性显著提升。
+                </p>
+                <div class="timeline-tags">
+                    <span class="timeline-tag">TCP/IP</span>
+                    <span class="timeline-tag">CLOSE_WAIT</span>
+                    <span class="timeline-tag">GStreamer</span>
+                    <span class="timeline-tag">网络诊断</span>
+                </div>
+            </div>
+
+            <!-- Experience 2 -->
+            <div class="timeline-item">
+                <div class="timeline-dot"></div>
+                <div class="timeline-date">性能优化</div>
+                <h3 class="timeline-title">和普 PTZ 跟踪抖动问题分析与修复</h3>
+                <p class="timeline-desc">
+                    PTZ云台在目标跟踪过程中出现明显抖动，影响追踪精度。通过分析控制指令时序、
+                    PID参数调节响应曲线及帧间目标位移数据，定位到指令频率与云台响应速率不匹配问题。
+                    优化控制策略后，跟踪平滑度大幅改善，目标保持稳定。
+                </p>
+                <div class="timeline-tags">
+                    <span class="timeline-tag">PTZ控制</span>
+                    <span class="timeline-tag">跟踪算法</span>
+                    <span class="timeline-tag">PID调节</span>
+                    <span class="timeline-tag">性能优化</span>
+                </div>
+            </div>
+
+            <!-- Experience 3 -->
+            <div class="timeline-item">
+                <div class="timeline-dot"></div>
+                <div class="timeline-date">延迟优化</div>
+                <h3 class="timeline-title">和普 PTZ 冷启动视频延迟分析与优化</h3>
+                <p class="timeline-desc">
+                    PTZ设备冷启动后视频流延迟过长，影响系统快速响应能力。
+                    对启动全流程进行时间切片分析，识别出视频源初始化、GStreamer管线构建、
+                    共享内存传输等关键瓶颈环节，并通过管线预构建与参数调优显著降低首帧延迟。
+                </p>
+                <div class="timeline-tags">
+                    <span class="timeline-tag">GStreamer</span>
+                    <span class="timeline-tag">启动优化</span>
+                    <span class="timeline-tag">延迟分析</span>
+                    <span class="timeline-tag">共享内存</span>
+                </div>
+            </div>
+
+            <!-- Experience 4 -->
+            <div class="timeline-item">
+                <div class="timeline-dot"></div>
+                <div class="timeline-date">架构设计</div>
+                <h3 class="timeline-title">PTZ100 AGX 系统架构设计</h3>
+                <p class="timeline-desc">
+                    主导设计并实现了 PTZ100 AGX 系统的整体软件架构，涵盖应用层、服务层、
+                    公共组件层三层结构。设计并实现了 Alink 自研设备通信协议，支撑雷达、PTZ、
+                    激光、惯导等多达7类异构设备的统一接入与数据路由。
+                </p>
+                <div class="timeline-tags">
+                    <span class="timeline-tag">系统架构</span>
+                    <span class="timeline-tag">Alink协议</span>
+                    <span class="timeline-tag">ROS2</span>
+                    <span class="timeline-tag">多设备融合</span>
+                </div>
+            </div>
+
+            <!-- Experience 5 -->
+            <div class="timeline-item">
+                <div class="timeline-dot"></div>
+                <div class="timeline-date">模块设计</div>
+                <h3 class="timeline-title">NexusGateway 云端直连架构设计</h3>
+                <p class="timeline-desc">
+                    设计了设备与云平台直连的四层通信架构，从底层 MQTT 消息路由到上层业务逻辑，
+                    实现了设备注册、状态同步、配置下发和 OTA 升级的完整闭环。
+                </p>
+                <div class="timeline-tags">
+                    <span class="timeline-tag">MQTT</span>
+                    <span class="timeline-tag">IoT</span>
+                    <span class="timeline-tag">OTA</span>
+                    <span class="timeline-tag">四层架构</span>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- ======================== Footer ======================== -->
+<footer class="footer">
+    <div class="footer-inner">
+        <p class="footer-text">
+            Built with vanilla HTML / CSS / JS &nbsp;·&nbsp;
+            <span id="footerDate"></span>
+        </p>
+    </div>
+</footer>
+
+<!-- Scripts -->
+<script src="js/doc-catalog.js"></script>
+<script src="js/doc-loader.js"></script>
+<script src="js/main.js"></script>
+
+</body>
+</html>

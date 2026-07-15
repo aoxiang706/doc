@@ -1,0 +1,1183 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>中程雷视标定开发——现状分析、问题诊断与改进方案</title>
+    <link rel="stylesheet" href="../../css/markdown.css">
+</head>
+<body>
+    <article class="markdown-body"><h1 id="_1">中程雷视标定开发——现状分析、问题诊断与改进方案</h1>
+<blockquote>
+<p>基于 <code>ptz100_agx_fix</code>（当前运行代码）与 <code>ptz100_agx</code>（需求文档及参考代码）两个工程的深度对比分析。</p>
+<p>生成日期: 2026-02-27</p>
+</blockquote>
+<hr />
+<h2 id="_2">目录</h2>
+<ol>
+<li><a href="#1-概述与目标">概述与目标</a></li>
+<li><a href="#2-系统架构与模块职责">系统架构与模块职责</a></li>
+<li><a href="#3-端到端标定流程现状">端到端标定流程现状</a><br />
+   - 3.1 <a href="#31-用户设置初值-0x71">用户设置初值 (0x71)</a><br />
+   - 3.2 <a href="#32-启动标定-0x94--0x9a">启动标定 (0x94 / 0x9A)</a><br />
+   - 3.3 <a href="#33-ptz锁定无人机">PTZ锁定无人机</a><br />
+   - 3.4 <a href="#34-雷达目标选择与采样">雷达目标选择与采样</a><br />
+   - 3.5 <a href="#35-标定完成与结果确认">标定完成与结果确认</a></li>
+<li><a href="#4-alink协议消息汇总">Alink协议消息汇总</a></li>
+<li><a href="#5-标定状态机">标定状态机</a></li>
+<li><a href="#6-核心算法分析">核心算法分析</a><br />
+   - 6.1 <a href="#61-目标筛选-radar_2ptz_calib">目标筛选 (radar_2ptz_calib)</a><br />
+   - 6.2 <a href="#62-引导采样-radarguide_calib">引导采样 (radarGuide_calib)</a><br />
+   - 6.3 <a href="#63-外参求解-mainapi--calibcpp">外参求解 (mainAPI / calib.cpp)</a></li>
+<li><a href="#7-数据持久化与运行期应用">数据持久化与运行期应用</a></li>
+<li><a href="#8-需求与代码差距分析gap-analysis">需求与代码差距分析（GAP Analysis）</a></li>
+<li><a href="#9-改进方案">改进方案</a></li>
+<li><a href="#10-实施路线图">实施路线图</a></li>
+<li><a href="#11-附录">附录</a></li>
+</ol>
+<hr />
+<h2 id="1">1. 概述与目标</h2>
+<h3 id="11">1.1 背景</h3>
+<p>PTZ（光电转台）在远距离工作时视场角极小（&lt;1°），不具备主动探测能力，必须依赖雷达等设备提供引导角度信息。<strong>雷视标定</strong>的核心目的是：通过对比雷达检测角度与PTZ实际锁定角度的差异，求解并修正两者之间的安装偏差（外参），从而提高雷达→PTZ引导的精度。</p>
+<p>前期已完成<strong>四面阵近程雷达</strong>的标定功能。中程雷达与近程雷达在探测距离、角度精度、波束特性上存在显著差异，需要针对中程雷达的特点对标定流程和算法进行适配与优化。</p>
+<h3 id="12">1.2 标定目标</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>待标定外参</strong></td>
+<td>yaw_offset（方位偏差）、pitch_offset（俯仰偏差）、roll_offset（横滚偏差）、height_offset（高度偏差）</td>
+</tr>
+<tr>
+<td><strong>精度指标</strong></td>
+<td>方位/俯仰残差均值 &lt; 0.5°，方差 &lt; 0.3° (目标值)</td>
+</tr>
+<tr>
+<td><strong>支持拓扑</strong></td>
+<td>机扫中程雷达 + PTZ；四面阵中程雷达 + PTZ</td>
+</tr>
+<tr>
+<td><strong>C2交互</strong></td>
+<td>与近程标定流程统型，复用 0x71 / 0x91 / 0x92 / 0x93 / 0x95 消息，新增 0x9A 统合启停/查询</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="2">2. 系统架构与模块职责</h2>
+<pre><code>┌─────────┐  Alink协议    ┌──────────────────────────────────────────┐
+│  C2客户端 │ ◄──────────► │                AGX嵌入式                  │
+│ (上位机)  │  (TCP二进制)  │                                          │
+└─────────┘               │  ┌──────────┐  ROS2  ┌───────────────┐  │
+                          │  │ alink_srv │ ◄────► │  ros_app 桥接   │  │
+                          │  │ (协议解析) │        │  (消息转换)    │  │
+                          │  └──────────┘        └───────┬───────┘  │
+                          │                              │          │
+                          │              ┌───────────────┼────────┐ │
+                          │              ▼               ▼        │ │
+                          │  ┌──────────────┐  ┌──────────────┐   │ │
+                          │  │ 自标定模块    │  │ PTZ引导模块   │   │ │
+                          │  │ (calibr_alg) │  │ (ptz_guider) │   │ │
+                          │  └──────┬───────┘  └──────────────┘   │ │
+                          │         │                              │ │
+                          │         ▼                              │ │
+                          │  ┌──────────────┐  ┌──────────────┐   │ │
+                          │  │ AI算法模块    │  │ SQLite / YAML │   │ │
+                          │  │ (ai_alg)     │  │ (持久化存储)  │   │ │
+                          │  └──────────────┘  └──────────────┘   │ │
+                          └────────────────────────────────────────┘ │
+</code></pre>
+<h3 id="_3">各模块职责</h3>
+<table>
+<thead>
+<tr>
+<th>模块</th>
+<th>关键文件</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>alink_srv</strong></td>
+<td><code>alink_track.cpp/.h</code>, <code>alink_system.cpp</code></td>
+<td>解析C2 Alink报文，转发给ROS层；上报标定状态/数据给C2</td>
+</tr>
+<tr>
+<td><strong>ros_app</strong></td>
+<td><code>ros_app.cpp/.h</code></td>
+<td>AGX内部ROS2消息桥接；订阅/发布标定状态(<code>UserCalibState</code>)、标定数据(<code>CalibRadarPtzObjList</code>)等</td>
+</tr>
+<tr>
+<td><strong>自标定模块</strong> (calibr_alg)</td>
+<td>ROS节点（需求文档描述）</td>
+<td>标定状态机管理、数据收集、外参求解、结果评估</td>
+</tr>
+<tr>
+<td><strong>PTZ引导模块</strong> (ptz_guider)</td>
+<td>ROS节点</td>
+<td>PTZ转向控制、锁定状态管理、引导/标定模式切换</td>
+</tr>
+<tr>
+<td><strong>AI算法模块</strong> (ai_alg)</td>
+<td><code>ai_main.cpp</code>, <code>guide.cpp</code>, <code>calib.cpp</code>, <code>tf.cpp</code></td>
+<td>雷达目标筛选、标定数据采集写文件、外参计算</td>
+</tr>
+<tr>
+<td><strong>SQLite/YAML</strong></td>
+<td><code>global_calibration.h/.c</code>, <code>radar_calibration.h/.c</code></td>
+<td>全局标定参数和单雷达标定结果的持久化</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="3">3. 端到端标定流程现状</h2>
+<h3 id="31-0x71">3.1 用户设置初值 (0x71)</h3>
+<p><strong>流程</strong>：C2 → <code>alink_set_mark_param_new()</code> → 写入 SQLite (<code>write_global_calibration</code>) + 写入 YAML (<code>g_hostDevCfgApi.updateBySn</code>) → <code>ros_app_cmd_set(21, 1)</code> 通知自标定模块 → 自标定模块调用 <code>init_alg()</code> 读取初值 → 发布 <code>UserCalibState</code> → 嵌入式上报 C2。</p>
+<p><strong>当前代码位置</strong>：<code>alink_track.cpp:667-714</code></p>
+<p><strong>参数内容</strong>：heading（朝向角）、longitude、latitude、altitude、rolling、pitching、relativeHeight</p>
+<h4 id="_4">🔴 发现的问题</h4>
+<ol>
+<li><strong>双写冗余</strong>：同时写入 SQLite 和 YAML，注释中提到"以后不用这个表了，统一用yaml，短期暂时不删除"——但两年后仍未清理</li>
+<li><strong>SN硬编码</strong>：<code>strcpy(list.sn, "SRP100")</code> 硬编码了设备SN，不支持多设备场景</li>
+<li><strong>缺少参数校验</strong>：收到的坐标参数没有有效性检查（如经纬度范围、海拔合理性）</li>
+</ol>
+<hr />
+<h3 id="32-0x94-0x9a">3.2 启动标定 (0x94 / 0x9A)</h3>
+<p><strong>需求</strong>：使用新的 0x9A 消息统合启动、停止、添加/删除标定方位角、查询历史标定结果。</p>
+<p><strong>当前代码</strong>：仍使用旧的 0x94 (<code>user_start_radar_calibration</code>)，只支持"启动标定"功能。</p>
+<pre><code>C2 → 0x94(sn + reserve) → alink_track.cpp:952
+  → ros_app_cmd_set(CMD_ID_LOCAL_CALIBRATION, STATE_CODE_CALIBRATION_USER_MODE_START)
+  → 自标定模块检查雷达/PTZ在线 → CALIB_STATE_IDLE
+  → 嵌入式收到IDLE后 → ros_app_calib_radar_info(calibration_sn) 发送SN给引导模块
+  → 引导模块转动PTZ至雷达法线角度 → 应答 PTZ_ARRIVED
+  → 自标定模块切换至 CALIB_STATE_PTZ_ARRIVED
+</code></pre>
+<h4 id="_5">🔴 发现的问题</h4>
+<ol>
+<li><strong>0x9A 未实现</strong>：需求文档定义了 0x9A 消息（含cmd=1启动/2停止/3添加方位/4删除方位/5查询历史），但代码中完全不存在</li>
+<li><strong>0x96 功能有限</strong>：当前 0x96 只是查询已有标定SQL数据，不支持按方位角添加/删除</li>
+<li><strong>无"标定方位角"概念</strong>：中程雷达可能需要按方位分段标定（0°/90°/180°/270°等），但当前代码没有方位角管理逻辑</li>
+</ol>
+<hr />
+<h3 id="33-ptz">3.3 PTZ锁定无人机</h3>
+<p><strong>流程</strong>：</p>
+<ol>
+<li><strong>自动锁定模式</strong> (默认)：PTZ自动检测并锁定无人机 → 引导模块应答 <code>PTZ_TRACKING_FINISHED</code></li>
+<li><strong>手动锁定模式</strong> (0x91 Request=4)：C2切换到手动模式 → 引导模块释放目标、启动AI检测 → 用户在C2界面手点像素框 → C2下发 0x95 → 引导模块锁定指定像素目标</li>
+<li><strong>锁定确认/取消</strong> (0x91 Request=1/2)：C2弹窗确认锁定的目标</li>
+</ol>
+<p><strong>当前代码位置</strong>：<code>alink_track.cpp:996-1037</code> (<code>radar_calibration_req</code>)</p>
+<h4 id="_6">🔴 发现的问题</h4>
+<ol>
+<li><strong>0x91 处理不完整</strong>：需求定义了8种Request值，当前代码只实现了1-4，且：<br />
+   - Request=5（退出PTZ手动锁定）→ 返回 0xFF（未实现）<br />
+   - Request=6（标定结果取消）→ <strong>缺失</strong><br />
+   - Request=7（手动选择雷达目标）→ <strong>缺失</strong><br />
+   - Request=8（自动选择雷达目标）→ <strong>缺失</strong></li>
+<li><strong>映射关系错乱</strong>：代码中 Request=3 映射到 <code>RESULT_CONFIRMED</code>，但需求文档中 Request=3 是"视觉锁定目标确认"，Request=7 才是"标定结果确认"。新老定义有冲突。</li>
+</ol>
+<hr />
+<h3 id="34">3.4 雷达目标选择与采样</h3>
+<p><strong>流程</strong>：<br />
+- 自标定模块切换到 <code>CALIB_STATE_RADAR_MANUAL_SELECT</code> 或自动选择模式<br />
+- 用户在C2选择雷达靶机目标 → 0x81 → 嵌入式转发<br />
+- 自标定模块将雷达原始目标与手选ID匹配 → 坐标转换到PTZ坐标系<br />
+- 结合PTZ锁定角度，计算雷达-PTZ角度偏差<br />
+- 按1Hz发布 <code>CalibRadarPtzObjList</code> (0x93) 给C2显示曲线</p>
+<p><strong>当前代码实现</strong>（在 <code>ptz100_agx_fix</code> 中）：<br />
+- <code>ai_alg_calib()</code> 作为标定主函数<br />
+- <code>radarGuide_calib()</code> 选择雷达目标<br />
+- 数据写入文件 <code>radar_ptz_status.txt</code><br />
+- 采集完成后启动 <code>mark_task</code> 线程调用 <code>mainAPI()</code> 计算外参</p>
+<h4 id="_7">🔴 发现的问题</h4>
+<ol>
+<li><strong><code>STATE_CODE_CALIBRATION_USER_MODE_RADAR_MANUAL_SELECT</code> 未定义</strong>：需求文档引用了此状态码，但代码中不存在</li>
+<li><strong>雷达原始目标类型 0xE1 复用冲突</strong>：需求说新增 0xE1 用于雷达原始目标，但代码中 0xE1 已被 <code>track_pkg_remote_id</code>（遥控ID）和 <code>HeartBeatHostStatus</code>（心跳）复用</li>
+<li><strong>数据采样使用文件 I/O</strong>：<code>ai_alg_calib()</code> 每个采样点都 <code>fopen/fprintf/fclose</code>，在高频采样下存在性能和可靠性隐患</li>
+<li><strong>缺少中程雷达特化筛选</strong>：<code>radar_2ptz_calib()</code> 仅靠 <code>alive &gt;= 0</code> 过滤，没有距离/速度/仰角/信噪比门限</li>
+</ol>
+<hr />
+<h3 id="35">3.5 标定完成与结果确认</h3>
+<p><strong>流程</strong>：<br />
+- 采样达到阈值或超时 → 启动 <code>mark_task</code> 线程<br />
+- <code>mainAPI()</code> 从文件读取采样数据 → 分段、合并、去异常值 → 计算方位/俯仰偏差均值<br />
+- 结果通过 <code>alink_upload_mark_result()</code> 上报C2<br />
+- C2弹窗确认 → 0x91 Request=3 → <code>RESULT_CONFIRMED</code><br />
+- 嵌入式将结果写入YAML</p>
+<h4 id="_8">🔴 发现的问题</h4>
+<ol>
+<li><strong>结果未持久化到SQLite</strong>：<code>mark_task</code> 计算完成后只上报C2，没有将 yaw_offset/pitch_offset 写入 <code>radar_calibration</code> 表</li>
+<li><strong>结果未实时应用</strong>：<code>setPTZ0()</code> 函数中没有加载标定偏差值进行修正</li>
+<li><strong>自标定模块与AI算法模块职责交叉</strong>：需求文档描述的流程由自标定模块（ROS节点）主导，但实际代码中标定逻辑在AI算法模块（<code>ai_alg_calib</code>），两个体系不一致</li>
+</ol>
+<hr />
+<h2 id="4-alink">4. Alink协议消息汇总</h2>
+<table>
+<thead>
+<tr>
+<th>消息ID</th>
+<th>方向</th>
+<th>功能</th>
+<th>代码状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>0x71</strong></td>
+<td>C2→AGX→C2</td>
+<td>设置标定初值（经纬度、朝向、高度等）</td>
+<td>✅ 已实现</td>
+</tr>
+<tr>
+<td><strong>0x81</strong></td>
+<td>C2→AGX</td>
+<td>用户选择跟踪目标</td>
+<td>✅ 已实现</td>
+</tr>
+<tr>
+<td><strong>0x82</strong></td>
+<td>AGX→C2</td>
+<td>AGX上报跟踪状态</td>
+<td>✅ 已实现</td>
+</tr>
+<tr>
+<td><strong>0x91</strong></td>
+<td>C2→AGX→C2</td>
+<td>标定确认（8种子命令）</td>
+<td>⚠️ 部分实现(仅1-4)</td>
+</tr>
+<tr>
+<td><strong>0x92</strong></td>
+<td>双向</td>
+<td>标定状态查询/上报</td>
+<td>✅ 已实现</td>
+</tr>
+<tr>
+<td><strong>0x93</strong></td>
+<td>AGX→C2</td>
+<td>标定过程数据（PTZ/雷达角度对列表）</td>
+<td>✅ 已实现</td>
+</tr>
+<tr>
+<td><strong>0x94</strong></td>
+<td>C2→AGX</td>
+<td>启动标定（旧）</td>
+<td>✅ 已实现（需迁移到0x9A）</td>
+</tr>
+<tr>
+<td><strong>0x95</strong></td>
+<td>C2→AGX→C2</td>
+<td>用户下发手点像素目标值</td>
+<td>✅ 已实现</td>
+</tr>
+<tr>
+<td><strong>0x96</strong></td>
+<td>C2→AGX→C2</td>
+<td>查询历史标定SQL数据</td>
+<td>✅ 已实现（需整合到0x9A）</td>
+</tr>
+<tr>
+<td><strong>0x9A</strong></td>
+<td>C2→AGX→C2</td>
+<td>启动/停止标定 + 管理/查询标定方位角</td>
+<td>❌ 未实现</td>
+</tr>
+<tr>
+<td><strong>0xE1</strong></td>
+<td>—</td>
+<td>雷达原始目标类型（新）</td>
+<td>❌ 未实现（ID已被占用）</td>
+</tr>
+<tr>
+<td><strong>0xE6</strong></td>
+<td>AGX→C2</td>
+<td>融合新协议目标（含debug_status=30标识雷达原始数据）</td>
+<td>✅ 已实现</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="5">5. 标定状态机</h2>
+<pre><code>                    ┌─────────────────────────────┐
+                    │                             │
+                    ▼                             │
+    ┌──────────────────────┐                     │
+    │  CALIB_STATE_IDLE(0) │◄────────────────────┤
+    └──────────┬───────────┘  结果确认/取消/超时    │
+               │ 启动标定                         │
+               ▼                                 │
+    ┌──────────────────────────┐                 │
+    │ CALIB_STATE_INIT_PARAM   │                 │
+    │     _SET_SUCCESS(1)      │                 │
+    └──────────┬───────────────┘                 │
+               │ 设备在线确认                      │
+               ▼                                 │
+    ┌──────────────────────────┐                 │
+    │ CALIB_STATE_INITIALIZED  │                 │
+    │          (2)             │                 │
+    └──────────┬───────────────┘                 │
+               │ 22=INITIALIZE_FAIL → 退出       │
+               │ PTZ到达指定角度                   │
+               ▼                                 │
+    ┌──────────────────────────┐                 │
+    │ CALIB_STATE_PTZ_ARRIVED  │                 │
+    │          (3)             │                 │
+    └──────────┬───────────────┘                 │
+               │ PTZ锁定目标                      │
+               ▼                                 │
+    ┌──────────────────────────────┐             │
+    │ CALIB_STATE_PTZ_TRACKING     │             │
+    │     _SUCCESS(4)              │             │
+    │ 24=PTZ_TRACKING_FAIL → 回退   │             │
+    └──────────┬───────────────────┘             │
+               │ 用户确认锁定                      │
+               ▼                                 │
+    ┌──────────────────────────────┐             │
+    │ CALIB_STATE_PTZ_TRACKING     │             │
+    │     _SUCCESS_CONFIRMED(5)    │             │
+    └──────────┬───────────────────┘             │
+               │ ⭐ 缺失: RADAR_MANUAL_SELECT     │
+               │ 开始数据采集                      │
+               ▼                                 │
+    ┌──────────────────────────┐                 │
+    │ CALIB_STATE_DOING(8)    │                 │
+    └──────────┬───────────────┘                 │
+               │ 进度100%或超时                    │
+               ▼                                 │
+    ┌──────────────────────────┐                 │
+    │ CALIB_STATE_DONE(9)     │                 │
+    └──────────┬───────────────┘                 │
+               │ 确认(10)/取消(30)                 │
+               ▼                                 │
+    ┌──────────────────────────────────┐         │
+    │ CALIB_STATE_RESULT_CONFIRMED(10) ├─────────┘
+    │ 或 CALIB_STATE_RESULT_CANCELED(30)│
+    └──────────────────────────────────┘
+</code></pre>
+<h4 id="_9">🔴 状态机缺失项</h4>
+<ul>
+<li><code>CALIB_STATE_RADAR_MANUAL_SELECT</code>：需求中定义了用户手选雷达目标的状态，但代码中未定义</li>
+<li><code>CALIB_STATE_RADAR_AUTO_SELECT</code>：自动选择雷达目标的状态也未定义</li>
+<li>缺少明确的"方位段"概念——中程雷达可能需要分多个方位段分别标定</li>
+</ul>
+<hr />
+<h2 id="6">6. 核心算法分析</h2>
+<h3 id="61-radar_2ptz_calib">6.1 目标筛选 (radar_2ptz_calib)</h3>
+<p><strong>文件</strong>：<code>ptz100_agx_fix/src/srv/algs/ai_alg/guide.cpp:203-263</code></p>
+<p><strong>当前逻辑</strong>：</p>
+<pre><code>对所有雷达目标:
+    if (alive &gt;= 0):       // 唯一过滤条件
+        加入 useful_obj
+
+if useful_obj 只有1个:
+    直接选定
+else if 有多个:
+    选择与当前锁定ID匹配的目标 (按 ptz_id 匹配)
+    否则选择 alive 值最大（生存时间最长）的目标
+</code></pre>
+<h4 id="_10">🔴 问题</h4>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>影响</th>
+<th>建议</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>仅靠 <code>alive&gt;=0</code> 过滤</td>
+<td>杂波、地物、车辆等非目标也会通过</td>
+<td>增加距离范围(200m-5km)、速度门限(&gt;2m/s)、仰角门限(&gt;0°)等中程特化筛选条件</td>
+</tr>
+<tr>
+<td>无RCS/SNR门限</td>
+<td>低质量探测点影响标定精度</td>
+<td>若雷达上报SNR/RCS，增加门限过滤</td>
+</tr>
+<tr>
+<td>未使用目标分类信息</td>
+<td><code>classification</code> 字段未利用</td>
+<td>仅选择 classification==无人机 的目标</td>
+</tr>
+<tr>
+<td>多目标选择策略简单</td>
+<td>可能误选非标定靶机</td>
+<td>结合C2手选ID(0x81)做强关联，或要求标定时空域只有单一目标</td>
+</tr>
+</tbody>
+</table>
+<h3 id="62-radarguide_calib">6.2 引导采样 (radarGuide_calib)</h3>
+<p><strong>文件</strong>：<code>ptz100_agx_fix/src/srv/algs/ai_alg/ai_main.cpp:837-917</code></p>
+<p><strong>当前逻辑</strong>：</p>
+<pre><code>调用 radar_2ptz_calib 选取雷达目标
+if 选取成功:
+    记录雷达目标角度到全局变量 (target_horizatal_angle, target_pitching_angle, target_range)
+    记录速度 (target_vx, target_vy, target_vz)
+    （注意：setPTZ0 引导PTZ转向的代码被注释掉了）
+</code></pre>
+<p>数据采样在 <code>ai_alg_calib()</code> 的后半部分完成：</p>
+<pre><code>if mark_status == 1 且有雷达数据:
+    写入 radar_ptz_status.txt:
+        radar_azimuth, radar_elevation, range, vx, vy, vz,
+        ptz_azimuth, ptz_elevation, timestamp, id, track_azimuth, track_elevation
+</code></pre>
+<h4 id="_11">🔴 问题</h4>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>影响</th>
+<th>建议</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>setPTZ0 被注释掉</td>
+<td>标定时不引导PTZ跟踪雷达目标，依赖PTZ自行AI检测锁定</td>
+<td>标定时应该由雷达引导PTZ对准目标，或至少辅助引导</td>
+</tr>
+<tr>
+<td>使用文件IO采样</td>
+<td>高频写文件影响实时性；文件损坏则丢失所有数据</td>
+<td>改为内存buffer采样，完成后一次性写入或直接在内存中计算</td>
+</tr>
+<tr>
+<td>缺少采样质量评估</td>
+<td>每个采样点都无条件记录</td>
+<td>增加实时一致性检查：连续采样角度跳变&gt;阈值时丢弃</td>
+</tr>
+<tr>
+<td>record_time 超时机制不健壮</td>
+<td><code>AI_MARK_COLLECT_DATA_TIMEOUT</code> 从record_time开始计算，包含等待目标出现的时间</td>
+<td>应从实际开始有效采样时计时</td>
+</tr>
+</tbody>
+</table>
+<h3 id="63-mainapi-calibcpp">6.3 外参求解 (mainAPI / calib.cpp)</h3>
+<p><strong>文件</strong>：<code>ptz100_agx_fix/src/srv/algs/ai_alg/calib.cpp:59-521</code></p>
+<p><strong>当前算法流程</strong>：</p>
+<pre><code>1. 从文件读取 CSV 数据 (radar_azimuth, radar_elevation, range, ..., ptz_azimuth, ptz_elevation, ...)
+2. 远离过程分段:
+   - 按距离递增趋势分段
+   - 相邻段角度跳变&gt;阈值时切分
+   - 计算各段方位/俯仰 vs 距离的斜率和截距
+   - 合并相似段
+   - 选择样本最多的段
+   - 去除相邻帧角度差&gt;1°的异常点
+3. 靠近过程分段: (反向遍历，同样逻辑)
+4. 合并远离/靠近两段数据
+5. 计算方位/俯仰偏差:
+   H_off = radar_azimuth - ptz_azimuth
+   V_off = radar_elevation - ptz_elevation
+6. 中值滤波: 排序后取中值
+7. 阈值去异常: abs(偏差 - 中值) &lt; f_TH(=10°)
+8. 截尾均值: 取中间60%数据(20%-80%)求均值
+9. 取反作为标定值: yaw_offset = -mean(H_off), pitch_offset = -mean(V_off)
+10. 写入 calib.conf 文件
+</code></pre>
+<h4 id="_12">🔴 问题</h4>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>严重度</th>
+<th>详细说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>仅求解yaw/pitch，无roll/height</strong></td>
+<td>高</td>
+<td>需求要求4个外参(yaw, pitch, roll, height_offset)，但算法只计算2个</td>
+</tr>
+<tr>
+<td><strong>简单差值法，非旋转矩阵拟合</strong></td>
+<td>高</td>
+<td>直接用角度差均值作为外参，忽略了roll引起的交叉耦合（方位偏差随俯仰角变化）</td>
+</tr>
+<tr>
+<td><strong>f_TH=10° 硬编码阈值</strong></td>
+<td>中</td>
+<td>对于精标定场景，10°的异常阈值过大；应根据数据分布自适应</td>
+</tr>
+<tr>
+<td><strong>最少50个有效样本</strong></td>
+<td>中</td>
+<td>硬编码 <code>v_azimuth_off_valid_size &lt; 50</code> 返回失败，不可配置</td>
+</tr>
+<tr>
+<td><strong>文件读写作为数据接口</strong></td>
+<td>中</td>
+<td>从文件读取CSV数据容易因格式错误崩溃（如 <code>std::stof</code> 抛异常）</td>
+</tr>
+<tr>
+<td><strong>分段合并逻辑复杂且无文档</strong></td>
+<td>中</td>
+<td>分段+合并+筛选逻辑约200行代码，完全没有注释说明目的</td>
+</tr>
+<tr>
+<td><strong>无距离加权</strong></td>
+<td>中</td>
+<td>远距离采样点角度误差较大，应给予较低权重</td>
+</tr>
+<tr>
+<td><strong>截尾均值比例固定</strong></td>
+<td>低</td>
+<td>使用20%-80%截尾均值，比例不可调整</td>
+</tr>
+<tr>
+<td><strong>角度wraparound处理不完整</strong></td>
+<td>低</td>
+<td>仅在偏差&gt;180°时+-360°，但分段逻辑中可能遗漏</td>
+</tr>
+</tbody>
+</table>
+<h4 id="_13">改进建议：外参求解算法</h4>
+<p>推荐的数学模型：</p>
+<p>给定雷达目标在雷达坐标系下的方位角 (a_r)、俯仰角 (e_r)，以及 PTZ 实际锁定的方位角 (a_p)、俯仰角 (e_p)，建立模型：</p>
+<p>$$<br />
+\begin{bmatrix} a_p \ e_p \end{bmatrix} = R(\Delta\text{yaw}, \Delta\text{pitch}, \Delta\text{roll}) \cdot \begin{bmatrix} a_r \ e_r \end{bmatrix} + \text{bias}<br />
+$$</p>
+<p>对于小角度偏差，可简化为线性模型：</p>
+<p>$$<br />
+a_p \approx a_r + \Delta\text{yaw} + \Delta\text{roll} \cdot \tan(e_r)<br />
+$$<br />
+$$<br />
+e_p \approx e_r + \Delta\text{pitch} + \Delta\text{height_offset} / d<br />
+$$</p>
+<p>其中 (d) 是目标距离。使用加权最小二乘法求解：</p>
+<p>$$<br />
+\min \sum_{i} w_i \left[ (a_{p,i} - a_{r,i} - \Delta\text{yaw} - \Delta\text{roll} \cdot \tan(e_{r,i}))^2 + (e_{p,i} - e_{r,i} - \Delta\text{pitch} - \Delta h / d_i)^2 \right]<br />
+$$</p>
+<p>权重 (w_i) 可基于距离和SNR设置。</p>
+<hr />
+<h2 id="7">7. 数据持久化与运行期应用</h2>
+<h3 id="71">7.1 持久化现状</h3>
+<table>
+<thead>
+<tr>
+<th>存储方式</th>
+<th>内容</th>
+<th>读写位置</th>
+<th>问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SQLite <code>global_calibration</code></td>
+<td>全局初值(经纬度/朝向/高度)</td>
+<td><code>alink_set_mark_param_new()</code> 写入</td>
+<td>与YAML双写，冗余</td>
+</tr>
+<tr>
+<td>YAML配置文件</td>
+<td>同上 + 设备属性</td>
+<td><code>g_hostDevCfgApi.updateBySn()</code> 写入</td>
+<td>已成为主要存储</td>
+</tr>
+<tr>
+<td>SQLite <code>radar_calibration</code></td>
+<td>单雷达标定结果(local_delta_*)</td>
+<td><code>user_start_radar_calibration_result_handler()</code> 写入</td>
+<td>但AI算法模块不写入此表</td>
+</tr>
+<tr>
+<td>文件 <code>radar_ptz_status.txt</code></td>
+<td>标定采样原始数据</td>
+<td><code>ai_alg_calib()</code> 追加写入</td>
+<td>临时文件，不可靠</td>
+</tr>
+<tr>
+<td>文件 <code>calib.conf</code></td>
+<td>标定结果(yaw_off, pitch_off)</td>
+<td><code>mainAPI()</code> → <code>write_calbvalue()</code></td>
+<td>平面文件，无校验</td>
+</tr>
+</tbody>
+</table>
+<h3 id="72">7.2 运行期应用现状</h3>
+<p><strong>关键问题：标定结果在运行期引导中未被使用。</strong></p>
+<p><code>setPTZ0()</code> 函数（<code>ai_main.cpp:368-395</code>）直接将雷达角度转发给PTZ，<strong>没有</strong>加载或应用任何标定偏差补偿：</p>
+<pre><code class="language-c">void setPTZ0(float ablHor, float ablVer, float verticalHeight, 
+             float horizontalDistance, ...)
+{
+    addr_t.guidance_mode = PTZ_ADDR_GUIDANCE_MODE_ANGLE;
+    addr_t.horizatal_angle = ablHor;        // 未修正！
+    addr_t.pitch_angle = ablVer;            // 未修正！
+    addr_t.target_altitude = verticalHeight;
+    addr_t.distance = horizontalDistance;
+    send_ptz_control_addr(&amp;addr_t);
+}
+</code></pre>
+<p><code>radarGuide()</code>（正常引导函数）调用 <code>setPTZ0(horAngle, obj_to_ptz.elevation, ...)</code> 时同样没有加入标定补偿。</p>
+<h4 id="_14">🔴 这意味着：即使完成了标定流程，标定结果也不会实际改善引导精度！</h4>
+<hr />
+<h2 id="8-gap-analysis">8. 需求与代码差距分析（GAP Analysis）</h2>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>需求</th>
+<th>当前代码状态</th>
+<th>差距等级</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>0x9A 消息（启停/管理方位角/查询历史）</td>
+<td>❌ 完全未实现</td>
+<td><strong>P0-阻塞</strong></td>
+</tr>
+<tr>
+<td>2</td>
+<td>0x91 支持8种Request</td>
+<td>⚠️ 仅实现1-4，且映射关系与需求不一致</td>
+<td><strong>P0-阻塞</strong></td>
+</tr>
+<tr>
+<td>3</td>
+<td>标定状态机含RADAR_MANUAL_SELECT</td>
+<td>❌ 状态未定义</td>
+<td><strong>P1-重要</strong></td>
+</tr>
+<tr>
+<td>4</td>
+<td>0xE1 雷达原始目标类型</td>
+<td>❌ ID被其他功能占用</td>
+<td><strong>P1-重要</strong></td>
+</tr>
+<tr>
+<td>5</td>
+<td>标定结果含 roll_offset, height_offset</td>
+<td>❌ 算法仅计算yaw/pitch</td>
+<td><strong>P1-重要</strong></td>
+</tr>
+<tr>
+<td>6</td>
+<td>标定结果持久化到SQLite</td>
+<td>❌ 仅写入平面文件</td>
+<td><strong>P1-重要</strong></td>
+</tr>
+<tr>
+<td>7</td>
+<td>标定结果运行期应用于引导</td>
+<td>❌ setPTZ0 无偏差修正</td>
+<td><strong>P0-阻塞</strong></td>
+</tr>
+<tr>
+<td>8</td>
+<td>中程雷达特化目标筛选</td>
+<td>❌ 仅 alive&gt;=0</td>
+<td><strong>P1-重要</strong></td>
+</tr>
+<tr>
+<td>9</td>
+<td>自标定模块(calibr_alg)流程</td>
+<td>⚠️ 代码用AI模块替代</td>
+<td><strong>P2-优化</strong></td>
+</tr>
+<tr>
+<td>10</td>
+<td>标定数据实时上报C2画曲线(0x93)</td>
+<td>⚠️ 框架在但可能与AI模块不对接</td>
+<td><strong>P1-重要</strong></td>
+</tr>
+<tr>
+<td>11</td>
+<td>近程/中程标定流程统型</td>
+<td>⚠️ 控制流程基本一致，但消息定义不统一</td>
+<td><strong>P2-优化</strong></td>
+</tr>
+<tr>
+<td>12</td>
+<td>双写(SQLite+YAML)清理</td>
+<td>⚠️ 冗余存在</td>
+<td><strong>P3-技术债</strong></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="9">9. 改进方案</h2>
+<h3 id="91-p0">9.1 P0 级改进（阻塞性问题）</h3>
+<h4 id="911-0x9a">9.1.1 实现 0x9A 消息处理</h4>
+<p>在 <code>alink_track.cpp</code> 中新增注册和处理函数：</p>
+<pre><code class="language-c">// 新增 0x9A 消息结构
+#pragma pack(1)
+typedef struct alink_calibration_start_stop_req {
+    char sn[25];
+    uint8_t cmd;        // 1:启动 2:停止 3:添加方位 4:删除方位 5:查询历史
+    float angle;        // 标定方位角度
+    uint8_t reserve[128];
+} alink_calibration_start_stop_req_t;
+#pragma pack()
+
+// 注册
+alink_register_cmd(&amp;pkg_0x9A, 0x9A, sizeof(alink_calibration_start_stop_req_t), 
+                   handle_calibration_start_stop);
+
+// 处理函数
+static void handle_calibration_start_stop(alink_payload_t *psPayload, 
+                                          alink_resp_t *psResp)
+{
+    auto* req = (alink_calibration_start_stop_req_t*)(psPayload-&gt;pbyData);
+    switch (req-&gt;cmd) {
+        case 1: // 启动标定
+            // 复用原 user_start_radar_calibration 逻辑
+            break;
+        case 2: // 停止标定
+            // 发送 RESULT_CANCELED 状态
+            break;
+        case 3: // 添加标定方位角
+            // 存入 YAML/SQLite，关联 sn + angle
+            break;
+        case 4: // 删除标定方位角
+            // 从存储中删除对应记录
+            break;
+        case 5: // 查询历史标定结果
+            // 复用/增强原 get_radar_calibration_sql_data 逻辑
+            break;
+    }
+}
+</code></pre>
+<h4 id="912-0x91">9.1.2 补全 0x91 处理</h4>
+<p>扩展 <code>radar_calibration_req()</code> 支持需求定义的所有Request值：</p>
+<pre><code class="language-c">static void radar_calibration_req(alink_payload_t *psPayload, alink_resp_t *psResp)
+{
+    struct alink_calibration_req* payload = ...;
+    struct alink_calibration_rsp* resp = ...;
+
+    switch (payload-&gt;Request) {
+        case 1: // PTZ锁定确认
+            ros_app_cmd_set(..., STATE_CODE_..._PTZ_TRACKING_CONFIRMED);
+            break;
+        case 2: // PTZ锁定取消
+            ros_app_cmd_set(..., STATE_CODE_..._PTZ_TRACKING_CANCEL);
+            break;
+        case 3: // 视觉锁定目标确认 (新)
+            ros_app_cmd_set(..., STATE_CODE_..._VISION_CONFIRMED);
+            break;
+        case 4: // 视觉锁定目标取消 (新) 
+            ros_app_cmd_set(..., STATE_CODE_..._VISION_CANCEL);
+            break;
+        case 5: // 手动选择雷达目标模式 (新)
+            ros_app_cmd_set(..., STATE_CODE_..._RADAR_MANUAL_SELECT);
+            break;
+        case 6: // 自动选择雷达目标模式 (新)
+            ros_app_cmd_set(..., STATE_CODE_..._RADAR_AUTO_SELECT);
+            break;
+        case 7: // 标定结果确认
+            ros_app_cmd_set(..., STATE_CODE_..._RESULT_CONFIRMED);
+            break;
+        case 8: // 标定结果取消
+            ros_app_cmd_set(..., STATE_CODE_..._RESULT_CANCELED);
+            break;
+    }
+}
+</code></pre>
+<h4 id="913">9.1.3 标定结果运行期应用</h4>
+<p>在 <code>setPTZ0()</code> 中加载并应用标定偏差：</p>
+<pre><code class="language-c">// 全局或模块级变量，启动时从 calib.conf/YAML/SQLite 加载
+static float g_calib_yaw_offset = 0.0f;
+static float g_calib_pitch_offset = 0.0f;
+static float g_calib_roll_offset = 0.0f;
+static float g_calib_height_offset = 0.0f;
+static bool  g_calib_loaded = false;
+
+void load_calibration_offsets(const char* sn)
+{
+    // 从 YAML 或 SQLite 加载指定雷达SN的标定结果
+    // g_calib_yaw_offset = ...
+    // g_calib_pitch_offset = ...
+    g_calib_loaded = true;
+}
+
+void setPTZ0(float ablHor, float ablVer, float verticalHeight, 
+             float horizontalDistance, ...)
+{
+    addr_t.guidance_mode = PTZ_ADDR_GUIDANCE_MODE_ANGLE;
+
+    // ★ 应用标定偏差修正
+    if (g_calib_loaded) {
+        ablHor += g_calib_yaw_offset;
+        ablVer += g_calib_pitch_offset;
+        // roll 修正: ablHor += g_calib_roll_offset * tan(ablVer * DEG2RAD);
+        // height 修正: ablVer += atan(g_calib_height_offset / horizontalDistance) * RAD2DEG;
+    }
+
+    addr_t.horizatal_angle = ablHor;
+    addr_t.pitch_angle = ablVer;
+    addr_t.target_altitude = verticalHeight;
+    addr_t.distance = horizontalDistance;
+    send_ptz_control_addr(&amp;addr_t);
+}
+</code></pre>
+<h3 id="92-p1">9.2 P1 级改进（重要功能）</h3>
+<h4 id="921">9.2.1 中程雷达特化目标筛选</h4>
+<p>增强 <code>radar_2ptz_calib()</code> 的筛选条件：</p>
+<pre><code class="language-c">int radar_2ptz_calib(std::vector&lt;RadarObj&gt; *obj_ptr, RadarObj &amp;obj_to_ptz, int ptz_id)
+{
+    std::vector&lt;RadarObj&gt; useful_obj;
+
+    for (auto it = obj_ptr-&gt;begin(); it != obj_ptr-&gt;end(); ++it) {
+        // 基础过滤
+        if (it-&gt;alive &lt; 3) continue;           // 需要至少3帧存活
+
+        // 中程特化过滤
+        if (it-&gt;range &lt; 200 || it-&gt;range &gt; 5000) continue;   // 200m-5km
+        if (abs(it-&gt;velocity) &lt; 2.0f) continue;              // 速度&gt;2m/s（排除静止物）
+        if (it-&gt;elevation &lt; -5.0f) continue;                  // 排除地面目标
+
+        // 分类过滤（如果可用）
+        // if (it-&gt;classification != CLASS_UAV) continue;
+
+        useful_obj.push_back(*it);
+    }
+
+    // ... 后续选择逻辑
+}
+</code></pre>
+<h4 id="922">9.2.2 改进外参求解算法</h4>
+<p>将 <code>mainAPI()</code> 重构为结构化的内存计算：</p>
+<pre><code class="language-c">struct CalibSample {
+    float radar_az, radar_el, range;
+    float ptz_az, ptz_el;
+    uint64_t timestamp;
+    int id;
+    float weight;  // 基于距离/质量的权重
+};
+
+struct CalibResult {
+    float yaw_offset;
+    float pitch_offset;
+    float roll_offset;
+    float height_offset;
+    float yaw_mean, yaw_var, yaw_max_diff;
+    float pitch_mean, pitch_var, pitch_max_diff;
+    int valid_sample_count;
+    int valid_flag;  // CALIB_VALID_FLAG_YAW | CALIB_VALID_FLAG_PITCH
+};
+
+int compute_calibration(const std::vector&lt;CalibSample&gt;&amp; samples, CalibResult&amp; result)
+{
+    // 1. RANSAC/IRLS 去异常值
+    // 2. 加权最小二乘拟合 yaw, pitch, roll, height_offset
+    // 3. 计算残差统计
+    // 4. 质量评估
+}
+</code></pre>
+<h4 id="923">9.2.3 标定结果持久化</h4>
+<p>标定完成后，将结果同时写入 SQLite 和 YAML：</p>
+<pre><code class="language-c">// mark_task 中，mainAPI 成功后
+radar_calibration_list_t cali_list = {0};
+strncpy(cali_list.sn, calibration_sn, sizeof(cali_list.sn));
+cali_list.timestamp = skyfend_get_systimemap();
+cali_list.local_delta_yaw = f_H_off;
+cali_list.local_delta_pitch = f_V_off;
+cali_list.state_flag = 2; // 标定完成
+write_radar_calibration(&amp;cali_list);
+</code></pre>
+<h3 id="93-p2">9.3 P2 级改进（优化项）</h3>
+<ol>
+<li><strong>统一自标定模块与AI算法模块的标定职责</strong>：明确由自标定模块管理状态机，AI算法模块只负责目标筛选和角度计算</li>
+<li><strong>消除双写</strong>：统一使用 YAML 存储全局标定参数，废弃 SQLite <code>global_calibration</code> 表</li>
+<li><strong>增加标定日志</strong>：在标定过程中输出结构化日志，便于问题诊断</li>
+<li><strong>内存采样替代文件采样</strong>：使用环形buffer替代每帧写文件</li>
+<li><strong>自动化测试</strong>：设计可复现的仿真测试用例</li>
+</ol>
+<hr />
+<h2 id="10">10. 实施路线图</h2>
+<h3 id="phase-12-3">Phase 1：协议与框架对齐（预计2-3天）</h3>
+<table>
+<thead>
+<tr>
+<th>任务</th>
+<th>改动文件</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>实现 0x9A 消息处理</td>
+<td><code>alink_track.cpp/.h</code></td>
+<td>新增结构体、注册、处理函数</td>
+</tr>
+<tr>
+<td>扩展 0x91 到8种Request</td>
+<td><code>alink_track.cpp</code></td>
+<td>扩展 switch-case，新增 CmdEnum 定义</td>
+</tr>
+<tr>
+<td>新增 CmdEnum 状态码</td>
+<td><code>skyfend_interfaces</code> ROS包</td>
+<td>添加 RADAR_MANUAL_SELECT 等</td>
+</tr>
+<tr>
+<td>解决 0xE1 ID冲突</td>
+<td>协调决定</td>
+<td>可能需要分配新ID给雷达原始目标</td>
+</tr>
+</tbody>
+</table>
+<h3 id="phase-23-5">Phase 2：算法优化与补全（预计3-5天）</h3>
+<table>
+<thead>
+<tr>
+<th>任务</th>
+<th>改动文件</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>增强 radar_2ptz_calib 筛选</td>
+<td><code>guide.cpp</code></td>
+<td>添加距离/速度/分类过滤</td>
+</tr>
+<tr>
+<td>重构 mainAPI 为内存计算</td>
+<td><code>calib.cpp</code></td>
+<td>去除文件IO，改为传参</td>
+</tr>
+<tr>
+<td>实现 roll/height 求解</td>
+<td><code>calib.cpp</code></td>
+<td>加权最小二乘</td>
+</tr>
+<tr>
+<td>采样数据改为内存buffer</td>
+<td><code>ai_main.cpp</code></td>
+<td>替换 fopen/fprintf</td>
+</tr>
+<tr>
+<td>标定质量评估增强</td>
+<td><code>calib.cpp</code></td>
+<td>残差统计、自适应阈值</td>
+</tr>
+</tbody>
+</table>
+<h3 id="phase-32-3">Phase 3：持久化与运行期应用（预计2-3天）</h3>
+<table>
+<thead>
+<tr>
+<th>任务</th>
+<th>改动文件</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>mark_task 结果写入 SQLite</td>
+<td><code>ai_main.cpp</code></td>
+<td>调用 write_radar_calibration</td>
+</tr>
+<tr>
+<td>setPTZ0 加载标定偏差</td>
+<td><code>ai_main.cpp</code></td>
+<td>系统启动时读取 calib.conf/SQLite</td>
+</tr>
+<tr>
+<td>setPTZ0 应用偏差修正</td>
+<td><code>ai_main.cpp</code></td>
+<td>引导角度 += offset</td>
+</tr>
+<tr>
+<td>标定完成后自动重载</td>
+<td><code>ai_main.cpp</code></td>
+<td>mark_task 结束时更新全局偏差</td>
+</tr>
+</tbody>
+</table>
+<h3 id="phase-43-5">Phase 4：联调与验证（预计3-5天）</h3>
+<table>
+<thead>
+<tr>
+<th>任务</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>C2 0x9A 消息联调</td>
+<td>与C2团队对接新消息</td>
+</tr>
+<tr>
+<td>标定流程走通</td>
+<td>单雷达+PTZ，完整标定流程</td>
+</tr>
+<tr>
+<td>引导精度验证</td>
+<td>标定前后对比引导到达角度误差</td>
+</tr>
+<tr>
+<td>多方位标定测试</td>
+<td>测试不同方位段的标定独立性</td>
+</tr>
+<tr>
+<td>异常场景测试</td>
+<td>超时、中途退出、多目标干扰等</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="11_1">11. 附录</h2>
+<h3 id="a">附录A：关键数据结构</h3>
+<h4 id="global_calibration_list_t">global_calibration_list_t (全局标定参数)</h4>
+<pre><code class="language-c">typedef struct global_calibration_list {
+    char sn[128];
+    uint64_t timestamp;
+    double longitude, latitude, altitude;
+    float roll, pitch, yaw;
+    int state_flag;        // 0-未初始化, 1-初始化, 2-标定完成
+    float relative_height;
+    struct global_calibration_list* next;
+} global_calibration_list_t;
+</code></pre>
+<h4 id="radar_calibration_list_t">radar_calibration_list_t (单雷达标定结果)</h4>
+<pre><code class="language-c">typedef struct radar_calibration_list {
+    char sn[128];
+    uint64_t timestamp;
+    double longitude, latitude, altitude;
+    float local_t_x, local_t_y, local_t_z;             // 平移
+    float local_roll, local_pitch, local_yaw;           // 姿态
+    float local_delta_t_x, local_delta_t_y, local_delta_t_z;     // 微调平移
+    float local_delta_roll, local_delta_pitch, local_delta_yaw;   // 微调姿态（标定结果）
+    int state_flag;
+    struct radar_calibration_list* next;
+} radar_calibration_list_t;
+</code></pre>
+<h4 id="alink_calibration_status_t-0x92">alink_calibration_status_t (0x92 标定状态上报)</h4>
+<pre><code class="language-c">typedef struct alink_calibration_status {
+    uint64_t timestamp;
+    uint8_t Sn[25];
+    uint8_t calib_ongoing_state;     // 见状态机章节
+    uint8_t calib_state;
+    float recommend_uav_height;
+    float recommend_uav_fly_direction;
+    uint8_t calib_progress_bar;      // 0-100
+    uint8_t yaw_valid_flag;
+    float yaw_mean, yaw_variance, yaw_max_diff;
+    uint8_t pitch_valid_flag;
+    float pitch_mean, pitch_variance, pitch_max_diff;
+    float yaw_offset, pitch_offset, roll_offset, height_offset;
+    uint8_t valid_flag;              // CALIB_VALID_FLAG_YAW=1, CALIB_VALID_FLAG_PITCH=2
+    uint32_t Reserver;
+} alink_calibration_status_t;
+</code></pre>
+<h3 id="b">附录B：关键文件索引</h3>
+<table>
+<thead>
+<tr>
+<th>文件路径</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>src/srv/alink/command/track/alink_track.cpp</code></td>
+<td>C2标定命令入口：0x71/0x91/0x92/0x93/0x94/0x95/0x96</td>
+</tr>
+<tr>
+<td><code>src/srv/alink/command/track/alink_track.h</code></td>
+<td>标定Alink消息结构体定义</td>
+</tr>
+<tr>
+<td><code>src/app/ros_app/ros_app.cpp</code></td>
+<td>ROS桥接：UserCalibState订阅/CalibRadarPtzObjList回调</td>
+</tr>
+<tr>
+<td><code>src/srv/algs/ai_alg/ai_main.cpp</code></td>
+<td>标定主函数 ai_alg_calib()、数据采样、mark_task线程</td>
+</tr>
+<tr>
+<td><code>src/srv/algs/ai_alg/guide.cpp</code></td>
+<td>radarGuide_calib() 目标选择、radar_2ptz_calib() 筛选</td>
+</tr>
+<tr>
+<td><code>src/srv/algs/ai_alg/calib.cpp</code></td>
+<td>mainAPI() 外参求解算法</td>
+</tr>
+<tr>
+<td><code>src/srv/algs/ai_alg/tf.cpp</code></td>
+<td>坐标变换工具</td>
+</tr>
+<tr>
+<td><code>src/common/sqlite/global_calibration.h/.c</code></td>
+<td>SQLite全局标定参数读写</td>
+</tr>
+<tr>
+<td><code>src/common/sqlite/radar_calibration.h/.c</code></td>
+<td>SQLite单雷达标定结果读写</td>
+</tr>
+</tbody>
+</table>
+<h3 id="c-vs">附录C：中程雷达 vs 近程雷达标定差异</h3>
+<table>
+<thead>
+<tr>
+<th>特性</th>
+<th>近程雷达（四面阵）</th>
+<th>中程雷达（机扫/相控阵）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>探测距离</td>
+<td>50m - 2km</td>
+<td>200m - 8km</td>
+</tr>
+<tr>
+<td>角度精度</td>
+<td>±0.5°</td>
+<td>±1° ~ ±2°</td>
+</tr>
+<tr>
+<td>波束宽度</td>
+<td>窄</td>
+<td>较宽</td>
+</tr>
+<tr>
+<td>更新率</td>
+<td>高（4面同时）</td>
+<td>较低（扫描周期）</td>
+</tr>
+<tr>
+<td>标定方位段</td>
+<td>4面各自标定</td>
+<td>全方位或分段标定</td>
+</tr>
+<tr>
+<td>对标定算法影响</td>
+<td>角度差直接可用</td>
+<td>需要更多样本、更强去噪、距离加权</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<blockquote>
+<p><strong>总结</strong>：当前代码已具备基本的标定框架（Alink消息传递、ROS桥接、简单的外参计算），但存在多个阻塞性问题：0x9A未实现、0x91不完整、标定结果未在运行期应用、仅计算yaw/pitch两个外参。建议按照 Phase 1→4 的路线图依次推进，优先解决 P0 级问题以打通端到端流程，再逐步优化算法精度和健壮性。</p>
+</blockquote></article>
+    <script>
+        // Sync theme with parent page
+        try {
+            var parentTheme = window.parent.document.documentElement.getAttribute('data-theme');
+            if (parentTheme) document.documentElement.setAttribute('data-theme', parentTheme);
+            // Listen for theme changes
+            var observer = new MutationObserver(function(mutations) {
+                mutations.forEach(function(m) {
+                    if (m.attributeName === 'data-theme') {
+                        var t = window.parent.document.documentElement.getAttribute('data-theme');
+                        if (t) document.documentElement.setAttribute('data-theme', t);
+                    }
+                });
+            });
+            observer.observe(window.parent.document.documentElement, { attributes: true });
+        } catch(e) {}
+    </script>
+</body>
+</html>

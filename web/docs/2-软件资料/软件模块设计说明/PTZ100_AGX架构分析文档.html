@@ -1,0 +1,950 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PTZ100_AGX 整体架构深度分析文档</title>
+    <link rel="stylesheet" href="../../css/markdown.css">
+</head>
+<body>
+    <article class="markdown-body"><h1 id="ptz100_agx">PTZ100_AGX 整体架构深度分析文档</h1>
+<blockquote>
+<p><strong>文档版本</strong>: V1.0<br />
+<strong>生成日期</strong>: 2024<br />
+<strong>产品名称</strong>: PTZ100_AGX (SRP100)<br />
+<strong>平台</strong>: NVIDIA Jetson AGX Xavier</p>
+</blockquote>
+<hr />
+<h2 id="_1">目录</h2>
+<ul>
+<li><a href="#一产品定位">一、产品定位</a></li>
+<li><a href="#二整体技术栈">二、整体技术栈</a></li>
+<li><a href="#三顶层目录结构">三、顶层目录结构</a></li>
+<li><a href="#四核心架构双模式运行">四、核心架构：双模式运行</a></li>
+<li><a href="#五src-源码层次结构">五、src/ 源码层次结构</a></li>
+<li><a href="#六核心模块详解">六、核心模块详解</a></li>
+<li><a href="#61-alg_app---ai引导算法核心">6.1 alg_app - AI引导算法核心</a></li>
+<li><a href="#62-ros_app---ros2消息总线">6.2 ros_app - ROS2消息总线</a></li>
+<li><a href="#63-alink---自研通信协议框架">6.3 alink - 自研通信协议框架</a></li>
+<li><a href="#64-eth_link---以太网设备管理">6.4 eth_link - 以太网设备管理</a></li>
+<li><a href="#七ros2工作空间节点架构">七、ROS2工作空间节点架构</a></li>
+<li><a href="#八iot设备sdk">八、IoT设备SDK</a></li>
+<li><a href="#九整体数据流">九、整体数据流</a></li>
+<li><a href="#十配置与部署体系">十、配置与部署体系</a></li>
+<li><a href="#十一关键设计模式与要点">十一、关键设计模式与要点</a></li>
+</ul>
+<hr />
+<h2 id="_2">一、产品定位</h2>
+<p><strong>PTZ100_AGX</strong> 是 Skyfend（天巡）公司开发的<strong>智能反无人机系统</strong>，运行在 NVIDIA Jetson AGX 边缘计算平台上。系统内部代号为 <strong>SRP100</strong>（Skyfend Radar PTZ 100）。</p>
+<h3 id="_3">核心功能</h3>
+<ul>
+<li><strong>多设备接入管理</strong>：接入多种雷达、PTZ光电吊舱、激光、干扰设备等</li>
+<li><strong>AI智能引导</strong>：通过AI算法对无人机目标进行识别、跟踪和引导</li>
+<li><strong>统一指控</strong>：通过C2（指控上位机）进行统一管理和指令下发</li>
+<li><strong>雷视融合</strong>：融合雷达和视觉感知数据，提升目标检测精度</li>
+</ul>
+<hr />
+<h2 id="_4">二、整体技术栈</h2>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>技术选型</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>操作系统</strong></td>
+<td>Ubuntu (ARM aarch64, Jetson AGX)</td>
+</tr>
+<tr>
+<td><strong>主框架</strong></td>
+<td>ROS2 Humble + C/C++17 混合编程</td>
+</tr>
+<tr>
+<td><strong>构建系统</strong></td>
+<td>CMake (支持 ROS_SUPPORTED 编译开关)</td>
+</tr>
+<tr>
+<td><strong>AI推理</strong></td>
+<td>CUDA + TensorRT + OpenCV</td>
+</tr>
+<tr>
+<td><strong>视频处理</strong></td>
+<td>GStreamer (主流) / FFmpeg (旧版，已替换)</td>
+</tr>
+<tr>
+<td><strong>通信协议</strong></td>
+<td>自研 alink 二进制协议 / TCP / UDP / MQTT / Protobuf / Modbus</td>
+</tr>
+<tr>
+<td><strong>数据库</strong></td>
+<td>SQLite3 (存储标定参数、设备配置)</td>
+</tr>
+<tr>
+<td><strong>日志系统</strong></td>
+<td>zlog</td>
+</tr>
+<tr>
+<td><strong>媒体服务</strong></td>
+<td>mediamtx (RTSP服务器)</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="_5">三、顶层目录结构</h2>
+<pre><code>ptz100_agx/
+├── src/              # 主程序源码（C/C++ 非ROS核心逻辑）
+├── ros_ws/           # ROS2工作空间（各ROS节点）
+├── iotDevices/       # IoT设备SDK（激光/PTZ/雷达等）
+├── public/           # 公共库（MQTT/GStreamer/共享内存等）
+├── thirdpart/        # 第三方库（TensorRT/OpenCV/FFmpeg等）
+├── config/           # 运行时配置（日志/启动脚本/监控/NTP等）
+├── docker/           # Docker运行脚本
+└── doc/              # 设计文档
+</code></pre>
+<h3 id="_6">目录说明</h3>
+<ul>
+<li><strong>src/</strong>: 核心业务逻辑，C/C++混合，不依赖ROS但可编译为ROS节点</li>
+<li><strong>ros_ws/</strong>: ROS2节点集合，包括设备驱动、融合算法、引导控制等</li>
+<li><strong>iotDevices/</strong>: 第三方设备SDK封装（和普PTZ、激光、雷达等）</li>
+<li><strong>public/</strong>: 跨模块公共库（日志、配置、网络、视频等）</li>
+<li><strong>thirdpart/</strong>: 预编译的第三方库（aarch64架构）</li>
+<li><strong>config/</strong>: 运行时配置文件、启动脚本、监控配置</li>
+</ul>
+<hr />
+<h2 id="_7">四、核心架构：双模式运行</h2>
+<p>系统支持两种编译/运行模式，通过 <code>PTZ100_SUPPORTED_ROS</code> 宏控制：</p>
+<h3 id="ros">ROS模式（生产环境）</h3>
+<pre><code>entry.cpp → rclcpp::init → ros_app → libmain()
+主循环由 rclcpp executor spin() 驱动
+</code></pre>
+<p><strong>特点</strong>：<br />
+- 作为ROS2节点运行，可与其他ROS节点通信<br />
+- 使用 <code>rclcpp::MultiThreadedExecutor</code> 多线程执行器<br />
+- 主入口：<code>ros_ws/src/ptz100_ros/src/entry.cpp</code></p>
+<h3 id="_8">裸机模式（调试/测试）</h3>
+<pre><code>main() → while(!exit_app) { sleep(1); }
+主循环由 while 循环驱动
+</code></pre>
+<p><strong>特点</strong>：<br />
+- 独立运行，不依赖ROS环境<br />
+- 便于调试和单元测试<br />
+- 主入口：<code>src/main.c</code></p>
+<h3 id="mainclibmain">启动序列（main.c/libmain）</h3>
+<p>启动顺序严格，各模块按以下顺序初始化：</p>
+<pre><code class="language-c">1. skyfend_log_init()          // 日志初始化
+2. common_init()               // 公共模块（sysport/storage/sqlite/配置）
+3. alg_init()                  // AI算法模块 + 图像线程 + 目标队列
+4. eth_link_init()             // 以太网链路管理（设备注册发现）
+5. load_ptz()                  // PTZ摄像头加载（RTSP/SDK连接）
+6. alink_init()                // Alink通信协议框架初始化
+7. c2_network_init()           // C2指控网络连接
+8. radar_network_init()        // 雷达网络连接
+9. eth_link_server_init()       // 以太网Server监听（子设备接入）
+10. sfl200_app_init()           // SFL200干扰设备管理
+11. electronic_fence_app_init() // 电子围栏
+12. ota_app_init()              // OTA升级服务
+</code></pre>
+<hr />
+<h2 id="src">五、src/ 源码层次结构</h2>
+<pre><code>src/
+├── main.c                  # 程序入口
+├── libmain.h               # ROS模式导出接口
+├── inc/version.h           # 版本号定义
+│
+├── app/                    # 应用层（业务逻辑）
+│   ├── alg_app/            # AI算法应用
+│   │   ├── alg_app.cpp/h   # 算法主逻辑
+│   │   └── queue/          # 目标队列管理
+│   ├── ptz/                # PTZ摄像头控制
+│   │   ├── ptz_app.cpp/h   # PTZ应用层
+│   │   └── ffmpeg/         # 视频编解码（旧版，已替换）
+│   ├── ros_app/            # ROS2消息总线适配器
+│   │   └── ros_app.cpp/h   # ROS消息发布/订阅
+│   ├── c2_network/          # C2指控网络
+│   ├── radars_network/     # 雷达网络管理
+│   ├── sfl200_app/         # SFL200/哨兵设备
+│   ├── electronic_fence_app/ # 电子围栏
+│   └── ota_app/            # OTA升级
+│
+├── srv/                    # 服务层（通用能力）
+│   ├── alink/              # 核心通信协议框架
+│   │   ├── alink.c/h       # 协议核心
+│   │   ├── analysis/       # 报文解析
+│   │   ├── command/        # 指令处理器（system/target/track等）
+│   │   ├── upload/         # 数据上传打包
+│   │   └── devices_pb/     # Protobuf定义
+│   ├── eth_link/           # 以太网链路/设备管理
+│   │   ├── eth_link.c/h    # 链路管理
+│   │   ├── ptz_protocol/   # PTZ协议解析
+│   │   ├── eth_protocol/   # 以太网协议
+│   │   └── socket/         # TCP/UDP封装
+│   ├── algs/               # 算法接口 + AI引导算法
+│   │   ├── alg_interface.c/h # 算法接口
+│   │   └── ai_alg/         # AI引导核心（ai_main.cpp）
+│   └── log/                # 日志服务
+│
+└── common/                 # 基础层
+    ├── sysport/            # 系统移植（任务/定时器/时间）
+    ├── sqlite/             # SQLite标定数据
+    ├── storage/            # 文件存储
+    ├── config/             # 配置管理（YAML/SQLite）
+    └── tools/              # 工具函数
+</code></pre>
+<hr />
+<h2 id="_9">六、核心模块详解</h2>
+<h3 id="61-alg_app-ai">6.1 alg_app - AI引导算法核心</h3>
+<p><strong>位置</strong>: <code>src/app/alg_app/alg_app.cpp</code></p>
+<p>这是系统最核心的业务模块，负责AI目标识别和PTZ引导控制。</p>
+<h4 id="_10">线程架构</h4>
+<p><code>alg_init()</code> 创建5个工作线程：</p>
+<table>
+<thead>
+<tr>
+<th>线程名</th>
+<th>功能</th>
+<th>数据源/目标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ai_alg_thread</code></td>
+<td>核心AI引导线程</td>
+<td>从目标队列取目标 → <code>ai_alg_run7()</code> → PTZ引导</td>
+</tr>
+<tr>
+<td><code>image_get_thread</code></td>
+<td>可见光图像获取</td>
+<td>共享内存(SHM)读帧 → 队列</td>
+</tr>
+<tr>
+<td><code>image_push_thread</code></td>
+<td>可见光图像推流</td>
+<td>队列 → GstRtspClient RTSP推送</td>
+</tr>
+<tr>
+<td><code>image_get_thread_infrared</code></td>
+<td>红外图像获取</td>
+<td>共享内存(SHM)读帧 → 队列</td>
+</tr>
+<tr>
+<td><code>image_push_thread_infrared</code></td>
+<td>红外图像推流</td>
+<td>队列 → GstRtspClient RTSP推送</td>
+</tr>
+</tbody>
+</table>
+<h4 id="_11">目标数据流</h4>
+<pre><code>雷达/融合节点 
+    ↓ ROS callback
+fusion_packet_ckb_handle() / ainode_packet_ckb_handle()
+    ↓
+ai_insert_target_to_head()  // 插入目标链表
+    ↓
+ai_alg_thread 消费目标
+    ↓
+ai_alg_run7()  // 核心引导算法
+    ↓
+send_ptz_control_xxx()  // 控制PTZ
+</code></pre>
+<h4 id="_12">工作模式</h4>
+<ul>
+<li><strong>标定模式</strong> (<code>mark_status=1</code>): 调用 <code>ai_alg_calib()</code>，用于雷达-PTZ标定</li>
+<li><strong>引导模式</strong> (<code>mark_status=0</code>): 调用 <code>ai_alg_run7()</code>，正常AI引导跟踪</li>
+</ul>
+<h4 id="_13">关键数据结构</h4>
+<pre><code class="language-c">typedef struct alg_app_res {
+    thread_task_t   *task_list;        // 线程任务列表
+    int             task_list_num;     // 线程数量
+    ai_input_targets_t ai_targets;     // AI目标链表
+    module_target_headers_t modules_targets;  // 模块目标头
+    bool release;                      // 释放标志
+    void* pvalgtask;                   // AI任务消息队列
+    void* fu_pvalgtask;                // 融合任务消息队列
+} alg_app_res_t;
+</code></pre>
+<hr />
+<h3 id="62-ros_app-ros2">6.2 ros_app - ROS2消息总线</h3>
+<p><strong>位置</strong>: <code>src/app/ros_app/ros_app.cpp/h</code></p>
+<p><code>ros_app</code> 类是整个系统的 <strong>ROS2消息中心</strong>，充当非ROS C代码与ROS2生态的桥梁。</p>
+<h4 id="subscribetopic">订阅（Subscribe）的关键Topic</h4>
+<table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>来源节点</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>rvfusion_objs</code></td>
+<td>rvfusion_service</td>
+<td>雷视融合目标</td>
+</tr>
+<tr>
+<td><code>fusionTargetObjs</code></td>
+<td>ptz100_fusion</td>
+<td>融合目标</td>
+</tr>
+<tr>
+<td><code>sfl200_objs</code></td>
+<td>sfl200节点</td>
+<td>哨兵设备目标</td>
+</tr>
+<tr>
+<td><code>ptzGuidanceCmd</code></td>
+<td>ptz_guider_ctl</td>
+<td>PTZ引导指令</td>
+</tr>
+<tr>
+<td><code>ptzTrackCmd</code></td>
+<td>引导节点</td>
+<td>PTZ跟踪指令</td>
+</tr>
+<tr>
+<td><code>dhp120Status</code></td>
+<td>dhp100_tracker</td>
+<td>中程雷达状态</td>
+</tr>
+<tr>
+<td><code>bph110Status/Param</code></td>
+<td>laser_service</td>
+<td>激光状态</td>
+</tr>
+<tr>
+<td><code>hepuPtzInfo</code></td>
+<td>ptz_service</td>
+<td>和普PTZ设备信息</td>
+</tr>
+</tbody>
+</table>
+<h4 id="publishtopic">发布（Publish）的关键Topic</h4>
+<table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>接收方</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>radar1/2/3/4Meas</code></td>
+<td>rvfusion_service</td>
+<td>雷达跟踪数据</td>
+</tr>
+<tr>
+<td><code>radar1/2/3/4Dectect</code></td>
+<td>融合节点</td>
+<td>雷达检测数据</td>
+</tr>
+<tr>
+<td><code>ptzStatus/ptzLensInfo</code></td>
+<td>引导节点</td>
+<td>PTZ当前状态</td>
+</tr>
+<tr>
+<td><code>aiMeas</code></td>
+<td>ptz100_fusion</td>
+<td>AI感知结果</td>
+</tr>
+<tr>
+<td><code>ptzRgbPic/ptzFraredPic</code></td>
+<td>算法节点</td>
+<td>可见光/红外图像</td>
+</tr>
+<tr>
+<td><code>tracerP_droneid/remoteid</code></td>
+<td>融合节点</td>
+<td>RF侦测目标</td>
+</tr>
+<tr>
+<td><code>devlist</code></td>
+<td>C2</td>
+<td>设备列表</td>
+</tr>
+<tr>
+<td><code>sysHeartbeat</code></td>
+<td>系统监控</td>
+<td>系统心跳</td>
+</tr>
+</tbody>
+</table>
+<h4 id="_14">回调注册机制</h4>
+<pre><code class="language-cpp">// 业务模块可注册ROS订阅的数据回调
+ros_register_subscribe_cbk(ROS_FUSION_DATA, fusion_packet_ckb_handle);
+ros_register_subscribe_cbk(ROS_AI_DATA, ainode_packet_ckb_handle);
+ros_register_subscribe_cbk(ROS_DEV_ATTR_DATA, devattr_packet_ckb_handle);
+</code></pre>
+<hr />
+<h3 id="63-alink-">6.3 alink - 自研通信协议框架</h3>
+<p><strong>位置</strong>: <code>src/srv/alink/</code></p>
+<p>Alink是整个系统的<strong>私有二进制通信协议框架</strong>，负责AGX与雷达、C2、探测设备之间的通信。</p>
+<h4 id="_15">目录结构</h4>
+<pre><code>alink/
+├── alink.c/h              # 框架核心（注册/发送/接收）
+├── alink_defines.h        # 设备ID枚举（雷达/C2/SRP100/SFL200等）
+├── analysis/              # 报文解析
+│   ├── alink_order.c      # 指令解析
+│   ├── alink_recv.c       # 接收处理
+│   └── alink_socket.c     # Socket封装
+├── check/                 # 校验和
+│   ├── alink_check.c      # 协议校验
+│   └── checksum.c         # 校验算法
+├── command/               # 指令处理器
+│   ├── system/            # 系统指令（心跳/配置/设备信息）
+│   ├── target/            # 目标上报
+│   ├── track/             # 跟踪控制
+│   ├── efence/            # 电子围栏
+│   ├── sentry/            # 哨兵设备
+│   ├── stp120/            # STP120设备
+│   ├── tracerMatrix/      # TracerMatrix干扰矩阵
+│   └── bph110/            # BPH110激光
+├── upload/                # 数据上传打包
+│   ├── alink_package.c     # 打包逻辑
+│   └── alink_upload.c     # 上传接口
+└── devices_pb/radar/      # 雷达Protobuf定义
+    ├── radar.proto        # 雷达消息定义
+    └── broadcast.proto    # 广播消息定义
+</code></pre>
+<h4 id="idalink_dev_id_t">设备ID体系（alink_dev_id_t）</h4>
+<table>
+<thead>
+<tr>
+<th>设备ID</th>
+<th>宏定义</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>3</td>
+<td><code>ALINK_DEV_ID_RADAR</code></td>
+<td>雷达</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>ALINK_DEV_ID_PC</code></td>
+<td>PC端</td>
+</tr>
+<tr>
+<td>6</td>
+<td><code>ALINK_DEV_ID_C2</code></td>
+<td>指控上位机</td>
+</tr>
+<tr>
+<td>12</td>
+<td><code>ALINK_DEV_ID_SRP100</code></td>
+<td>本机（AGX）</td>
+</tr>
+<tr>
+<td>0x0d</td>
+<td><code>ALINK_DEV_ID_SFL200</code></td>
+<td>哨兵干扰设备</td>
+</tr>
+<tr>
+<td>0x1f</td>
+<td><code>ALINK_DEV_ID_BPH110</code></td>
+<td>激光</td>
+</tr>
+<tr>
+<td>0x22</td>
+<td><code>ALINK_DEV_ID_TRACERP</code></td>
+<td>TracerP侦测设备</td>
+</tr>
+<tr>
+<td>0x20</td>
+<td><code>ALINK_DEV_ID_STP120</code></td>
+<td>STP120设备</td>
+</tr>
+</tbody>
+</table>
+<h4 id="api">核心API</h4>
+<pre><code class="language-c">// 初始化
+int32_t alink_init(void);
+
+// 注册指令处理器
+int32_t alink_register_cmd(alink_cmd_list_t *psCmdList, 
+                           uint8_t byOrder, 
+                           uint16_t wPayloadLen,
+                           void (*pv_cmd_task)(alink_payload_t *psPayload, 
+                                               alink_resp_t *psResp));
+
+// 上传数据包
+int32_t alink_upload_package(alink_package_list_t *psPackage, void *psImport);
+
+// 上传目标信息
+int32_t alink_upload_tracked(void *psObjTrack);
+int32_t alink_upload_detected(void *psObjDetect);
+</code></pre>
+<hr />
+<h3 id="64-eth_link-">6.4 eth_link - 以太网设备管理</h3>
+<p><strong>位置</strong>: <code>src/srv/eth_link/</code></p>
+<p>管理所有通过以太网接入的子设备，提供统一的设备发现、连接、通信能力。</p>
+<h4 id="_16">功能特性</h4>
+<ul>
+<li><strong>TCP客户端/服务端</strong>: 支持主动连接和被动监听</li>
+<li><strong>UDP Socket</strong>: 支持UDP通信</li>
+<li><strong>设备在线状态管理</strong>: 维护设备在线/离线状态</li>
+<li><strong>设备列表维护</strong>: <code>get_devices_online_info()</code> 获取在线设备</li>
+<li><strong>PTZ协议解析</strong>: <code>ptz_protocol/</code> 解析PTZ控制协议</li>
+<li><strong>RTK调试器</strong>: <code>rtk_debuger/</code> RTK定位调试</li>
+</ul>
+<h4 id="_17">默认网络参数</h4>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>AGX自身IP</td>
+<td><code>192.168.1.161</code></td>
+<td>AGX设备IP</td>
+</tr>
+<tr>
+<td>AGX端口</td>
+<td><code>18070</code></td>
+<td>默认服务端口</td>
+</tr>
+<tr>
+<td>PTZ接入IP</td>
+<td><code>192.168.2.163</code></td>
+<td>PTZ设备IP</td>
+</tr>
+<tr>
+<td>PTZ端口</td>
+<td><code>19005</code></td>
+<td>PTZ通信端口</td>
+</tr>
+<tr>
+<td>PTZ RTSP主码流</td>
+<td><code>rtsp://192.168.2.4:554/channel=0,stream=0</code></td>
+<td>可见光主码流</td>
+</tr>
+<tr>
+<td>PTZ RTSP子码流</td>
+<td><code>rtsp://192.168.2.4:554/channel=0,stream=1</code></td>
+<td>可见光子码流</td>
+</tr>
+<tr>
+<td>PTZ RTSP红外</td>
+<td><code>rtsp://192.168.2.4:554/channel=1,stream=0</code></td>
+<td>红外码流</td>
+</tr>
+</tbody>
+</table>
+<h4 id="api_1">核心API</h4>
+<pre><code class="language-c">// 初始化
+int eth_link_init(void);
+int eth_link_server_init(void);
+
+// 注册设备类型
+int eth_link_add_type(uint16_t type, uint8_t net, uint8_t max, 
+                      eth_link_cbk_t* (*ps_init)(eth_link_user_t *psUser));
+
+// 获取设备信息
+int get_devices_online_info(void *pdevlist, int exclude_devid);
+int find_device_info_by_sn(eth_link_device_info_t *devinfo, const char *dest_sn);
+</code></pre>
+<hr />
+<h2 id="ros2">七、ROS2工作空间节点架构</h2>
+<p><strong>位置</strong>: <code>ros_ws/src/</code></p>
+<h3 id="_18">节点列表</h3>
+<table>
+<thead>
+<tr>
+<th>节点名</th>
+<th>功能</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ptz100_ros</code></td>
+<td><strong>主节点</strong>，包含libmain，消息总线</td>
+<td>✅ 运行中</td>
+</tr>
+<tr>
+<td><code>ptz_service</code></td>
+<td>PTZ设备驱动（和普Hepu PTZ）</td>
+<td>✅ 运行中</td>
+</tr>
+<tr>
+<td><code>laser_service</code></td>
+<td>激光设备驱动（He BPH110）</td>
+<td>✅ 运行中</td>
+</tr>
+<tr>
+<td><code>br100a</code></td>
+<td>BR100A短程小雷达驱动</td>
+<td>✅ 运行中</td>
+</tr>
+<tr>
+<td><code>gnss_b3</code></td>
+<td>GNSS-B3定位模块驱动</td>
+<td>✅ 运行中</td>
+</tr>
+<tr>
+<td><code>spoofer</code></td>
+<td>干扰设备驱动</td>
+<td>✅ 运行中</td>
+</tr>
+<tr>
+<td><code>spoofer_fixed_point</code></td>
+<td>定点干扰</td>
+<td>✅ 运行中</td>
+</tr>
+<tr>
+<td><code>electronic_fence</code></td>
+<td>电子围栏（TracerAir侦测）</td>
+<td>✅ 运行中</td>
+</tr>
+<tr>
+<td><code>sysmanager</code></td>
+<td>系统管理（进程监控/健康检查）</td>
+<td>✅ 运行中</td>
+</tr>
+<tr>
+<td><code>ptz100_ai</code></td>
+<td>AI感知节点</td>
+<td>⚠️ 目录存在，暂空</td>
+</tr>
+<tr>
+<td><code>ptz100_fusion</code></td>
+<td>雷视融合节点</td>
+<td>⚠️ 目录存在，暂空</td>
+</tr>
+<tr>
+<td><code>ptz100_guide_ai</code></td>
+<td>AI引导节点</td>
+<td>⚠️ 目录存在，暂空</td>
+</tr>
+<tr>
+<td><code>radar_target_simulation</code></td>
+<td>雷达目标仿真测试</td>
+<td>✅ 测试用</td>
+</tr>
+</tbody>
+</table>
+<h3 id="launch">Launch文件启动的节点</h3>
+<p><strong>文件</strong>: <code>ros_ws/launch/ptz100_ros.launch</code></p>
+<pre><code class="language-xml">&lt;launch&gt;
+    &lt;node pkg=&quot;ptz100_ros&quot; exec=&quot;ptz100_ros&quot; output=&quot;screen&quot;/&gt;
+    &lt;node pkg=&quot;rvfusion_service&quot; exec=&quot;rvfusion_service&quot; output=&quot;screen&quot;/&gt;
+    &lt;node pkg=&quot;multiple_radar_calibration&quot; exec=&quot;multiple_radar_calibration&quot; output=&quot;screen&quot;/&gt;
+    &lt;node pkg=&quot;ptz_guider_ctl&quot; exec=&quot;ptz_guider_ctl&quot; output=&quot;screen&quot;/&gt;
+    &lt;node pkg=&quot;dhp100_link&quot; exec=&quot;dhp100_link&quot; output=&quot;screen&quot;/&gt;
+    &lt;node pkg=&quot;dhp100_tracker&quot; exec=&quot;dhp100_tracker&quot; output=&quot;screen&quot;/&gt;
+&lt;/launch&gt;
+</code></pre>
+<p><strong>说明</strong>:<br />
+- <code>ptz100_ros</code>: 主逻辑节点<br />
+- <code>rvfusion_service</code>: 雷视融合服务（外部ROS包）<br />
+- <code>multiple_radar_calibration</code>: 多雷达标定<br />
+- <code>ptz_guider_ctl</code>: PTZ引导控制（外部ROS包）<br />
+- <code>dhp100_link</code>: DHP100中程雷视链路<br />
+- <code>dhp100_tracker</code>: DHP100目标跟踪</p>
+<hr />
+<h2 id="iotsdk">八、IoT设备SDK</h2>
+<p><strong>位置</strong>: <code>iotDevices/</code></p>
+<h3 id="sdk">SDK列表</h3>
+<table>
+<thead>
+<tr>
+<th>SDK</th>
+<th>设备类型</th>
+<th>功能</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>laserHeSDK</code></td>
+<td>He系列激光测距仪</td>
+<td>激光测距、目标识别</td>
+</tr>
+<tr>
+<td><code>memsBr100aSDK</code></td>
+<td>MEMS BR100A微型雷达</td>
+<td>短程雷达数据采集</td>
+</tr>
+<tr>
+<td><code>ptzHepuSDK</code></td>
+<td>和普（Hepu）PTZ吊舱</td>
+<td>PTZ控制、视频流获取</td>
+</tr>
+<tr>
+<td><code>tempSensorPT100SDK</code></td>
+<td>PT100温度传感器</td>
+<td>温度监测</td>
+</tr>
+</tbody>
+</table>
+<h3 id="sdk_1">SDK结构</h3>
+<p>每个SDK通常包含：<br />
+- <code>include/</code>: 头文件<br />
+- <code>src/</code>: 实现文件<br />
+- <code>example/</code>: 示例代码<br />
+- <code>CMakeLists.txt</code>: 构建配置<br />
+- <code>README.md</code>: 使用说明</p>
+<hr />
+<h2 id="_19">九、整体数据流</h2>
+<h3 id="_20">系统数据流图</h3>
+<pre><code>                    ┌─────────────┐
+                    │  C2 上位机   │ TCP/alink协议
+                    └──────┬──────┘
+                           │ c2_network
+                           ▼
+┌──────────┐    alink   ┌──────────────────────────────────────────┐
+│  雷达网络 │──────────→│                  AGX                      │
+│(br100a等) │           │                                          │
+└──────────┘           │  ┌──────────┐    ROS Topic    ┌────────┐ │
+                       │  │ ros_app  │◄───────────────►│ 融合节 │ │
+┌──────────┐   RTSP    │  │  (消息   │                 │ 点等   │ │
+│ PTZ吊舱  │──────────→│  │  总线)   │                 └────────┘ │
+│(可见光+  │  SDK/TCP  │  └────┬─────┘                            │
+│ 红外)    │           │       │ 共享内存/ROS                     │
+└──────────┘           │  ┌────▼─────┐                            │
+                       │  │ alg_app  │ ai_alg_run7() PTZ引导       │
+┌──────────┐  alink    │  │ (AI算法) │──────────────────────────→ │ PTZ控制指令
+│SFL200干扰│──────────→│  └──────────┘                            │
+│ 设备     │           │                                          │
+└──────────┘           │  ┌──────────┐                            │
+                       │  │  alink   │──────────→ 雷达/C2上报     │
+┌──────────┐  USB/UART │  │ 协议层   │                            │
+│ TracerP/ │──────────→│  └──────────┘                            │
+│电子围栏  │           └──────────────────────────────────────────┘
+└──────────┘
+</code></pre>
+<h3 id="_21">关键数据流说明</h3>
+<ol>
+<li>
+<p><strong>雷达数据流</strong>:<br />
+<code>雷达设备 → eth_link → alink → ros_app → ROS Topic → 融合节点</code></p>
+</li>
+<li>
+<p><strong>PTZ控制流</strong>:<br />
+<code>AI算法 → send_ptz_control_xxx() → eth_link → PTZ设备</code></p>
+</li>
+<li>
+<p><strong>图像数据流</strong>:<br />
+<code>PTZ设备 → RTSP流 → image_get_thread → 共享内存 → AI算法</code></p>
+</li>
+<li>
+<p><strong>C2指令流</strong>:<br />
+<code>C2上位机 → c2_network → alink → 指令处理器 → 业务模块</code></p>
+</li>
+</ol>
+<hr />
+<h2 id="_22">十、配置与部署体系</h2>
+<h3 id="_23">配置文件</h3>
+<table>
+<thead>
+<tr>
+<th>配置文件</th>
+<th>路径</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>zlog配置</td>
+<td><code>config/log/*.conf</code></td>
+<td>各模块日志级别和文件路径</td>
+</tr>
+<tr>
+<td>开机自启</td>
+<td><code>config/boot/auto_boot_app.sh</code></td>
+<td>系统自启动脚本</td>
+</tr>
+<tr>
+<td>monit监控</td>
+<td><code>config/monit/monitrc</code></td>
+<td>进程守护配置</td>
+</tr>
+<tr>
+<td>NTP时间同步</td>
+<td><code>config/ntp/ntp.conf</code></td>
+<td>对时配置</td>
+</tr>
+<tr>
+<td>SQLite数据库</td>
+<td><code>config/sqlite/sqlite.db</code></td>
+<td>设备类型/标定参数</td>
+</tr>
+<tr>
+<td>OTA升级</td>
+<td><code>config/tools/ota_app/</code></td>
+<td>在线升级脚本</td>
+</tr>
+</tbody>
+</table>
+<h3 id="_24">版本命名规则</h3>
+<p>版本格式：<code>PTZ100-ROS-Vxx3.xx2.xx1</code></p>
+<ul>
+<li><strong>xx1</strong>: 同一功能下的优化迭代</li>
+<li><strong>xx2</strong>: 重大功能增加和致命bug修复</li>
+<li><strong>xx3</strong>: 重大架构变更</li>
+</ul>
+<p><strong>当前最新版本</strong>: V2.0.1.13 (2024-05-28)</p>
+<h3 id="_25">打包脚本</h3>
+<p>使用 <code>config/tools/publish-version.sh</code> 打包，生成文件名格式：</p>
+<pre><code>ptz100_agx-PTZ100-ROS-Vxx3.xx2.xx1-date.tar.gz
+</code></pre>
+<hr />
+<h2 id="_26">十一、关键设计模式与要点</h2>
+<h3 id="1">1. 双编译模式</h3>
+<p>通过 <code>#ifdef PTZ100_SUPPORTED_ROS</code> 宏区分ROS模式和裸机模式，同一套代码两种运行形态。</p>
+<p><strong>优势</strong>:<br />
+- 便于调试（裸机模式不依赖ROS环境）<br />
+- 便于单元测试<br />
+- 生产环境使用ROS模式，便于集成</p>
+<h3 id="2">2. 消息总线模式</h3>
+<p><code>ros_app</code> 作为C代码与ROS的唯一边界，所有跨进程通信通过ROS topic。</p>
+<p><strong>优势</strong>:<br />
+- 解耦ROS层与业务层<br />
+- 便于扩展新的ROS节点<br />
+- 统一的消息格式</p>
+<h3 id="3">3. 共享内存传图</h3>
+<p>使用 <code>ShmTransferFrame</code> 类进行AI节点与alg_app之间的零拷贝图像传输（替代旧的POSIX shm_open方式）。</p>
+<p><strong>优势</strong>:<br />
+- 零拷贝，性能高<br />
+- 支持多进程共享<br />
+- 自动帧同步</p>
+<h3 id="4">4. 任务队列模式</h3>
+<p>使用 <code>sysport_task</code> 基于POSIX消息队列（mq）实现异步任务分发。</p>
+<p><strong>优势</strong>:<br />
+- 解耦生产者和消费者<br />
+- 支持优先级队列<br />
+- 线程安全</p>
+<h3 id="5">5. 目标链表管理</h3>
+<p><code>ai_insert_target_to_head()</code> 将各种来源的目标插入链表，<code>ai_alg_thread</code> 统一消费。</p>
+<p><strong>优势</strong>:<br />
+- 统一的目标管理<br />
+- 支持多源融合<br />
+- 便于扩展新的目标源</p>
+<h3 id="6">6. 回调注册机制</h3>
+<p><code>ros_register_subscribe_cbk()</code> 允许业务模块注册ROS订阅的数据回调，解耦ROS层与业务层。</p>
+<p><strong>优势</strong>:<br />
+- 动态注册回调<br />
+- 支持多个回调函数<br />
+- 便于模块化设计</p>
+<h3 id="7">7. 设备抽象层</h3>
+<p>通过 <code>eth_link</code> 统一管理所有以太网设备，提供统一的设备发现、连接、通信接口。</p>
+<p><strong>优势</strong>:<br />
+- 设备类型可扩展<br />
+- 统一的设备管理<br />
+- 便于设备热插拔</p>
+<hr />
+<h2 id="_27">附录</h2>
+<h3 id="a">A. 关键文件索引</h3>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>路径</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>主入口</td>
+<td><code>src/main.c</code></td>
+<td>程序入口，启动序列</td>
+</tr>
+<tr>
+<td>ROS入口</td>
+<td><code>ros_ws/src/ptz100_ros/src/entry.cpp</code></td>
+<td>ROS模式入口</td>
+</tr>
+<tr>
+<td>AI算法</td>
+<td><code>src/app/alg_app/alg_app.cpp</code></td>
+<td>AI引导核心</td>
+</tr>
+<tr>
+<td>ROS适配</td>
+<td><code>src/app/ros_app/ros_app.cpp</code></td>
+<td>ROS消息总线</td>
+</tr>
+<tr>
+<td>Alink协议</td>
+<td><code>src/srv/alink/alink.c</code></td>
+<td>通信协议核心</td>
+</tr>
+<tr>
+<td>PTZ控制</td>
+<td><code>src/srv/eth_link/ptz_protocol/ptz_control.c</code></td>
+<td>PTZ控制协议</td>
+</tr>
+</tbody>
+</table>
+<h3 id="b">B. 关键宏定义</h3>
+<table>
+<thead>
+<tr>
+<th>宏</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>PTZ100_SUPPORTED_ROS</code></td>
+<td>启用ROS模式编译</td>
+</tr>
+<tr>
+<td><code>USE_SHM_TRANSFER_API</code></td>
+<td>使用共享内存API</td>
+</tr>
+<tr>
+<td><code>USE_NEW_VIDEO_API</code></td>
+<td>使用新的视频API（GStreamer）</td>
+</tr>
+<tr>
+<td><code>MONITOR_GUIDE_PROCESS</code></td>
+<td>监控引导过程</td>
+</tr>
+<tr>
+<td><code>MONITOR_AUTEL_AI</code></td>
+<td>监控Autel AI</td>
+</tr>
+</tbody>
+</table>
+<h3 id="c">C. 版本历史</h3>
+<p>详见 <code>release-note.txt</code> 文件。</p>
+<hr />
+<h2 id="_28">总结</h2>
+<p>PTZ100_AGX是一个复杂的边缘计算系统，集成了雷达、PTZ、激光、干扰设备等多种硬件，通过AI算法实现智能反无人机功能。系统采用ROS2作为消息总线，C/C++混合编程，支持双模式运行，具有良好的模块化和可扩展性。</p>
+<p><strong>核心特点</strong>:<br />
+- ✅ 多设备统一管理<br />
+- ✅ AI智能引导<br />
+- ✅ 雷视融合感知<br />
+- ✅ 统一指控接口<br />
+- ✅ 模块化设计<br />
+- ✅ 双模式运行</p>
+<hr />
+<p><strong>文档维护</strong>: 请根据代码变更及时更新本文档。</p></article>
+    <script>
+        // Sync theme with parent page
+        try {
+            var parentTheme = window.parent.document.documentElement.getAttribute('data-theme');
+            if (parentTheme) document.documentElement.setAttribute('data-theme', parentTheme);
+            // Listen for theme changes
+            var observer = new MutationObserver(function(mutations) {
+                mutations.forEach(function(m) {
+                    if (m.attributeName === 'data-theme') {
+                        var t = window.parent.document.documentElement.getAttribute('data-theme');
+                        if (t) document.documentElement.setAttribute('data-theme', t);
+                    }
+                });
+            });
+            observer.observe(window.parent.document.documentElement, { attributes: true });
+        } catch(e) {}
+    </script>
+</body>
+</html>

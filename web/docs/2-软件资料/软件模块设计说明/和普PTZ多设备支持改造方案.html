@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ptz_service 多设备支持改造方案</title>
+    <link rel="stylesheet" href="../../css/markdown.css">
+</head>
+<body>
+    <article class="markdown-body"><hr />
+<p>name: PTZ multi-device support<br />
+overview: 将 ptz_service 从单设备架构改为多设备架构，参考 laser_service 的 devListApi_ 模式，使用 unordered_map 按 SN 管理多个 PtzDeviceBase 实例，支持 Z50 + DMA35 或双 Z50 同时在线。<br />
+todos:<br />
+  - id: factory<br />
+    content: "ptzDevice.h: createDevice 增加 sn 参数"<br />
+    status: completed<br />
+  - id: hepu-ctor<br />
+    content: "ptzDeviceHepu: 构造函数接受 sn，loadPtzConfig* 按 SN 查找配置而非写死 index 0"<br />
+    status: completed<br />
+  - id: hepu-resource<br />
+    content: "ptzDeviceHepu: SHM 命名和 RTSP 端口按设备索引动态生成"<br />
+    status: completed<br />
+  - id: rosservice-map<br />
+    content: "rosService.h: deviceApi_ 改为 unordered_map devListApi_"<br />
+    status: completed<br />
+  - id: rosservice-init<br />
+    content: "rosService.cpp init(): 遍历配置创建多个设备实例"<br />
+    status: completed<br />
+  - id: rosservice-dispatch<br />
+    content: "rosService.cpp: 8 个回调函数改为按 dev_id 路由到对应设备"<br />
+    status: completed<br />
+  - id: rosservice-deinit<br />
+    content: "rosService.cpp deInit(): 遍历清理所有设备"<br />
+    status: completed<br />
+  - id: cfg-getbysn<br />
+    content: 不需要：DevicesCfgBase 已内置 getBySn 方法，PtzDevicesCfg 直接继承可用<br />
+    status: cancelled<br />
+  - id: hepu-viewcfg-persn<br />
+    content: "ptzHepuViewCfg: 改为按 SN 存储每台设备独立的 visible_table + thermal_table，查询接口加 sn 参数"<br />
+    status: completed<br />
+  - id: hepu-ctrl-distview<br />
+    content: "HepuPtzCtrl: 新增 deviceSn_ 成员，distanceToView 用 deviceSn_ 查对应设备的 FOV 表，去掉 getByIndex(0)"<br />
+    status: completed<br />
+isProject: false</p>
+<hr />
+<h1 id="ptz_service">ptz_service 多设备支持改造方案</h1>
+<h2 id="_1">现状分析</h2>
+<p>你说得对——<code>iotDevices/ptzHepuSDK</code> 的 <code>HepuPtz</code>/<code>HepuPtzCtrl</code> 不是单例，每个实例持有独立的 <code>DevHandle</code>、IP、连接状态，<strong>SDK 层已支持多设备</strong>。瓶颈在 <code>ptz_service</code> 层：</p>
+<ul>
+<li><code>RosService</code> 单例只持有一个 <code>std::unique_ptr&lt;PtzDeviceBase&gt; deviceApi</code>_</li>
+<li><code>PtzDeviceHepu</code> 构造函数里 <code>loadPtzConfigIp/Sn/Type</code> 写死 <code>getByIndex(0, ...)</code></li>
+<li>SHM 命名写死 <code>generateShmName(0, ...)</code>, RTSP 推流端口写死 <code>5410/5411</code></li>
+</ul>
+<h2 id="laser_service">参考架构：laser_service 模式</h2>
+<pre><code class="language-mermaid">flowchart TB
+  subgraph rosService[RosService Singleton]
+    devMap[&quot;devListApi_: unordered_map&lt;sn, unique_ptr&gt;&quot;]
+  end
+  subgraph dispatch[ROS Callback Dispatch]
+    cb[&quot;cb_xxx(input)&quot;]
+    cb --&gt;|&quot;input.sn empty&quot;| first[&quot;devListApi_.begin()&quot;]
+    cb --&gt;|&quot;input.sn match&quot;| find[&quot;devListApi_.find(sn)&quot;]
+  end
+  subgraph config[YAML Config]
+    yaml[&quot;laserDevicesCfg.yaml&lt;br/&gt;device array&quot;]
+  end
+  config --&gt;|readList| rosService
+  rosService --&gt; dispatch
+</code></pre>
+<p><strong>关键点</strong>：topic 不按设备分，所有设备共享同一组 topic 名称，通过消息中的 <code>sn</code>/<code>dev_id</code> 字段路由到对应设备。PTZ 消息已有 <code>dev_id</code> 和 <code>photoelectricity_no</code> 字段，可复用。</p>
+<h2 id="5">改造方案（共 5 个文件）</h2>
+<h3 id="1-ptzdevice-createdevice-sn">1. PtzDevice 工厂：<code>createDevice</code> 增加 SN 参数</h3>
+<p><strong>文件</strong>: <a href="ros_ws/src/ptz_service/src/ptzDevice/ptzDevice.h">ptzDevice.h</a></p>
+<ul>
+<li><code>createDevice(DeviceType type, const std::string&amp; sn)</code> 增加 <code>sn</code> 参数传入</li>
+<li>内部 <code>std::make_unique&lt;PtzDeviceHepu&gt;(sn)</code> 将 SN 传给设备实例</li>
+</ul>
+<h3 id="2-ptzdevicehepu-indexsn-index-0">2. PtzDeviceHepu：构造函数接受设备 index/SN，不再写死 index 0</h3>
+<p><strong>文件</strong>: <a href="ros_ws/src/ptz_service/src/ptzDevice/ptzDeviceHepu.h">ptzDeviceHepu.h</a>, <a href="ros_ws/src/ptz_service/src/ptzDevice/ptzDeviceHepu.cpp">ptzDeviceHepu.cpp</a></p>
+<ul>
+<li>构造函数改为 <code>PtzDeviceHepu(const std::string&amp; sn)</code>，存储 SN</li>
+<li><code>loadPtzConfigIp/Sn/Type</code> 改为通过 SN 查找配置（遍历 <code>ptzCfgApi</code>_ 按 SN 匹配），而非写死 <code>getByIndex(0, ...)</code></li>
+<li>SHM 命名：根据设备在 YAML 中的索引（0 或 1）动态生成 <code>generateShmName(deviceIndex, ...)</code>, 不再写死 0</li>
+<li>RTSP 推流端口：根据设备索引偏移，如 index 0 用 5410/5411，index 1 用 5412/5413</li>
+<li>状态上报时填充正确的 <code>dev_id</code>（基于设备索引或通过 SN 映射）</li>
+</ul>
+<h3 id="3-rosservicedeviceapi_-unordered_map">3. RosService：deviceApi_ 改为 unordered_map</h3>
+<p><strong>文件</strong>: <a href="ros_ws/src/ptz_service/src/rosService/rosService.h">rosService.h</a>, <a href="ros_ws/src/ptz_service/src/rosService/rosService.cpp">rosService.cpp</a></p>
+<p><strong>头文件改动</strong>:</p>
+<ul>
+<li><code>std::unique_ptr&lt;PtzDeviceBase&gt; deviceApi</code><em> 改为 <code>std::unordered_map&lt;std::string, std::unique_ptr&lt;PtzDeviceBase&gt;&gt; devListApi</code></em></li>
+<li>新增 <code>PtzDeviceBase* findDevice(uint32_t dev_id)</code> 或 <code>findDevice(const std::string&amp; sn)</code> 辅助查找方法</li>
+</ul>
+<p><strong>init() 改动</strong>:</p>
+<ul>
+<li>遍历 <code>ptzCfgApi_.getCount()</code> 个设备，对每个调用 <code>getByIndex(i, ptzDev)</code></li>
+<li>为每个设备创建 <code>PtzDevice::createDevice(devType, ptzDev.sn)</code> 并 <code>try_emplace(ptzDev.sn, ...)</code></li>
+<li>topic 名称保持不变（不按设备分 topic，参考 laser_service）</li>
+</ul>
+<p><strong>回调改动（8 个 cb_ 函数）</strong>:</p>
+<ul>
+<li>控制类回调（<code>cb_ptz_guidance_cmd</code>, <code>cb_ptz_motion_cmd</code>, <code>cb_ptz_lens_cmd</code>, <code>cb_ptz_track_cmd</code>, <code>cb_ptz_manual_lock_target</code>, <code>cb_ptz_switch_track</code>）：消息中有 <code>dev_id</code>/<code>photoelectricity_no</code>，通过 <code>dev_id</code> 查找对应设备；如果 <code>dev_id == 0</code> 则路由到默认第一台（<code>begin()</code>）</li>
+<li>AI 检测回调（<code>cb_visible_track</code>, <code>cb_infrared_track</code>）：<code>AiTargetInfo</code> 消息需要确认是否有设备标识字段。如果没有，暂时路由到默认第一台设备（与 laser_service 对 PTZ 算法指令的处理一致）</li>
+</ul>
+<p><strong>发布改动</strong>:</p>
+<ul>
+<li><code>pub_ptz_status</code>、<code>pub_ptz_device_info</code> 等发布函数不变，多台设备各自调用同一个 publisher 发布，消息中的 <code>dev_id</code>/<code>sn</code> 字段区分来源</li>
+</ul>
+<p><strong>deInit() 改动</strong>:</p>
+<ul>
+<li>遍历 <code>devListApi</code>_ 逐个 reset，然后 clear</li>
+</ul>
+<h3 id="4-ptzdevicescfg-getbysn">4. ~~PtzDevicesCfg：新增 getBySn 方法~~ — 不需要</h3>
+<p><code>DevicesCfgBase&lt;T&gt;</code> 基类已内置 <code>getBySn</code> 和 <code>updateBySn</code> 方法（<code>devicesCfgBase.h</code> 第 268 行），<code>PtzDevicesCfg</code> 直接继承可用，与 laser_service 调用 <code>g_laserDevCfgApi.getBySn()</code> 方式完全一致。<strong>无需新增任何方法。</strong></p>
+<h3 id="5-dev_id-a">5. dev_id 路由策略 — 确定方案 A</h3>
+<p><strong>结论</strong>：<code>dev_id</code> = YAML 设备索引（0, 1）。</p>
+<p><strong>dev_id 上报链路分析</strong>：<code>dev_id</code> 不是随便填的占位字段。在感知目标上报（0xE3 协议）链路中，<code>dev_id</code> 会从引导节点 → ros_app → alink → C2 完整透传：</p>
+<ul>
+<li><code>ptz_guider_ctl</code> 发布 <code>PtzGuidingInfoVis</code>（含 <code>dev_id</code>）</li>
+<li><code>ros_app::ptz_guiding_vis_callback</code> 将 <code>dev_id</code> 拷贝到 <code>alink_ptz_tracked.dev_id</code></li>
+<li><code>track_pkg_target_info_perception</code>（<code>alink_target.c:178</code>）将 <code>dev_id</code> 原样打包到 0xE3 二进制包发给 C2</li>
+</ul>
+<p><strong>具体做法</strong>：</p>
+<ul>
+<li><strong>上报</strong>：<code>PtzDeviceHepu</code> 上报状态时 <code>dev_id = deviceIndex</code>_（设备在 YAML 中的索引）</li>
+<li><strong>接收</strong>：<code>RosService</code> 回调中按 <code>input-&gt;dev_id</code> 查 <code>indexToSnMap_[dev_id]</code> → 路由到对应 <code>devListApi_[sn]</code></li>
+<li><strong>兼容</strong>：单台设备时 <code>dev_id = 0</code>，与当前行为一致；<code>dev_id == 0</code> 且 map 中只有 1 个 entry 时路由到唯一设备</li>
+</ul>
+<h2 id="_2">资源隔离汇总</h2>
+<table>
+<thead>
+<tr>
+<th>资源</th>
+<th>当前</th>
+<th>改造后</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SHM</td>
+<td><code>/shm_0_zoom_0</code>, <code>/shm_0_infrared_0</code></td>
+<td><code>/shm_{idx}_zoom_0</code>, <code>/shm_{idx}_infrared_0</code></td>
+</tr>
+<tr>
+<td>RTSP 推流端口</td>
+<td>5410/5411</td>
+<td>5410+idx<em>2 / 5411+idx</em>2</td>
+</tr>
+<tr>
+<td>ROS Topic</td>
+<td>全局共享</td>
+<td>保持共享，消息内 dev_id/sn 区分</td>
+</tr>
+<tr>
+<td>HepuPtz 实例</td>
+<td>1 个</td>
+<td>N 个，各自独立 IP/handle</td>
+</tr>
+</tbody>
+</table>
+<h3 id="6-ptzhepuviewcfg-sn-fov">6. ptzHepuViewCfg：改为按 SN 存储每台设备独立 FOV 表</h3>
+<p><strong>文件</strong>: <a href="iotDevices/ptzHepuSDK/include/ptzHepuViewCfg.h">ptzHepuViewCfg.h</a>, <a href="iotDevices/ptzHepuSDK/src/ptzHepuViewCfg.cpp">ptzHepuViewCfg.cpp</a></p>
+<p><strong>问题</strong>：当前 <code>PtzHepuViewCfg</code> 单例存储 3 张全局共享表（visible / uncooled_thermal / cooled_thermal）。但不同 PTZ 设备即使类型相同（如都是非制冷），可见光和热像镜头参数也可能不同，FOV 表不能共用。</p>
+<p><strong>YAML 新格式</strong>（一份文件，按 SN 分 section）：</p>
+<pre><code class="language-yaml"># ptzHepuViewCfg.yaml
+devices:
+  - sn: &quot;SN-PTZ-A1234&quot;
+    visible_table:
+      100: 20.0
+      200: 12.0
+      # ...
+    thermal_table:
+      100: 18.46
+      200: 13.85
+      # ...
+
+  - sn: &quot;SN-PTZ-B5678&quot;
+    visible_table:
+      100: 15.0
+      200: 10.0
+      # ...
+    thermal_table:
+      100: 13.39
+      200: 13.39
+      # ...
+</code></pre>
+<p>每台设备 2 张表：<code>visible_table</code> + <code>thermal_table</code>（不再区分 cooled/uncooled，每台设备的热像就是它自己的那张表）。</p>
+<p><strong>PtzHepuViewCfg 类改动</strong>：</p>
+<ul>
+<li>成员变量从 3 张 map 改为按 SN 索引的结构：</li>
+</ul>
+<pre><code class="language-cpp">  struct DeviceViewTables {
+      std::map&lt;uint32_t, double&gt; visibleTable;
+      std::map&lt;uint32_t, double&gt; thermalTable;
+  };
+  std::unordered_map&lt;std::string, DeviceViewTables&gt; devTablesMap_;
+
+
+</code></pre>
+<ul>
+<li>查询接口增加 SN 参数：</li>
+</ul>
+<pre><code class="language-cpp">  double getVisibleViewAngle(const std::string&amp; sn, uint32_t distance);
+  double getThermalViewAngle(const std::string&amp; sn, uint32_t distance);
+
+
+</code></pre>
+<ul>
+<li><code>loadCfg</code> 解析新的 YAML 格式</li>
+<li><code>createDefaultCfg</code> 生成新格式默认文件（当前 Z50 数据作为第一台设备默认值）</li>
+<li>向后兼容：如果 YAML 中找不到某 SN，使用 <code>devTablesMap_.begin()</code> 的表作为 fallback 并 LOG_WARN</li>
+</ul>
+<h3 id="7-hepuptzctrldistancetoview-sn">7. HepuPtzCtrl：distanceToView 改用设备 SN 查询</h3>
+<p><strong>文件</strong>: <a href="iotDevices/ptzHepuSDK/include/ptz_hepu_ctrl.h">ptz_hepu_ctrl.h</a>, <a href="iotDevices/ptzHepuSDK/src/ptz_hepu_ctrl.cpp">ptz_hepu_ctrl.cpp</a></p>
+<ul>
+<li><code>HepuPtzCtrl</code> 新增成员 <code>std::string deviceSn</code>_ 和 setter <code>void setDeviceSn(const std::string&amp; sn)</code></li>
+<li><code>PtzDeviceHepu</code> 构造时调用 <code>deviceApi_-&gt;ctrl-&gt;setDeviceSn(deviceSn_)</code></li>
+<li><code>distanceToView</code> 彻底简化，去掉 <code>getByIndex(0)</code> 和制冷/非制冷判断：</li>
+</ul>
+<pre><code class="language-cpp">case VT_LIGHT:
+    view = cfgInstance.getVisibleViewAngle(deviceSn_, distUint32);
+    break;
+case VT_IRD:
+    view = cfgInstance.getThermalViewAngle(deviceSn_, distUint32);
+    break;
+</code></pre>
+<h2 id="_3">不涉及的模块</h2>
+<ul>
+<li><code>ptzDevicesCfg.yaml</code> — 已支持多设备配置，无需修改</li>
+<li><code>sysmonit</code> — C++ 后端动态遍历设备列表，功能不受影响（前端帮助文档可选更新）</li>
+<li>AI/引导团队代码 — 不修改</li>
+</ul></article>
+    <script>
+        // Sync theme with parent page
+        try {
+            var parentTheme = window.parent.document.documentElement.getAttribute('data-theme');
+            if (parentTheme) document.documentElement.setAttribute('data-theme', parentTheme);
+            // Listen for theme changes
+            var observer = new MutationObserver(function(mutations) {
+                mutations.forEach(function(m) {
+                    if (m.attributeName === 'data-theme') {
+                        var t = window.parent.document.documentElement.getAttribute('data-theme');
+                        if (t) document.documentElement.setAttribute('data-theme', t);
+                    }
+                });
+            });
+            observer.observe(window.parent.document.documentElement, { attributes: true });
+        } catch(e) {}
+    </script>
+</body>
+</html>

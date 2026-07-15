@@ -1,0 +1,1991 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>sysmonit 方案设计文档</title>
+    <link rel="stylesheet" href="../../css/markdown.css">
+</head>
+<body>
+    <article class="markdown-body"><h1 id="sysmonit">sysmonit 方案设计文档</h1>
+<blockquote>
+<p><strong>项目</strong>：PTZ100 AGX 系统运维监控<br />
+<strong>模块名称</strong>：sysmonit<br />
+<strong>源码路径</strong>：<code>ros_ws/src/sysmonit</code><br />
+<strong>文档版本</strong>：v1.1<br />
+<strong>日期</strong>：2026-06-09</p>
+</blockquote>
+<hr />
+<h2 id="_1">目录</h2>
+<ol>
+<li><a href="#1-概述">概述</a> — 含 <strong>整体系统架构图</strong></li>
+<li><a href="#2-技术栈">技术栈</a> — 含前后端技术栈总览图</li>
+<li><a href="#3-软件架构">软件架构</a> — 含分层架构、进程模块、线程模型、认证路由图</li>
+<li><a href="#4-视频页数据流重点">视频页数据流（重点）</a> — 含端到端视频链路、轮询时序、场景 A/B 状态图</li>
+<li><a href="#5-rest-api-设计">REST API 设计</a> — 含 API 模块 mindmap、登录时序图</li>
+<li><a href="#6-ros-集成">ROS 集成</a> — 含 ROS 通信拓扑图</li>
+<li><a href="#7-前端页面结构">前端页面结构</a> — 含 SPA 导航结构图</li>
+<li><a href="#8-部署与运行">部署与运行</a> — 含部署架构、进程启停链路图</li>
+<li><a href="#9-安全与运维注意">安全与运维注意</a></li>
+<li><a href="#10-扩展开发建议">扩展开发建议</a></li>
+</ol>
+<hr />
+<h2 id="1">1. 概述</h2>
+<h3 id="11">1.1 定位</h3>
+<p><strong>sysmonit</strong> 是运行在 AGX 上的 <strong>ROS 2 节点</strong>，在进程内启动轻量级 <strong>HTTP 服务</strong>（默认端口 <strong>12345</strong>），对外提供：</p>
+<ul>
+<li><strong>Web 仪表盘</strong>：浏览器访问 <code>http://&lt;AGX_IP&gt;:12345/</code>，单页应用覆盖系统概览、进程管理、设备配置、ROS 诊断、视频流、Bag 录制、网络抓包等</li>
+<li><strong>JSON REST API</strong>：供运维脚本或第三方工具调用（需登录 Token）</li>
+</ul>
+<p>sysmonit <strong>不承载业务算法</strong>，定位为现场调试与运维的<strong>统一观测与控制入口</strong>。</p>
+<h3 id="12">1.2 典型使用场景</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>现场调试</td>
+<td>浏览器查看 CPU/内存、进程状态、视频链路 FPS、SHM 帧活跃情况</td>
+</tr>
+<tr>
+<td>进程运维</td>
+<td>通过 Web 或 API 对 18 个 ROS 进程执行 start/stop/restart（对接 monit）</td>
+</tr>
+<tr>
+<td>配置管理</td>
+<td>在线编辑 <code>/home/skyfend/config</code> 下 YAML/XML 等配置文件</td>
+</tr>
+<tr>
+<td>问题定位</td>
+<td>ROS Bag 录制/回放/绘图；tcpdump 抓包 + Alink 报文解析</td>
+</tr>
+<tr>
+<td>视频诊断</td>
+<td>MediaMTX 代理 RTSP、WebRTC 低延迟预览、和普 PTZ 场景 A/B 切换</td>
+</tr>
+</tbody>
+</table>
+<h3 id="13">1.3 整体系统架构图</h3>
+<p>下图从 <strong>AGX 整机视角</strong> 展示 sysmonit 在运维体系中的位置：浏览器/脚本通过 HTTP 访问 sysmonit，sysmonit 再桥接 ROS 生态、文件系统、monit 与外部流媒体服务。</p>
+<pre><code class="language-mermaid">flowchart TB
+  subgraph clients [访问端]
+    Browser[&quot;浏览器&lt;br/&gt;index.html SPA&quot;]
+    Script[&quot;运维脚本 / curl&quot;]
+  end
+
+  subgraph agx [AGX 主机]
+    subgraph sysmonit_proc [sysmonit 进程 :12345]
+      direction TB
+      FE[&quot;静态资源 web/index.html&quot;]
+      API[&quot;REST API /api/*&quot;]
+      ROSN[&quot;rclcpp::Node&lt;br/&gt;订阅/发布&quot;]
+      CACHE[&quot;内存缓存&lt;br/&gt;PTZ / AI / FOV / Video&quot;]
+      BG[&quot;视频缓存线程 10s&quot;]
+      FE --- API
+      API --- CACHE
+      ROSN --&gt; CACHE
+      BG --&gt; CACHE
+    end
+
+    subgraph ros_nodes [ROS 2 业务节点 18+]
+      PS[ptz_service]
+      AI[ptz100_ai]
+      NG[nexus_gateway]
+      OTH[&quot;ptz100_ros / laser_service&lt;br/&gt;rvfusion / sfl200 / ...&quot;]
+    end
+
+    subgraph infra [系统基础设施]
+      Monit[monit]
+      Boot[&quot;boot 脚本&lt;br/&gt;skyfend-ptz100.sh&quot;]
+      FS[&quot;/home/skyfend/config&lt;br/&gt;rosbag / capture&quot;]
+      TMP[&quot;/tmp/*.json&lt;br/&gt;pipeline / nexus RTMP&quot;]
+      SHM[&quot;POSIX SHM&lt;br/&gt;/shm_*&quot;]
+      Proc[&quot;/proc / /tmp/*.pid&quot;]
+    end
+
+    subgraph media [流媒体]
+      MTX[&quot;MediaMTX&lt;br/&gt;RTSP :9554 / WHEP :8889&quot;]
+      PTZcam[&quot;PTZ 相机&lt;br/&gt;RTSP :554&quot;]
+    end
+  end
+
+  Browser --&gt;|&quot;HTTP GET /&quot;| FE
+  Browser --&gt;|&quot;HTTP /api/* + Token&quot;| API
+  Browser --&gt;|&quot;WebRTC WHEP :8889&lt;br/&gt;不经 sysmonit&quot;| MTX
+  Script --&gt; API
+
+  API --&gt;|&quot;popen/system/fork&quot;| Monit
+  API --&gt; Boot
+  API --&gt; FS
+  API --&gt; TMP
+  API --&gt; SHM
+  API --&gt; Proc
+  API --&gt;|&quot;ros2 CLI&quot;| ros_nodes
+
+  ROSN &lt;--&gt;|&quot;Topic 订阅/发布&quot;| ros_nodes
+  PS --&gt; TMP
+  PS --&gt; SHM
+  NG --&gt; TMP
+  PS --&gt; PTZcam
+  MTX --&gt;|&quot;拉流代理&quot;| PTZcam
+  MTX --&gt; SHM
+
+  Monit --&gt; Boot
+  Boot --&gt; ros_nodes
+</code></pre>
+<h3 id="14">1.4 与周边模块关系（简图）</h3>
+<pre><code class="language-mermaid">flowchart LR
+  subgraph sysmonit [sysmonit]
+    HTTP[HTTP :12345]
+    ROS[ROS Node]
+  end
+
+  Browser[浏览器] --&gt; HTTP
+  Monit[monit / boot 脚本] &lt;--&gt;|启停进程| HTTP
+  ptz_service --&gt;|/ptz_device_info 等| ROS
+  ptz100_ai --&gt;|/visiblelight_track_objs| ROS
+  nexus_gateway --&gt;|/tmp/nexus_stream_urls.json| HTTP
+  ptz_service --&gt;|/tmp/video_pipeline_status.json| HTTP
+  MediaMTX[MediaMTX :9554/:8889] &lt;--&gt;|RTSP/WHEP| Browser
+</code></pre>
+<hr />
+<h2 id="2">2. 技术栈</h2>
+<h3 id="21">2.1 后端</h3>
+<table>
+<thead>
+<tr>
+<th>层次</th>
+<th>技术</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>语言</td>
+<td><strong>C++17</strong></td>
+<td>主业务逻辑</td>
+</tr>
+<tr>
+<td>ROS</td>
+<td><strong>rclcpp</strong> (Humble)</td>
+<td>节点生命周期、Topic 订阅/发布、图 API</td>
+</tr>
+<tr>
+<td>HTTP 框架</td>
+<td><strong>libhv</strong> (<code>thirdpart/libhv</code>)</td>
+<td>多线程 <code>HttpServer</code>，4 worker / 最大 32 连接 / keepalive 5s</td>
+</tr>
+<tr>
+<td>消息类型</td>
+<td><strong>skyfend_interfaces</strong></td>
+<td>PTZ、AI、设备列表等自定义消息</td>
+</tr>
+<tr>
+<td>配置读取</td>
+<td><strong>yamlConfig</strong></td>
+<td>读取 <code>ptzDevicesCfg.yaml</code> 等设备配置</td>
+</tr>
+<tr>
+<td>日志</td>
+<td><strong>appLog</strong></td>
+<td>统一日志宏</td>
+</tr>
+<tr>
+<td>辅助脚本</td>
+<td><strong>Python 3</strong></td>
+<td><code>bag_reader.py</code>（Bag 解析）、<code>alink_parser.py</code>（pcap 解析）</td>
+</tr>
+<tr>
+<td>系统调用</td>
+<td><code>popen</code> / <code>system</code> / <code>fork</code></td>
+<td>执行 <code>ros2</code> CLI、monit、tcpdump 等</td>
+</tr>
+</tbody>
+</table>
+<p><strong>特点</strong>：无独立 Web 框架（如 Flask/FastAPI），HTTP 与 ROS 同进程；JSON 由 <code>ostringstream</code> 手工拼接，无第三方 JSON 库。</p>
+<h3 id="22">2.2 前端</h3>
+<table>
+<thead>
+<tr>
+<th>层次</th>
+<th>技术</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>形态</td>
+<td><strong>单文件 SPA</strong></td>
+<td><code>web/index.html</code>，内联 HTML + CSS + JavaScript</td>
+</tr>
+<tr>
+<td>构建</td>
+<td><strong>无</strong></td>
+<td>无 npm / webpack / Vite，改前端后 <code>colcon install</code> 即可</td>
+</tr>
+<tr>
+<td>网络</td>
+<td><strong>Fetch API</strong></td>
+<td><code>fetch(API_BASE + path, { headers: { Authorization: 'Bearer ' + token } })</code></td>
+</tr>
+<tr>
+<td>图表</td>
+<td><strong>自研 MiniChart</strong></td>
+<td>Canvas 绘制 Bag 曲线，避免 CDN 依赖</td>
+</tr>
+<tr>
+<td>视频播放</td>
+<td><strong>WebRTC WHEP</strong></td>
+<td>浏览器原生 <code>RTCPeerConnection</code>，对接 MediaMTX <code>:8889</code></td>
+</tr>
+<tr>
+<td>国际化</td>
+<td><strong>内联 i18n 字典</strong></td>
+<td><code>LANG.en</code> / <code>LANG.zh</code>，localStorage 持久化语言</td>
+</tr>
+<tr>
+<td>状态持久化</td>
+<td><strong>localStorage</strong></td>
+<td>如 <code>videoAgxIface</code>（eth0/eth1 选择）</td>
+</tr>
+</tbody>
+</table>
+<p><strong>特点</strong>：深色运维风格 UI；Tab 切换通过 <code>.page</code> / <code>.page.active</code> CSS 类控制显示，无 React/Vue 框架。</p>
+<h3 id="23">2.3 前后端技术栈总览</h3>
+<pre><code class="language-mermaid">flowchart LR
+  subgraph frontend [前端 - 浏览器]
+    HTML[&quot;HTML5 单页&quot;]
+    CSS[&quot;内联 CSS&lt;br/&gt;深色运维主题&quot;]
+    JS[&quot;原生 JavaScript&quot;]
+    Fetch[&quot;Fetch API + Bearer Token&quot;]
+    Canvas[&quot;Canvas MiniChart&quot;]
+    WebRTC[&quot;WebRTC WHEP&lt;br/&gt;RTCPeerConnection&quot;]
+    LS[&quot;localStorage&lt;br/&gt;语言 / eth0|eth1&quot;]
+    HTML --&gt; JS
+    CSS --&gt; HTML
+    JS --&gt; Fetch
+    JS --&gt; Canvas
+    JS --&gt; WebRTC
+    JS --&gt; LS
+  end
+
+  subgraph backend [后端 - sysmonit 进程]
+    Main[&quot;main.cpp&lt;br/&gt;rclcpp Node&quot;]
+    HServer[&quot;http_server.cpp&lt;br/&gt;libhv HttpServer&quot;]
+    HApi[&quot;http_api.cpp&lt;br/&gt;业务 Handler&quot;]
+    Stats[&quot;sys_stats.cpp&lt;br/&gt;/proc 采集&quot;]
+    Conc[&quot;concurrency.cpp&lt;br/&gt;全局互斥&quot;]
+    Py[&quot;Python 脚本&lt;br/&gt;bag / alink&quot;]
+    Main --&gt; HApi
+    HServer --&gt; HApi
+    HApi --&gt; Stats
+    HApi --&gt; Conc
+    HApi --&gt; Py
+  end
+
+  subgraph deps [依赖库/服务]
+    LibHV[&quot;libhv.so&quot;]
+    RCL[&quot;rclcpp / skyfend_interfaces&quot;]
+    Yaml[&quot;yamlConfig&quot;]
+    ROS2CLI[&quot;ros2 CLI&quot;]
+    LibHV --&gt; HServer
+    RCL --&gt; Main
+    Yaml --&gt; HApi
+    ROS2CLI --&gt; HApi
+  end
+
+  Fetch &lt;--&gt;|&quot;JSON REST :12345&quot;| HServer
+  HServer --&gt;|&quot;静态文件&quot;| HTML
+</code></pre>
+<h3 id="24">2.4 运行期外部依赖</h3>
+<table>
+<thead>
+<tr>
+<th>依赖</th>
+<th>用途</th>
+<th>是否必须</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ROS 2 Humble + <code>ros2</code> CLI</td>
+<td>话题诊断、Bag 录制</td>
+<td>是</td>
+</tr>
+<tr>
+<td>monit + boot 脚本</td>
+<td>进程启停</td>
+<td>进程管理功能需要</td>
+</tr>
+<tr>
+<td>MediaMTX</td>
+<td>RTSP 代理（9554）、WebRTC WHEP（8889）</td>
+<td>视频页需要</td>
+</tr>
+<tr>
+<td>tcpdump</td>
+<td>网络抓包</td>
+<td>抓包页需要</td>
+</tr>
+<tr>
+<td>nexus_gateway</td>
+<td>写入 <code>/tmp/nexus_stream_urls.json</code></td>
+<td>Nexus RTMP 卡片需要</td>
+</tr>
+<tr>
+<td>ptz_service / ptz100_ai</td>
+<td>写入 pipeline 状态、发布 ROS Topic</td>
+<td>视频诊断需要</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="3">3. 软件架构</h2>
+<h3 id="31">3.1 分层架构图</h3>
+<p>sysmonit 采用 <strong>单进程、多线程、前后端一体</strong> 的分层结构，HTTP 与 ROS 共享同一地址空间，通过内存缓存解耦高频 ROS 数据与低频 HTTP 轮询。</p>
+<pre><code class="language-mermaid">flowchart TB
+  subgraph presentation [表现层 Presentation]
+    UI[&quot;web/index.html&lt;br/&gt;9 个功能 Tab SPA&quot;]
+  end
+
+  subgraph gateway [接入层 Gateway]
+    Pre[&quot;preprocessor&lt;br/&gt;Token 鉴权 / 路径规范化&quot;]
+    Static[&quot;静态文件服务&lt;br/&gt;index.html&quot;]
+    Route[&quot;libhv 路由表&lt;br/&gt;register_routes&quot;]
+  end
+
+  subgraph business [业务层 Business - http_api.cpp]
+    HOverview[&quot;overview / nodes&quot;]
+    HDevices[&quot;devices / eth1&quot;]
+    HRos[&quot;ros / bag / capture&quot;]
+    HVideo[&quot;video / ptz&quot;]
+    HConfig[&quot;config&quot;]
+  end
+
+  subgraph service [服务层 Service]
+    StatsSvc[&quot;sys_stats&lt;br/&gt;系统指标&quot;]
+    NodeSvc[&quot;node_action&lt;br/&gt;进程启停&quot;]
+    VideoSvc[&quot;build_video_perf_json&lt;br/&gt;视频聚合&quot;]
+    BagSvc[&quot;ros2 bag fork&quot;]
+    CapSvc[&quot;tcpdump fork&quot;]
+  end
+
+  subgraph data [数据层 Data]
+    RosCache[&quot;ROS 订阅缓存&quot;]
+    FileIO[&quot;配置文件 / 日志 / /tmp&quot;]
+    SysProbe[&quot;/proc / SHM / TCP 端口&quot;]
+    Shell[&quot;popen / system / ros2 CLI&quot;]
+  end
+
+  UI --&gt;|&quot;Fetch REST&quot;| Pre
+  Pre --&gt; Route
+  Pre --&gt; Static
+  Route --&gt; HOverview &amp; HDevices &amp; HRos &amp; HVideo &amp; HConfig
+  HOverview --&gt; StatsSvc
+  HOverview --&gt; NodeSvc
+  HDevices --&gt; FileIO
+  HRos --&gt; Shell
+  HVideo --&gt; VideoSvc
+  HVideo --&gt; RosCache
+  HConfig --&gt; FileIO
+  StatsSvc --&gt; SysProbe
+  NodeSvc --&gt; Shell
+  VideoSvc --&gt; RosCache &amp; FileIO &amp; SysProbe
+  BagSvc --&gt; Shell
+  CapSvc --&gt; Shell
+</code></pre>
+<h3 id="32">3.2 进程内模块划分</h3>
+<pre><code class="language-mermaid">flowchart TB
+  subgraph process [sysmonit 进程]
+    subgraph main_thread [主线程 - rclcpp::spin]
+      Main[&quot;main.cpp&quot;]
+      Sub[&quot;ROS 订阅回调&lt;br/&gt;7 路 Topic&quot;]
+      Pub[&quot;ROS 发布&lt;br/&gt;/ptz_motion_cmd&lt;br/&gt;/ptz_lens_cmd&quot;]
+      Main --&gt; Sub
+      Main --&gt; Pub
+    end
+
+    subgraph http_thread [HTTP 线程]
+      HS[&quot;HttpServer::start&quot;]
+      Workers[&quot;libhv 4 worker&lt;br/&gt;max 32 conn&quot;]
+      HS --&gt; Workers
+    end
+
+    subgraph bg_thread [后台线程]
+      VT[&quot;视频缓存线程&lt;br/&gt;10s 刷新 g_video_cache&quot;]
+    end
+
+    subgraph modules [核心模块]
+      HAPI[&quot;http_api.cpp&quot;]
+      HSRV[&quot;http_server.cpp&quot;]
+      STATS[&quot;sys_stats.cpp&quot;]
+      CONC[&quot;concurrency.cpp&quot;]
+      UTIL[&quot;http_util.cpp&quot;]
+    end
+
+    subgraph mem [内存状态]
+      C1[&quot;g_ptz_smart_cache&quot;]
+      C2[&quot;g_ai_visible / infrared&quot;]
+      C3[&quot;g_lens_fov_by_dev&quot;]
+      C4[&quot;g_video_cache&quot;]
+      C5[&quot;Bag/Capture 状态机&quot;]
+    end
+
+    Main --&gt; HAPI
+    HS --&gt; HSRV
+    HSRV --&gt; HAPI
+    HAPI --&gt; STATS
+    HAPI --&gt; CONC
+    HAPI --&gt; UTIL
+    Sub --&gt; C1 &amp; C2 &amp; C3
+    VT --&gt; C4
+    HAPI --&gt; C1 &amp; C2 &amp; C3 &amp; C4 &amp; C5
+    Workers --&gt; HAPI
+  end
+</code></pre>
+<h3 id="33">3.3 线程模型</h3>
+<table>
+<thead>
+<tr>
+<th>线程</th>
+<th>入口</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>主线程</strong></td>
+<td><code>rclcpp::spin(node)</code></td>
+<td>ROS 订阅回调，更新 PTZ/AI/FOV 等内存缓存</td>
+</tr>
+<tr>
+<td><strong>HTTP 线程</strong></td>
+<td><code>std::thread → HttpServer::start()</code></td>
+<td>libhv 事件循环，4 worker 并发处理 HTTP</td>
+</tr>
+<tr>
+<td><strong>视频缓存线程</strong></td>
+<td><code>HttpApi::start_video_cache_thread()</code></td>
+<td>每 10s 调用 <code>build_video_perf_json("eth0")</code> 预热缓存</td>
+</tr>
+</tbody>
+</table>
+<p>进程退出顺序：<code>server.stop()</code> → join HTTP 线程 → join 视频缓存线程 → <code>rclcpp::shutdown()</code>。</p>
+<pre><code class="language-mermaid">flowchart LR
+  subgraph T1 [主线程]
+    Spin[&quot;rclcpp::spin&quot;]
+    CB[&quot;订阅回调&lt;br/&gt;更新缓存&quot;]
+    Spin --&gt; CB
+  end
+
+  subgraph T2 [HTTP 线程]
+    Run[&quot;HttpServer::run&quot;]
+    W1[&quot;worker 1&quot;]
+    W2[&quot;worker 2&quot;]
+    W3[&quot;worker 3&quot;]
+    W4[&quot;worker 4&quot;]
+    Run --&gt; W1 &amp; W2 &amp; W3 &amp; W4
+  end
+
+  subgraph T3 [视频缓存线程]
+    Loop[&quot;每 10s&lt;br/&gt;build_video_perf_json&quot;]
+    Loop --&gt; VC[&quot;写入 g_video_cache&quot;]
+  end
+
+  CB -.-&gt;|&quot;mutex 写&quot;| Cache[(&quot;共享缓存&quot;)]
+  W1 &amp; W2 &amp; W3 &amp; W4 -.-&gt;|&quot;mutex 读/写&quot;| Cache
+  VC -.-&gt; Cache
+</code></pre>
+<h3 id="34">3.4 请求处理链路</h3>
+<pre><code class="language-mermaid">sequenceDiagram
+  participant C as 浏览器/脚本
+  participant H as libhv HttpServer
+  participant P as preprocessor
+  participant A as HttpApi Handler
+  participant X as 外部系统
+
+  C-&gt;&gt;H: HTTP 请求
+  H-&gt;&gt;P: 路径规范化
+  alt /api/* 且非 login/health
+    P-&gt;&gt;P: 校验 Bearer Token
+  end
+  alt 静态资源
+    H-&gt;&gt;C: web/index.html 或静态文件
+  else /api/*
+    H-&gt;&gt;A: 路由到 Handler
+    A-&gt;&gt;X: 读缓存 / popen / fork / ROS API
+    A-&gt;&gt;C: JSON 响应
+  end
+</code></pre>
+<h3 id="35">3.5 认证与路由分发</h3>
+<pre><code class="language-mermaid">flowchart TD
+  Req[&quot;HTTP 请求&quot;] --&gt; Path{&quot;路径类型?&quot;}
+
+  Path --&gt;|&quot;/ 或 /index.html&quot;| Static[&quot;返回 web/index.html&quot;]
+  Path --&gt;|&quot;/api/health&quot;| Health[&quot;handle_health&lt;br/&gt;无需 Token&quot;]
+  Path --&gt;|&quot;/api/login&quot;| Login[&quot;handle_login&lt;br/&gt;校验账号密码&quot;]
+  Path --&gt;|&quot;/api/*&quot;| Auth{&quot;Token 有效?&quot;}
+
+  Auth --&gt;|否| Deny[&quot;401 Unauthorized&quot;]
+  Auth --&gt;|是| Dispatch{&quot;路由匹配&quot;}
+
+  Dispatch --&gt; Overview[&quot;/api/overview&quot;]
+  Dispatch --&gt; Nodes[&quot;/api/nodes/*&quot;]
+  Dispatch --&gt; Devices[&quot;/api/devices/*&quot;]
+  Dispatch --&gt; Ros[&quot;/api/ros*&quot;]
+  Dispatch --&gt; Bag[&quot;/api/bag/*&quot;]
+  Dispatch --&gt; Capture[&quot;/api/capture/*&quot;]
+  Dispatch --&gt; Video[&quot;/api/video*&quot;]
+  Dispatch --&gt; Ptz[&quot;/api/ptz/*&quot;]
+  Dispatch --&gt; Config[&quot;/api/config/*&quot;]
+  Dispatch --&gt; Eth1[&quot;/api/eth1_switch_status*&quot;]
+
+  Login --&gt; Token[&quot;生成 Token&lt;br/&gt;存入内存 std::set&quot;]
+  Token -.-&gt; Auth
+</code></pre>
+<h3 id="36">3.6 目录结构</h3>
+<pre><code>sysmonit/
+├── CMakeLists.txt
+├── package.xml
+├── readme.md                    # 包内简要说明（本文档为完整设计版）
+├── launch/sysmonit.launch.xml
+├── web/index.html               # 单页前端
+├── include/sysmonit/
+│   ├── http_server.hpp          # libhv 封装、鉴权 preprocessor
+│   ├── http_api.hpp             # API 路由与 Handler 声明
+│   ├── http_util.hpp            # 路径/Token/响应工具
+│   ├── concurrency.hpp          # 多线程互斥 RAII 锁
+│   └── sys_stats.hpp            # 系统概览 JSON 接口
+├── src/
+│   ├── main.cpp                 # ROS 节点入口
+│   ├── http_server.cpp
+│   ├── http_api.cpp             # 核心业务（约 2900 行）
+│   ├── http_util.cpp
+│   ├── sys_stats.cpp
+│   └── concurrency.cpp
+└── scripts/
+    ├── bag_reader.py
+    └── alink_parser.py
+</code></pre>
+<h3 id="37">3.7 并发安全设计</h3>
+<p><code>concurrency.hpp</code> 对以下共享资源加锁，避免 libhv 多 worker 并发冲突：</p>
+<table>
+<thead>
+<tr>
+<th>互斥量</th>
+<th>保护对象</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>g_ros_api_mtx</code></td>
+<td><code>rclcpp::Node</code> 图查询（topic 列表等）</td>
+</tr>
+<tr>
+<td><code>g_shell_mtx</code></td>
+<td><code>popen</code> / <code>system</code> / <code>ros2</code> CLI</td>
+</tr>
+<tr>
+<td><code>g_bag_mtx</code></td>
+<td>Bag 录制/播放状态机</td>
+</tr>
+<tr>
+<td><code>g_capture_mtx</code></td>
+<td>tcpdump 抓包状态机</td>
+</tr>
+<tr>
+<td><code>g_config_write_mtx</code></td>
+<td>配置文件写入</td>
+</tr>
+<tr>
+<td><code>g_ptz_cfg_mtx</code></td>
+<td>PTZ 设备配置读取</td>
+</tr>
+<tr>
+<td><code>g_ptz_smart_mtx</code></td>
+<td>PTZ 智能分析服务器缓存</td>
+</tr>
+<tr>
+<td><code>g_ai_target_mtx</code></td>
+<td>AI 目标快照</td>
+</tr>
+<tr>
+<td><code>g_lens_fov_mtx</code></td>
+<td>镜头 FOV 快照</td>
+</tr>
+<tr>
+<td><code>g_video_cache_mtx</code></td>
+<td>视频概览 JSON 缓存</td>
+</tr>
+</tbody>
+</table>
+<pre><code class="language-mermaid">flowchart LR
+  subgraph workers [libhv 4 workers]
+    W1[worker 1]
+    W2[worker 2]
+    W3[worker 3]
+    W4[worker 4]
+  end
+
+  subgraph locks [互斥锁保护]
+    L1[&quot;g_shell_mtx&quot;]
+    L2[&quot;g_ros_api_mtx&quot;]
+    L3[&quot;g_bag_mtx / g_capture_mtx&quot;]
+    L4[&quot;g_config_write_mtx&quot;]
+    L5[&quot;g_ptz_smart_mtx / g_ai_target_mtx&lt;br/&gt;g_lens_fov_mtx / g_video_cache_mtx&quot;]
+  end
+
+  W1 &amp; W2 &amp; W3 &amp; W4 --&gt; L1 &amp; L2 &amp; L3 &amp; L4 &amp; L5
+</code></pre>
+<hr />
+<h2 id="4">4. 视频页数据流（重点）</h2>
+<p>视频页（<code>page-video</code>）是 sysmonit 最复杂的页面，聚合了 <strong>ROS 实时数据</strong>、<strong>文件缓存</strong>、<strong>系统探测</strong> 和 <strong>浏览器 WebRTC</strong> 四类数据源。</p>
+<h3 id="41">4.1 页面功能区块</h3>
+<table>
+<thead>
+<tr>
+<th>区块</th>
+<th>DOM ID</th>
+<th>功能</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>视频流列表</td>
+<td><code>video-streams-list</code></td>
+<td>MediaMTX 代理状态、RTSP URL、Pipeline FPS</td>
+</tr>
+<tr>
+<td>SHM 诊断</td>
+<td><code>shm-info-panel</code></td>
+<td>共享内存帧活跃情况（PTZ→AI、AI→Stream）</td>
+</tr>
+<tr>
+<td>WebRTC 播放器</td>
+<td><code>webrtc-player-section</code></td>
+<td>通过 WHEP 低延迟预览可见光/红外</td>
+</tr>
+<tr>
+<td>AI 目标信息</td>
+<td><code>ai-target-card</code></td>
+<td>场景 B 下展示 AI 跟踪目标统计</td>
+</tr>
+<tr>
+<td>PTZ 遥控</td>
+<td><code>ptz-control-card</code></td>
+<td>方向/变焦/对焦/ICR/除雾/加热</td>
+</tr>
+<tr>
+<td>原始 RTSP 查询</td>
+<td><code>direct-rtsp-urls</code></td>
+<td>按 PTZ 类型+IP 拼接相机直连 URL</td>
+</tr>
+<tr>
+<td>Nexus RTMP</td>
+<td><code>nexus-rtmp-url-box</code></td>
+<td>读取 nexus_gateway 缓存的推流地址</td>
+</tr>
+</tbody>
+</table>
+<h3 id="42">4.2 视频链路端到端架构图</h3>
+<p>从 PTZ 相机到浏览器预览的完整视频链路（sysmonit 负责观测与遥控，<strong>不负责编解码</strong>）：</p>
+<pre><code class="language-mermaid">flowchart LR
+  subgraph ptz_side [PTZ 侧]
+    CamV[&quot;可见光相机&quot;]
+    CamI[&quot;红外相机&quot;]
+  end
+
+  subgraph agx_pipeline [AGX 视频处理链路]
+    PS[&quot;ptz_service&lt;br/&gt;拉流/解码&quot;]
+    SHM1[&quot;/shm_*_zoom_0&lt;br/&gt;原始帧&quot;]
+    AI[&quot;ptz100_ai&lt;br/&gt;检测跟踪&quot;]
+    SHM2[&quot;/shm_*_zoom_0_ai&lt;br/&gt;AI 帧&quot;]
+    Enc[&quot;编码推流模块&quot;]
+    Pipe[&quot;/tmp/video_pipeline_status.json&lt;br/&gt;decode/ai/encode fps&quot;]
+    PS --&gt; SHM1 --&gt; AI --&gt; SHM2 --&gt; Enc
+    PS --&gt; Pipe
+    AI --&gt; Pipe
+    Enc --&gt; Pipe
+  end
+
+  subgraph proxy [代理层]
+    MTX[&quot;MediaMTX&quot;]
+    RTSP[&quot;RTSP :9554&lt;br/&gt;/ptz/zoom/ch0&lt;br/&gt;/ptz/ir/ch0&quot;]
+    WHEP[&quot;WHEP :8889&quot;]
+    MTX --&gt; RTSP
+    MTX --&gt; WHEP
+  end
+
+  subgraph sysmonit_obs [sysmonit 观测]
+    API[&quot;/api/video*&lt;br/&gt;/api/video/shm&quot;]
+    ROSsub[&quot;订阅 /ptz_device_info&lt;br/&gt;/ptz_lens_info&lt;br/&gt;/visiblelight_track_objs&quot;]
+    API --- ROSsub
+  end
+
+  subgraph browser [浏览器 Video 页]
+    List[&quot;流列表 + FPS + SHM 诊断&quot;]
+    Player[&quot;WebRTC 播放器&quot;]
+    Ctrl[&quot;PTZ 遥控&quot;]
+  end
+
+  CamV &amp; CamI --&gt;|&quot;RTSP :554&quot;| PS
+  Enc --&gt; RTSP
+  RTSP --&gt; MTX
+  SHM1 &amp; SHM2 -.-&gt;|&quot;probe_shm&quot;| API
+  Pipe -.-&gt; API
+  ROSsub -.-&gt; API
+  API --&gt;|&quot;JSON :12345&quot;| List
+  WHEP --&gt;|&quot;直连不经 sysmonit&quot;| Player
+  Ctrl --&gt;|&quot;POST /api/ptz/control&quot;| PS
+</code></pre>
+<h3 id="43">4.3 数据源总览</h3>
+<pre><code class="language-mermaid">flowchart TB
+  subgraph ros [ROS Topic 订阅 - 主线程回调]
+    T1[&quot;/ptz_device_info&quot;]
+    T2[&quot;/ptz_status&quot;]
+    T3[&quot;/visiblelight_track_objs&quot;]
+    T4[&quot;/infrared_track_objs&quot;]
+    T5[&quot;/ptz_lens_info&quot;]
+    T6[&quot;/laser_ptz_lens_info&quot;]
+  end
+
+  subgraph files [文件/系统探测]
+    F1[&quot;/tmp/video_pipeline_status.json&quot;]
+    F2[&quot;/tmp/nexus_stream_urls.json&quot;]
+    F3[&quot;ptzDevicesCfg.yaml&quot;]
+    F4[&quot;/shm_* POSIX SHM&quot;]
+    F5[&quot;TCP :9554 MediaMTX&quot;]
+    F6[&quot;TCP :554 PTZ RTSP&quot;]
+  end
+
+  subgraph cache [sysmonit 内存缓存]
+    C1[g_ptz_smart_cache]
+    C2[g_ai_visible / g_ai_infrared]
+    C3[g_lens_fov_by_dev]
+    C4[g_video_cache]
+  end
+
+  subgraph api [HTTP API]
+    A1[&quot;GET /api/video&quot;]
+    A2[&quot;GET /api/video/fps&quot;]
+    A3[&quot;GET /api/video/shm&quot;]
+    A4[&quot;GET /api/video/fov&quot;]
+    A5[&quot;GET /api/video/ai_targets&quot;]
+    A6[&quot;GET /api/video/rtmp&quot;]
+    A7[&quot;POST /api/ptz/control&quot;]
+  end
+
+  T1 --&gt; C1
+  T2 --&gt; C1
+  T3 --&gt; C2
+  T4 --&gt; C2
+  T5 --&gt; C3
+  T6 --&gt; C3
+
+  F1 --&gt; A2
+  F2 --&gt; A6
+  F3 --&gt; A1
+  F4 --&gt; A1
+  F4 --&gt; A3
+  F5 --&gt; A1
+  F6 --&gt; A1
+
+  C1 --&gt; A1
+  C2 --&gt; A1
+  C2 --&gt; A5
+  C3 --&gt; A4
+  C4 --&gt; A1
+
+  A7 --&gt;|publish| P1[&quot;/ptz_motion_cmd&quot;]
+  A7 --&gt;|publish| P2[&quot;/ptz_lens_cmd&quot;]
+</code></pre>
+<h3 id="44-build_video_perf_json">4.4 后端：<code>build_video_perf_json</code> 组装逻辑</h3>
+<p><code>GET /api/video?iface=eth0|eth1</code> 的核心由 <code>build_video_perf_json()</code> 生成，数据来源：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>来源</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>iface</code> / <code>agx_ip</code></td>
+<td><code>getifaddrs</code> 读网卡 IP</td>
+<td><code>?iface=eth1</code> 时 Proxy RTSP 用 eth1 IP</td>
+</tr>
+<tr>
+<td><code>mediamtx_online</code></td>
+<td><code>connect()</code> 探测 <code>:9554</code></td>
+<td>MediaMTX RTSP 端口是否可达</td>
+</tr>
+<tr>
+<td><code>pipeline_visible/thermal</code></td>
+<td><code>/tmp/video_pipeline_status.json</code></td>
+<td>mtime &lt; 10s 才有效；含 decode/ai/encode fps</td>
+</tr>
+<tr>
+<td><code>streams[]</code></td>
+<td><code>ptzDevicesCfg.yaml</code> + SHM 探测</td>
+<td>每设备可见光/红外两路 RTSP 代理 URL</td>
+</tr>
+<tr>
+<td><code>ptz_smart_servers[]</code></td>
+<td><code>g_ptz_smart_cache</code>（来自 <code>/ptz_device_info</code>）</td>
+<td>智能分析服务器地址、场景 A/B 标志</td>
+</tr>
+<tr>
+<td><code>ai_target_visible/infrared</code></td>
+<td><code>g_ai_visible</code> / <code>g_ai_infrared</code></td>
+<td>最新 AI 目标快照（2s 内视为 fresh）</td>
+</tr>
+</tbody>
+</table>
+<p><strong>缓存策略</strong>：</p>
+<ul>
+<li><code>iface=eth0</code>（默认）：读 <code>g_video_cache</code>（后台线程每 <strong>10s</strong> 刷新）</li>
+<li><code>iface=eth1</code>：每次请求实时 <code>build_video_perf_json("eth1")</code>（不走缓存）</li>
+</ul>
+<p><strong>streams 条目示例字段</strong>：</p>
+<pre><code class="language-json">{
+  &quot;name&quot;: &quot;Visible Camera&quot;,
+  &quot;sn&quot;: &quot;SRP100-xxx&quot;,
+  &quot;cam_ip&quot;: &quot;192.168.2.4&quot;,
+  &quot;type&quot;: 0,
+  &quot;rtsp&quot;: &quot;rtsp://&lt;agx_ip&gt;:9554/ptz/zoom/ch0&quot;,
+  &quot;rtsp_direct&quot;: &quot;rtsp://192.168.2.4:554&quot;,
+  &quot;online&quot;: true,
+  &quot;is_hepu_type&quot;: true,
+  &quot;cam_reachable&quot;: true,
+  &quot;proxy_reachable&quot;: true
+}
+</code></pre>
+<p><code>cam_reachable</code> 判定：PTZ <code>:554</code> 可达 <strong>且</strong> 对应 SHM（如 <code>/shm_0_zoom_0</code>）存在、有 frame_id、age &lt; 10s。</p>
+<h3 id="45-api">4.5 视频子 API 分工</h3>
+<table>
+<thead>
+<tr>
+<th>API</th>
+<th>数据源</th>
+<th>刷新特点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET /api/video</code></td>
+<td>综合（见上）</td>
+<td>eth0 走 10s 缓存；前端 5s 轮询一次</td>
+</tr>
+<tr>
+<td><code>GET /api/video/fps</code></td>
+<td>直读 <code>/tmp/video_pipeline_status.json</code></td>
+<td>前端 <strong>1Hz</strong> 轮询，更新 Decode/AI/Encode FPS</td>
+</tr>
+<tr>
+<td><code>GET /api/video/shm</code></td>
+<td><code>probe_shm()</code> 遍历 <code>/shm_{dev}_{zoom\|infrared}_0[_ai]</code></td>
+<td>前端 <strong>5s</strong> 轮询</td>
+</tr>
+<tr>
+<td><code>GET /api/video/fov</code></td>
+<td><code>g_lens_fov_by_dev</code>（来自 <code>/ptz_lens_info</code>）</td>
+<td>前端 <strong>1Hz</strong> 轮询</td>
+</tr>
+<tr>
+<td><code>GET /api/video/ai_targets</code></td>
+<td><code>g_ai_visible</code> / <code>g_ai_infrared</code></td>
+<td>前端 <strong>1Hz</strong> 轮询（与 <code>/api/video</code> 分离）</td>
+</tr>
+<tr>
+<td><code>GET /api/video/rtmp</code></td>
+<td><code>/tmp/nexus_stream_urls.json</code></td>
+<td>手动刷新或进入页面时加载</td>
+</tr>
+<tr>
+<td><code>POST /api/ptz/control</code></td>
+<td>发布 ROS <code>PtzMotionCmd</code> / <code>PtzLensCmd</code></td>
+<td>用户操作触发</td>
+</tr>
+</tbody>
+</table>
+<h3 id="46">4.6 前端轮询时序</h3>
+<pre><code class="language-mermaid">sequenceDiagram
+  participant U as 用户
+  participant P as page-video
+  participant S as sysmonit API
+
+  U-&gt;&gt;P: 切换到 Video Stream Tab
+  par 首次加载
+    P-&gt;&gt;S: GET /api/video?iface=eth0
+    P-&gt;&gt;S: GET /api/video/shm
+    P-&gt;&gt;S: GET /api/video/rtmp
+  end
+  P-&gt;&gt;P: 渲染流列表 / SHM / Nexus RTMP
+  P-&gt;&gt;P: startFpsPolling + startAiTargetPolling
+
+  loop 每 1 秒
+    P-&gt;&gt;S: GET /api/video/fps
+    P-&gt;&gt;S: GET /api/video/fov
+    P-&gt;&gt;S: GET /api/video/ai_targets
+    P--&gt;&gt;P: 更新 FPS / HFOV / AI 目标卡片
+  end
+
+  loop 每 5 秒
+    P-&gt;&gt;S: GET /api/video/shm
+    P--&gt;&gt;P: 更新 SHM 活跃状态
+  end
+
+  loop 每 5 秒（fps 定时器内每 5 tick）
+    P-&gt;&gt;S: GET /api/video?iface=...
+    P--&gt;&gt;P: 更新可达性 / PTZ 功能按钮
+  end
+
+  U-&gt;&gt;P: 离开 Video Tab
+  P-&gt;&gt;P: stopFpsPolling + stopAiTargetPolling
+</code></pre>
+<p>进入 Video Stream Tab 时触发：</p>
+<pre><code class="language-javascript">initVideoAgxIfaceSelect();
+loadVideoPerf();        // 立即拉 /api/video，渲染流列表
+loadShmInfo();          // 立即拉 /api/video/shm
+loadNexusRtmpUrls();    // 立即拉 /api/video/rtmp
+startFpsPolling();      // 启动 1s 定时器
+startAiTargetPolling(); // 启动 1s AI 目标定时器
+</code></pre>
+<p><code>startFpsPolling()</code> 内部 <strong>1s 周期</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>每 tick</th>
+<th>请求</th>
+<th>更新内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>每次</td>
+<td><code>/api/video/fps</code></td>
+<td><code>#fps-visible</code> / <code>#fps-thermal</code> Pipeline FPS</td>
+</tr>
+<tr>
+<td>每次</td>
+<td><code>/api/video/fov</code></td>
+<td>SHM 卡片上的 HFOV 角度</td>
+</tr>
+<tr>
+<td>每 5 tick</td>
+<td><code>/api/video?iface=...</code></td>
+<td>Proxy/Camera 可达性、<code>lastVideoPayload</code>、PTZ 功能按钮状态</td>
+</tr>
+</tbody>
+</table>
+<p><code>startAiTargetPolling()</code> <strong>1s 周期</strong>：</p>
+<ul>
+<li>请求 <code>/api/video/ai_targets</code></li>
+<li>与 <code>lastVideoPayload</code> 合并后刷新 AI Target 卡片和 PTZ 特性控件</li>
+</ul>
+<p>离开 Video Tab 时调用 <code>stopFpsPolling()</code> + <code>stopAiTargetPolling()</code> 释放定时器。</p>
+<h3 id="47-webrtc">4.7 WebRTC 播放数据流</h3>
+<p>WebRTC <strong>不经过 sysmonit 后端</strong>，浏览器直连 MediaMTX WHEP 端点：</p>
+<pre><code class="language-mermaid">sequenceDiagram
+  participant B as 浏览器
+  participant M as MediaMTX :8889
+  participant P as PTZ/编码链路
+
+  B-&gt;&gt;B: togglePlayer('vis'/'ir')
+  B-&gt;&gt;B: RTCPeerConnection.createOffer()
+  B-&gt;&gt;M: POST /ptz/zoom/ch0/whep (SDP offer)
+  M-&gt;&gt;P: 拉取 RTSP 源
+  M-&gt;&gt;B: SDP answer
+  B-&gt;&gt;B: ontrack → video.srcObject
+  Note over B: liveSync 每 100ms 追帧 + 可选时间叠加
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>通道</th>
+<th>WHEP URL</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>可见光</td>
+<td><code>http://&lt;hostname&gt;:8889/ptz/zoom/ch0/whep</code></td>
+</tr>
+<tr>
+<td>红外</td>
+<td><code>http://&lt;hostname&gt;:8889/ptz/ir/ch0/whep</code></td>
+</tr>
+</tbody>
+</table>
+<p>低延迟优化：<code>jitterBufferTarget=0</code>、<code>playoutDelayHint=0</code>、缓冲滞后时动态调整 <code>playbackRate</code>（最高 1.18x）。</p>
+<h3 id="48-ptz-ab">4.8 和普 PTZ 场景 A/B 数据流</h3>
+<p>视频页支持在 <strong>场景 A（接和普 AI 盒子）</strong> 与 <strong>场景 B（直连 AGX）</strong> 间切换：</p>
+<pre><code class="language-mermaid">sequenceDiagram
+  participant U as 用户
+  participant W as Web 前端
+  participant S as sysmonit
+  participant Y as ptzDevicesCfg.yaml
+  participant P as ptz_service
+
+  U-&gt;&gt;W: 点击「切换场景」
+  W-&gt;&gt;S: GET /api/config/read?file=ptzDevicesCfg.yaml
+  W-&gt;&gt;W: 修改 with_hepu_ai_box 字段
+  W-&gt;&gt;S: POST /api/config/write
+  W-&gt;&gt;S: POST /api/nodes/ptz_service/restart
+  P-&gt;&gt;P: 按新场景启动/停止 ai_sender
+  P-&gt;&gt;P: 下发智能分析服务器配置到 PTZ Web
+  P--&gt;&gt;S: /ptz_device_info 更新
+  S--&gt;&gt;W: /api/video 反映新 ptz_smart_servers
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th><code>with_hepu_ai_box</code></th>
+<th>ptz_service 行为</th>
+<th>AI Target 卡片</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A</td>
+<td><code>true</code></td>
+<td>不启动 ai_sender；跟踪模式=识别自适应</td>
+<td>不显示</td>
+</tr>
+<tr>
+<td>B</td>
+<td><code>false</code></td>
+<td>启动 ai_sender；自动下发 eth1:39080</td>
+<td>和普 PTZ 在线时显示</td>
+</tr>
+</tbody>
+</table>
+<pre><code class="language-mermaid">stateDiagram-v2
+  [*] --&gt; 场景A: with_hepu_ai_box=1
+  [*] --&gt; 场景B: with_hepu_ai_box=0
+
+  场景A: 外接和普 AI 盒子
+  场景A: ptz_service 不启 ai_sender
+  场景A: 跟踪模式=识别自适应
+  场景A: 需手动配置 PTZ Web 智能分析服务器
+
+  场景B: 直连 AGX
+  场景B: ptz_service 启 ai_sender
+  场景B: 跟踪模式=对空半自动
+  场景B: 自动下发 eth1:39080
+  场景B: 显示 AI Target 卡片
+
+  场景A --&gt; 场景B: Web 切换 yaml + 重启 ptz_service
+  场景B --&gt; 场景A: Web 切换 yaml + 重启 ptz_service
+</code></pre>
+<h3 id="49-shm">4.9 SHM 命名与链路含义</h3>
+<p>每个 PTZ 设备索引 <code>devIdx</code>（来自 <code>ptzDevicesCfg.yaml</code> 顺序）对应 4 个 SHM：</p>
+<table>
+<thead>
+<tr>
+<th>SHM 名</th>
+<th>链路</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/shm_{dev}_zoom_0</code></td>
+<td>PTZ 可见光原始帧 → AI</td>
+</tr>
+<tr>
+<td><code>/shm_{dev}_zoom_0_ai</code></td>
+<td>AI 处理后 → 编码/推流</td>
+</tr>
+<tr>
+<td><code>/shm_{dev}_infrared_0</code></td>
+<td>PTZ 红外原始帧 → AI</td>
+</tr>
+<tr>
+<td><code>/shm_{dev}_infrared_0_ai</code></td>
+<td>AI 处理后 → 编码/推流</td>
+</tr>
+</tbody>
+</table>
+<p>前端根据 <code>exists</code>、<code>frame_id</code>、<code>age_ms</code> 显示 ✓(活跃) / ⚠(过期) / ✗(不存在)。</p>
+<pre><code class="language-mermaid">flowchart LR
+  subgraph dev0 [设备 devIdx=0]
+    Z0[&quot;/shm_0_zoom_0&lt;br/&gt;PTZ→AI 可见光&quot;]
+    Z0AI[&quot;/shm_0_zoom_0_ai&lt;br/&gt;AI→Stream&quot;]
+    I0[&quot;/shm_0_infrared_0&lt;br/&gt;PTZ→AI 红外&quot;]
+    I0AI[&quot;/shm_0_infrared_0_ai&lt;br/&gt;AI→Stream&quot;]
+    Z0 --&gt; Z0AI
+    I0 --&gt; I0AI
+  end
+</code></pre>
+<h3 id="410-ptz">4.10 PTZ 遥控数据流</h3>
+<pre><code class="language-mermaid">sequenceDiagram
+  participant U as 用户
+  participant W as Web 前端
+  participant S as sysmonit
+  participant PS as ptz_service
+
+  U-&gt;&gt;W: 按住方向键 / 点击变焦
+  W-&gt;&gt;S: POST /api/ptz/control {&quot;type&quot;:&quot;motion&quot;,&quot;action&quot;:&quot;left&quot;,&quot;speed&quot;:5}
+  S-&gt;&gt;S: 构造 PtzMotionCmd
+  S-&gt;&gt;PS: publish /ptz_motion_cmd
+  U-&gt;&gt;W: 松开 → action=stop
+  W-&gt;&gt;S: POST /api/ptz/control {&quot;type&quot;:&quot;motion&quot;,&quot;action&quot;:&quot;stop&quot;}
+</code></pre>
+<p>镜头控制同理，发布到 <code>/ptz_lens_cmd</code>（变焦、对焦、除雾、加热、ICR 等）。</p>
+<hr />
+<h2 id="5-rest-api">5. REST API 设计</h2>
+<h3 id="51-api">5.1 API 模块架构图</h3>
+<pre><code class="language-mermaid">mindmap
+  root((sysmonit API))
+    通用
+      /api/health
+      /api/login
+    系统
+      /api/overview
+      /api/nodes
+      /api/ptz/distance_fov_stats
+    设备
+      /api/devices
+      /api/eth1_switch_status
+    ROS
+      /api/ros_topics
+      /api/ros/topics
+      /api/ros/topic_hz
+    诊断工具
+      /api/bag
+      /api/capture
+    视频
+      /api/video
+      /api/video/fps
+      /api/video/shm
+      /api/video/fov
+      /api/video/ai_targets
+      /api/video/rtmp
+      /api/ptz/control
+    配置
+      /api/config/list
+      /api/config/read
+      /api/config/write
+</code></pre>
+<h3 id="52">5.2 认证</h3>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>默认账号</td>
+<td><code>admin</code> / <code>monit</code>（<code>http_api.cpp</code> 中 <code>kUser</code>/<code>kPass</code>，<strong>生产需修改</strong>）</td>
+</tr>
+<tr>
+<td>登录</td>
+<td><code>POST /api/login</code> → <code>{"token":"..."}</code></td>
+</tr>
+<tr>
+<td>鉴权</td>
+<td><code>Authorization: Bearer &lt;token&gt;</code> 或 Cookie；<code>/api/health</code>、<code>/api/login</code> 除外</td>
+</tr>
+<tr>
+<td>有效期</td>
+<td>进程重启后 Token 失效</td>
+</tr>
+</tbody>
+</table>
+<pre><code class="language-mermaid">sequenceDiagram
+  participant C as 客户端
+  participant S as sysmonit
+
+  C-&gt;&gt;S: POST /api/login {username, password}
+  alt 凭证正确
+    S-&gt;&gt;S: 生成随机 Token 存入内存
+    S--&gt;&gt;C: {&quot;token&quot;:&quot;xxx&quot;}
+    C-&gt;&gt;S: GET /api/overview&lt;br/&gt;Authorization: Bearer xxx
+    S--&gt;&gt;C: 200 JSON
+  else 凭证错误
+    S--&gt;&gt;C: 401
+  end
+  Note over S: 进程重启后 Token 全部失效
+</code></pre>
+<h3 id="53-api">5.3 API 分组一览</h3>
+<h4 id="_2">通用</h4>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>路径</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GET</td>
+<td><code>/api/health</code></td>
+<td><code>{"status":"ok"}</code>，无需登录</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/api/login</code></td>
+<td>JSON 或 form 登录</td>
+</tr>
+</tbody>
+</table>
+<h4 id="_3">系统概览</h4>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>路径</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GET</td>
+<td><code>/api/overview</code></td>
+<td>CPU/内存/磁盘/网络/温度/进程列表</td>
+</tr>
+</tbody>
+</table>
+<h4 id="monit">进程/节点（Monit）</h4>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>路径</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GET</td>
+<td><code>/api/nodes</code></td>
+<td>18 个监控节点状态</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/nodes/:name</code></td>
+<td>单节点状态</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/nodes/:name/detail</code></td>
+<td>节点详情</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/api/nodes/:name/:action</code></td>
+<td><code>start</code>/<code>stop</code>/<code>restart</code>（异步 <code>std::thread</code>）</td>
+</tr>
+</tbody>
+</table>
+<p>监控节点列表：<code>ptz100_ros</code>、<code>ptz100_ai</code>、<code>rvfusion_service</code>、<code>sfl200</code>、<code>ptz_guider_ctl</code>、<code>laser_guider_ctl</code>、<code>multiple_radar_calibration</code>、<code>sysmanager</code>、<code>dhp100_link</code>、<code>dhp100_tracker</code>、<code>spoofer</code>、<code>spoofer_fixed_point</code>、<code>electronic_fence</code>、<code>br100a</code>、<code>laser_service</code>、<code>ptz_service</code>、<code>nexus_gateway</code>、<code>sysmonit</code>。</p>
+<h4 id="_4">设备类型</h4>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>路径</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GET</td>
+<td><code>/api/devices/main</code></td>
+<td>主设备列表</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/devices/sub</code></td>
+<td>子设备列表</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/devices/current_type</code></td>
+<td>当前主次设备类型</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/api/devices/settype</code></td>
+<td>设置设备类型</td>
+</tr>
+</tbody>
+</table>
+<h4 id="eth1">eth1 交换机</h4>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>路径</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GET</td>
+<td><code>/api/eth1_switch_status</code></td>
+<td>读 ARP 扫描缓存</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/api/eth1_switch_status/scan</code></td>
+<td>触发 <code>arp-scan</code>/<code>nmap</code>（5s 限流）</td>
+</tr>
+</tbody>
+</table>
+<h4 id="ros">ROS 诊断</h4>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>路径</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GET</td>
+<td><code>/api/ros_topics</code></td>
+<td>预设话题列表（兼容旧接口）</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/ros_topics/:node_name</code></td>
+<td>按节点名返回话题</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/ros/topics</code></td>
+<td>当前 ROS 图全部 topic</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/ros/nodes</code></td>
+<td>节点名列表</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/ros/topic_detail?topic=</code></td>
+<td>topic 详情</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/ros/topic_hz?topic=</code></td>
+<td>近似频率</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/ros/topic_echo?topic=</code></td>
+<td>echo 一条消息</td>
+</tr>
+</tbody>
+</table>
+<h4 id="ros-bag">ROS Bag</h4>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>路径</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GET</td>
+<td><code>/api/bag/list</code></td>
+<td><code>/home/skyfend/rosbag</code> 列表</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/api/bag/record</code></td>
+<td>开始录制</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/api/bag/stop</code></td>
+<td>停止录制</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/bag/status</code></td>
+<td>录制状态</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/bag/info?name=</code></td>
+<td>Bag 详情（Python）</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/api/bag/play</code></td>
+<td>播放</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/api/bag/play_stop</code></td>
+<td>停止播放</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/api/bag/delete</code></td>
+<td>删除</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/bag/plot</code></td>
+<td>绘图数据</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/bag/fields</code></td>
+<td>可绘字段</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/bag/download?name=</code></td>
+<td>下载 tar.gz</td>
+</tr>
+</tbody>
+</table>
+<h4 id="_5">网络抓包</h4>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>路径</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GET</td>
+<td><code>/api/capture/status</code></td>
+<td>tcpdump 状态</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/api/capture/start</code></td>
+<td>启动抓包</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/api/capture/stop</code></td>
+<td>停止</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/capture/list</code></td>
+<td>pcap 列表</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/capture/parse</code></td>
+<td>Alink 解析</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/capture/download</code></td>
+<td>下载 pcap</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/api/capture/delete</code></td>
+<td>删除</td>
+</tr>
+</tbody>
+</table>
+<h4 id="4_1">视频（见第 4 章）</h4>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>路径</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GET</td>
+<td><code>/api/video?iface=</code></td>
+<td>视频流综合信息</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/video/fps</code></td>
+<td>Pipeline FPS</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/video/shm</code></td>
+<td>SHM 探测</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/video/fov</code></td>
+<td>镜头水平 FOV</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/video/ai_targets</code></td>
+<td>AI 目标快照</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/video/rtmp</code></td>
+<td>Nexus RTMP 地址</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/api/ptz/control</code></td>
+<td>PTZ 遥控</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/ptz/distance_fov_stats</code></td>
+<td>距离-FOV 异常统计（读 ptz_service.log）</td>
+</tr>
+</tbody>
+</table>
+<h4 id="_6">配置编辑</h4>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>路径</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GET</td>
+<td><code>/api/config/list</code></td>
+<td><code>/home/skyfend/config</code> 可编辑文件</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/config/read?file=</code></td>
+<td>读文件</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/api/config/write</code></td>
+<td>写文件（自动 <code>.bak</code> 备份）</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="6-ros">6. ROS 集成</h2>
+<h3 id="61-ros">6.1 ROS 通信拓扑图</h3>
+<pre><code class="language-mermaid">flowchart TB
+  subgraph sysmonit_node [sysmonit 节点]
+    direction TB
+    PubM[&quot;Publisher&lt;br/&gt;/ptz_motion_cmd&quot;]
+    PubL[&quot;Publisher&lt;br/&gt;/ptz_lens_cmd&quot;]
+    Sub1[&quot;Sub /ptz_device_info&quot;]
+    Sub2[&quot;Sub /ptz_status&quot;]
+    Sub3[&quot;Sub /ptz100_ros_devlist&quot;]
+    Sub4[&quot;Sub /visiblelight_track_objs&quot;]
+    Sub5[&quot;Sub /infrared_track_objs&quot;]
+    Sub6[&quot;Sub /ptz_lens_info&quot;]
+    Sub7[&quot;Sub /laser_ptz_lens_info&quot;]
+  end
+
+  PS[ptz_service]
+  AI[ptz100_ai]
+  ROS[ptz100_ros]
+  Laser[laser_service]
+
+  PS --&gt;|&quot;PtzDeviceInfo&quot;| Sub1
+  PS --&gt;|&quot;PtzStatus&quot;| Sub2
+  PS --&gt;|&quot;PtzLensInfo&quot;| Sub6
+  AI --&gt;|&quot;AiTargetInfo&quot;| Sub4
+  AI --&gt;|&quot;AiTargetInfo&quot;| Sub5
+  ROS --&gt;|&quot;DevList&quot;| Sub3
+  Laser --&gt;|&quot;PtzLensInfo&quot;| Sub7
+
+  PubM --&gt;|&quot;PtzMotionCmd&quot;| PS
+  PubL --&gt;|&quot;PtzLensCmd&quot;| PS
+
+  subgraph cache_map [写入缓存]
+    C1[&quot;g_ptz_smart_cache&quot;]
+    C2[&quot;g_ai_visible/infrared&quot;]
+    C3[&quot;g_lens_fov_by_dev&quot;]
+    C4[&quot;g_sfl200_devlist&quot;]
+  end
+
+  Sub1 &amp; Sub2 --&gt; C1
+  Sub4 &amp; Sub5 --&gt; C2
+  Sub6 &amp; Sub7 --&gt; C3
+  Sub3 --&gt; C4
+</code></pre>
+<h3 id="62">6.2 发布</h3>
+<table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>消息类型</th>
+<th>QoS</th>
+<th>触发</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/ptz_motion_cmd</code></td>
+<td><code>skyfend_interfaces/msg/PtzMotionCmd</code></td>
+<td>10</td>
+<td><code>POST /api/ptz/control</code> type=motion</td>
+</tr>
+<tr>
+<td><code>/ptz_lens_cmd</code></td>
+<td><code>skyfend_interfaces/msg/PtzLensCmd</code></td>
+<td>10</td>
+<td><code>POST /api/ptz/control</code> type=lens</td>
+</tr>
+</tbody>
+</table>
+<h3 id="63">6.3 订阅</h3>
+<table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>消息类型</th>
+<th>QoS</th>
+<th>缓存用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/ptz_device_info</code></td>
+<td><code>PtzDeviceInfo</code></td>
+<td>10</td>
+<td><code>g_ptz_smart_cache</code>：智能分析服务器、除雾/加热状态</td>
+</tr>
+<tr>
+<td><code>/ptz_status</code></td>
+<td><code>PtzStatus</code></td>
+<td>10</td>
+<td>补充 <code>day_night_mode</code>（ICR 状态）</td>
+</tr>
+<tr>
+<td><code>/ptz100_ros_devlist</code></td>
+<td><code>DevList</code></td>
+<td>10</td>
+<td>子设备列表（Devices 页）</td>
+</tr>
+<tr>
+<td><code>/visiblelight_track_objs</code></td>
+<td><code>AiTargetInfo</code></td>
+<td>KeepLast(5) best_effort</td>
+<td><code>g_ai_visible</code></td>
+</tr>
+<tr>
+<td><code>/infrared_track_objs</code></td>
+<td><code>AiTargetInfo</code></td>
+<td>KeepLast(5) best_effort</td>
+<td><code>g_ai_infrared</code></td>
+</tr>
+<tr>
+<td><code>/ptz_lens_info</code></td>
+<td><code>PtzLensInfo</code></td>
+<td>KeepLast(5) best_effort</td>
+<td><code>g_lens_fov_by_dev</code></td>
+</tr>
+<tr>
+<td><code>/laser_ptz_lens_info</code></td>
+<td><code>PtzLensInfo</code></td>
+<td>KeepLast(5) best_effort</td>
+<td>同上（激光 PTZ）</td>
+</tr>
+</tbody>
+</table>
+<p><strong>设计原则</strong>：高频 Topic（AI 25Hz）采用「最新一帧覆盖」策略，HTTP 层以 1Hz 拉取缓存，避免背压。</p>
+<hr />
+<h2 id="7">7. 前端页面结构</h2>
+<h3 id="71-spa">7.1 SPA 导航结构图</h3>
+<pre><code class="language-mermaid">flowchart TB
+  Login[&quot;#login-page&lt;br/&gt;POST /api/login&quot;] --&gt; Dash[&quot;#dashboard&quot;]
+
+  Dash --&gt; Nav[&quot;顶部导航 nav-tab&quot;]
+  Nav --&gt; P1[&quot;page-overview&lt;br/&gt;系统概览&quot;]
+  Nav --&gt; P2[&quot;page-nodes&lt;br/&gt;进程管理&quot;]
+  Nav --&gt; P3[&quot;page-ros&lt;br/&gt;ROS 话题&quot;]
+  Nav --&gt; P4[&quot;page-devices&lt;br/&gt;设备类型&quot;]
+  Nav --&gt; P5[&quot;page-config&lt;br/&gt;配置编辑&quot;]
+  Nav --&gt; P6[&quot;page-video&lt;br/&gt;视频流&quot;]
+  Nav --&gt; P7[&quot;page-bag&lt;br/&gt;ROS Bag&quot;]
+  Nav --&gt; P8[&quot;page-capture&lt;br/&gt;网络抓包&quot;]
+
+  P2 --&gt; P2D[&quot;page-node-detail&lt;br/&gt;单节点详情子页&quot;]
+
+  P1 -.-&gt;|&quot;5s 轮询&quot;| API1[&quot;/api/overview&quot;]
+  P2 -.-&gt;|&quot;手动/定时&quot;| API2[&quot;/api/nodes&quot;]
+  P3 -.-&gt;|&quot;按需&quot;| API3[&quot;/api/ros/*&quot;]
+  P4 -.-&gt;|&quot;自动刷新&quot;| API4[&quot;/api/devices/*&quot;]
+  P5 -.-&gt;|&quot;按需&quot;| API5[&quot;/api/config/*&quot;]
+  P6 -.-&gt;|&quot;1s/5s 轮询&quot;| API6[&quot;/api/video/*&quot;]
+  P7 -.-&gt;|&quot;按需&quot;| API7[&quot;/api/bag/*&quot;]
+  P8 -.-&gt;|&quot;按需&quot;| API8[&quot;/api/capture/*&quot;]
+</code></pre>
+<h3 id="72-api">7.2 页面与 API 映射</h3>
+<table>
+<thead>
+<tr>
+<th>页面 ID</th>
+<th>Tab 名称</th>
+<th>主要 API</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>page-overview</code></td>
+<td>Overview</td>
+<td><code>/api/overview</code>、<code>/api/ptz/distance_fov_stats</code></td>
+</tr>
+<tr>
+<td><code>page-nodes</code></td>
+<td>Nodes</td>
+<td><code>/api/nodes</code></td>
+</tr>
+<tr>
+<td><code>page-node-detail</code></td>
+<td>（子页）</td>
+<td><code>/api/nodes/:name/detail</code></td>
+</tr>
+<tr>
+<td><code>page-ros</code></td>
+<td>ROS Topics</td>
+<td><code>/api/ros/topics</code>、<code>topic_echo</code> 等</td>
+</tr>
+<tr>
+<td><code>page-devices</code></td>
+<td>Device Type</td>
+<td><code>/api/devices/*</code>、<code>/api/eth1_switch_status</code></td>
+</tr>
+<tr>
+<td><code>page-config</code></td>
+<td>Config</td>
+<td><code>/api/config/*</code></td>
+</tr>
+<tr>
+<td><code>page-video</code></td>
+<td>Video Stream</td>
+<td><code>/api/video/*</code>、<code>/api/ptz/control</code></td>
+</tr>
+<tr>
+<td><code>page-bag</code></td>
+<td>ROS Bag</td>
+<td><code>/api/bag/*</code></td>
+</tr>
+<tr>
+<td><code>page-capture</code></td>
+<td>Capture</td>
+<td><code>/api/capture/*</code></td>
+</tr>
+</tbody>
+</table>
+<p>页面切换逻辑：<code>loadCurrentPage()</code> 根据 <code>data-page</code> 属性显示对应 <code>.page</code>，并启动/停止各页定时器。</p>
+<hr />
+<h2 id="8">8. 部署与运行</h2>
+<h3 id="81">8.1 部署架构图</h3>
+<pre><code class="language-mermaid">flowchart TB
+  subgraph build [构建阶段]
+    Src[&quot;ros_ws/src/sysmonit&quot;]
+    Colcon[&quot;colcon build --packages-select sysmonit&quot;]
+    Install[&quot;install/sysmonit/&lt;br/&gt;lib/sysmonit/sysmonit&lt;br/&gt;share/sysmonit/web/&quot;]
+    Src --&gt; Colcon --&gt; Install
+  end
+
+  subgraph runtime [运行阶段]
+    StartSh[&quot;ros_ws/scripts/start.sh&lt;br/&gt;或 ros2 launch&quot;]
+    Monit[&quot;monit&lt;br/&gt;skyfend-ptz100-monit&quot;]
+    BootApp[&quot;boot_app.sh sysmonit start&quot;]
+    Exec[&quot;sysmonit 可执行文件&quot;]
+    PID[&quot;/tmp/sysmonit.pid&quot;]
+
+    StartSh --&gt; Exec
+    Monit --&gt; BootApp --&gt; Exec
+    Exec --&gt; PID
+  end
+
+  subgraph access [访问]
+    Browser[&quot;http://AGX_IP:12345/&quot;]
+    Exec --&gt; Browser
+  end
+
+  Install --&gt; StartSh
+  Install --&gt; BootApp
+</code></pre>
+<h3 id="82">8.2 进程启停链路</h3>
+<pre><code class="language-mermaid">sequenceDiagram
+  participant W as Web / API
+  participant S as sysmonit
+  participant M as program_monit.sh
+  participant B as skyfend-ptz100.sh
+  participant Mon as monit
+
+  W-&gt;&gt;S: POST /api/nodes/ptz_service/restart
+  S-&gt;&gt;S: std::thread 异步执行 node_action
+  alt program_monit.sh 可执行
+    S-&gt;&gt;M: program_monit.sh ptz_service restart
+  else 回退
+    S-&gt;&gt;B: bash skyfend-ptz100.sh -s ptz_service -e restart
+  end
+  M-&gt;&gt;Mon: monit restart ptz_service
+  B-&gt;&gt;Mon: 等效启停
+  Mon--&gt;&gt;S: 进程状态变化
+  S--&gt;&gt;W: GET /api/nodes 反映新状态
+</code></pre>
+<h3 id="83">8.3 编译安装</h3>
+<pre><code class="language-bash">cd /path/to/ros_ws
+source /opt/ros/humble/setup.bash
+colcon build --packages-select sysmonit
+source install/setup.bash
+</code></pre>
+<p>静态资源安装至：<code>install/sysmonit/share/sysmonit/web/</code>。</p>
+<h3 id="84">8.4 启动方式</h3>
+<pre><code class="language-bash"># ROS launch
+ros2 launch sysmonit sysmonit.launch.xml
+
+# 或直接运行
+ros2 run sysmonit sysmonit
+</code></pre>
+<p><code>ros_ws/scripts/start.sh</code> 亦通过 <code>nohup</code> 启动 sysmonit。</p>
+<h3 id="85-monit">8.5 monit 托管</h3>
+<p><code>config/monit/skyfend-ptz100-monit</code> 配置：</p>
+<pre><code>check process sysmonit with pidfile /tmp/sysmonit.pid
+    start program = &quot;.../boot_app.sh sysmonit start&quot;
+    stop program  = &quot;.../boot_app.sh sysmonit stop&quot;
+    restart program = &quot;.../boot_app.sh sysmonit restart&quot;
+</code></pre>
+<p>进程启停优先调用 <code>config/tools/program_monit.sh</code>，否则回退 <code>config/boot/skyfend-ptz100.sh</code>。</p>
+<h3 id="86">8.6 关键路径常量</h3>
+<table>
+<thead>
+<tr>
+<th>常量</th>
+<th>路径</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HTTP 端口</td>
+<td><code>12345</code></td>
+</tr>
+<tr>
+<td>配置目录</td>
+<td><code>/home/skyfend/config</code></td>
+</tr>
+<tr>
+<td>Bag 目录</td>
+<td><code>/home/skyfend/rosbag</code></td>
+</tr>
+<tr>
+<td>抓包目录</td>
+<td><code>/home/skyfend/capture</code></td>
+</tr>
+<tr>
+<td>Pipeline 状态</td>
+<td><code>/tmp/video_pipeline_status.json</code></td>
+</tr>
+<tr>
+<td>Nexus RTMP 缓存</td>
+<td><code>/tmp/nexus_stream_urls.json</code></td>
+</tr>
+<tr>
+<td>MediaMTX RTSP</td>
+<td><code>:9554</code></td>
+</tr>
+<tr>
+<td>MediaMTX WHEP</td>
+<td><code>:8889</code></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="9">9. 安全与运维注意</h2>
+<ol>
+<li><strong>默认密码硬编码</strong>：<code>admin/monit</code> 写在源码中，生产环境务必修改或外置配置</li>
+<li><strong>无 TLS</strong>：HTTP 明文传输，仅建议内网/VPN 使用，或通过 Nginx 反代加 HTTPS</li>
+<li><strong>命令执行风险</strong>：多处 <code>popen</code>/<code>system</code>/<code>fork</code> 执行 shell 与 <code>ros2</code>，需控制运行用户权限</li>
+<li><strong>sudo 依赖</strong>：monit summary、arp-scan 等使用 <code>echo 123456 | sudo -S</code></li>
+<li><strong>慢 API 占满 worker</strong>：<code>ros2 topic hz</code>、bag 打包等耗时操作会阻塞 libhv worker，前端不宜过高频轮询</li>
+<li><strong>前端更新</strong>：修改 <code>index.html</code> 后需重新 <code>colcon build</code> 并重启节点</li>
+</ol>
+<hr />
+<h2 id="10">10. 扩展开发建议</h2>
+<h3 id="101-api">10.1 新增 API</h3>
+<ol>
+<li>在 <code>http_api.hpp</code> 声明 Handler</li>
+<li>在 <code>http_api.cpp</code> 实现逻辑</li>
+<li>在 <code>register_routes()</code> 注册路由（注意路径前缀顺序）</li>
+<li>在 <code>index.html</code> 增加 <code>req('/api/...')</code> 调用</li>
+</ol>
+<h3 id="102-tab">10.2 新增前端 Tab</h3>
+<ol>
+<li>增加 <code>id="page-xxx"</code> 区块与导航 <code>data-page="xxx"</code></li>
+<li>在 <code>loadCurrentPage()</code> 增加分支</li>
+<li>实现 <code>loadXxx()</code> 与对应定时器启停</li>
+</ol>
+<h3 id="103">10.3 建议外置化的配置</h3>
+<table>
+<thead>
+<tr>
+<th>当前硬编码</th>
+<th>建议</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HTTP 端口 12345</td>
+<td>ROS 参数或 YAML</td>
+</tr>
+<tr>
+<td>账号密码</td>
+<td>环境变量或加密配置文件</td>
+</tr>
+<tr>
+<td>目录路径</td>
+<td>ROS 参数</td>
+</tr>
+<tr>
+<td>monit sudo 密码</td>
+<td>专用 sudoers 免密规则</td>
+</tr>
+</tbody>
+</table>
+<h3 id="104">10.4 相关文档</h3>
+<ul>
+<li>包内简要说明：<code>ros_ws/src/sysmonit/readme.md</code></li>
+<li>PTZ 多设备方案：<code>doc/和普PTZ多设备支持改造方案.md</code></li>
+<li>Nexus 推流：<code>doc/NexusGateway_开发方案.md</code></li>
+</ul>
+<hr />
+<p><em>文档维护：随 <code>ros_ws/src/sysmonit</code> 代码演进同步更新。</em></p></article>
+    <script>
+        // Sync theme with parent page
+        try {
+            var parentTheme = window.parent.document.documentElement.getAttribute('data-theme');
+            if (parentTheme) document.documentElement.setAttribute('data-theme', parentTheme);
+            // Listen for theme changes
+            var observer = new MutationObserver(function(mutations) {
+                mutations.forEach(function(m) {
+                    if (m.attributeName === 'data-theme') {
+                        var t = window.parent.document.documentElement.getAttribute('data-theme');
+                        if (t) document.documentElement.setAttribute('data-theme', t);
+                    }
+                });
+            });
+            observer.observe(window.parent.document.documentElement, { attributes: true });
+        } catch(e) {}
+    </script>
+</body>
+</html>

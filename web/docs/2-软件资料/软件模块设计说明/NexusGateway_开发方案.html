@@ -1,0 +1,1889 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NexusGateway 开发方案</title>
+    <link rel="stylesheet" href="../../css/markdown.css">
+</head>
+<body>
+    <article class="markdown-body"><h1 id="nexusgateway">NexusGateway 开发方案</h1>
+<blockquote>
+<p><strong>项目</strong>：Spotter Pro 直接上云（直连天盾云平台）<br />
+<strong>模块名称</strong>：NexusGateway<br />
+<strong>文档版本</strong>：v1.1<br />
+<strong>日期</strong>：2026-03-31</p>
+</blockquote>
+<hr />
+<h2 id="_1">目录</h2>
+<ol>
+<li><a href="#1-项目背景与目标">项目背景与目标</a></li>
+<li><a href="#2-现有代码分析">现有代码分析</a></li>
+<li><a href="#3-架构设计">架构设计</a></li>
+<li><a href="#4-ros-topic-订阅发布总表">ROS Topic 订阅/发布总表</a></li>
+<li><a href="#5-模块目录结构">模块目录结构</a></li>
+<li><a href="#6-核心接口设计">核心接口设计</a></li>
+<li><a href="#7-实现步骤">实现步骤</a></li>
+<li><a href="#8-在线离线生命周期时序">在线/离线生命周期时序</a></li>
+<li><a href="#9-关键风险及应对">关键风险及应对</a></li>
+<li><a href="#10-实现优先级与工期估算">实现优先级与工期估算</a></li>
+</ol>
+<hr />
+<h2 id="1">1. 项目背景与目标</h2>
+<h3 id="11">1.1 背景</h3>
+<p>Spotter Pro 是公司自研的侦测反制一体化设备（设备领域 domain=4，设备类型 type=1016）。天盾是公司平台软件部开发的云平台，功能类似 C2，通过标准 MQTT 物模型协议与设备通信。</p>
+<p><strong>本项目目标</strong>：Spotter Pro 设备通过 MQTT 协议直接连接天盾云平台，实现设备管理、数据上报、云端命令下发等功能，<strong>无 C2 网关中转</strong>。</p>
+<h3 id="12">1.2 核心通信关系</h3>
+<p>由于 Spotter Pro 直接上云，设备本身即充当网关角色，因此：</p>
+<ul>
+<li><code>{gateway_sn}</code> = <code>{device_sn}</code> = Spotter Pro 序列号（SN）</li>
+<li>设备直接与天盾 MQTT Broker 建立长连接</li>
+</ul>
+<h3 id="13-mqtt-topic">1.3 天盾 MQTT Topic 标准</h3>
+<p>天盾平台定义了两类 Topic 前缀：</p>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>Topic 前缀</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>基础类</td>
+<td><code>sys/</code></td>
+<td>通用上云功能，如设备生命周期状态更新</td>
+</tr>
+<tr>
+<td>物模型类</td>
+<td><code>thing/</code></td>
+<td>物模型功能，围绕 Property、Service、Event 展开</td>
+</tr>
+</tbody>
+</table>
+<p><strong>消息公共字段</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>类型</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>tid</code></td>
+<td>string</td>
+<td>事务 UUID，长度 &lt; 50，标识一次消息通信</td>
+</tr>
+<tr>
+<td><code>bid</code></td>
+<td>string</td>
+<td>业务 UUID，标识跨多次通信的业务流程</td>
+</tr>
+<tr>
+<td><code>timestamp</code></td>
+<td>int64</td>
+<td>消息发送时的 UTC 毫秒时间戳（13位）</td>
+</tr>
+<tr>
+<td><code>method</code></td>
+<td>string</td>
+<td>物模型方法标识符</td>
+</tr>
+<tr>
+<td><code>gateway</code></td>
+<td>string</td>
+<td>网关设备 SN</td>
+</tr>
+<tr>
+<td><code>need_reply</code></td>
+<td>int</td>
+<td>0=不需要回复，1=需要回复（events topic 使用）</td>
+</tr>
+<tr>
+<td><code>data</code></td>
+<td>object</td>
+<td>消息具体内容</td>
+</tr>
+</tbody>
+</table>
+<p><strong>完整 MQTT Topic 定义</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>方向</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>thing/product/{sn}/osd</code></td>
+<td>设备→云</td>
+<td>定频属性推送（心跳、目标数据，1条/秒）</td>
+</tr>
+<tr>
+<td><code>thing/product/{sn}/state</code></td>
+<td>设备→云</td>
+<td>按需上报设备配置</td>
+</tr>
+<tr>
+<td><code>thing/product/{sn}/state_reply</code></td>
+<td>云→设备</td>
+<td>配置上报回复</td>
+</tr>
+<tr>
+<td><code>thing/product/{sn}/register</code></td>
+<td>设备→云</td>
+<td>设备注册</td>
+</tr>
+<tr>
+<td><code>thing/product/{sn}/register_reply</code></td>
+<td>云→设备</td>
+<td>注册回复</td>
+</tr>
+<tr>
+<td><code>thing/product/{sn}/services</code></td>
+<td>云→设备</td>
+<td>云端下发服务命令</td>
+</tr>
+<tr>
+<td><code>thing/product/{sn}/services_reply</code></td>
+<td>设备→云</td>
+<td>服务命令执行结果</td>
+</tr>
+<tr>
+<td><code>thing/product/{sn}/events</code></td>
+<td>设备→云</td>
+<td>设备事件上报</td>
+</tr>
+<tr>
+<td><code>thing/product/{sn}/events_reply</code></td>
+<td>云→设备</td>
+<td>事件回复</td>
+</tr>
+<tr>
+<td><code>thing/product/{sn}/requests</code></td>
+<td>设备→云</td>
+<td>设备请求（如临时上传凭证）</td>
+</tr>
+<tr>
+<td><code>thing/product/{sn}/requests_reply</code></td>
+<td>云→设备</td>
+<td>请求回复</td>
+</tr>
+<tr>
+<td><code>thing/product/{sn}/property/set</code></td>
+<td>云→设备</td>
+<td>属性设置命令</td>
+</tr>
+<tr>
+<td><code>thing/product/{sn}/property/set_reply</code></td>
+<td>设备→云</td>
+<td>属性设置响应</td>
+</tr>
+<tr>
+<td><code>sys/product/{sn}/status</code></td>
+<td>设备→云</td>
+<td>设备上下线状态更新</td>
+</tr>
+<tr>
+<td><code>sys/product/{sn}/status_reply</code></td>
+<td>云→设备</td>
+<td>平台响应</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="2">2. 现有代码分析</h2>
+<h3 id="21-publicmqttmqttclient-bug">2.1 <code>public/mqtt/MqttClient</code> —— 可复用，含一处 Bug</h3>
+<p><strong>文件路径</strong>：<code>public/mqtt/MqttClient.h</code> / <code>public/mqtt/MqttClient.cpp</code></p>
+<p><code>CMQTTClient</code> 是对 libmosquitto 的轻量封装，职责单一，结构清晰，<strong>作为传输层直接复用</strong>。</p>
+<p><strong>接口摘要</strong>：</p>
+<pre><code class="language-cpp">class CMQTTClient {
+public:
+    int  InitClientInfo(const string&amp; clientId, const string&amp; server,
+                        uint16_t port, const string&amp; user, const string&amp; passwd);
+    bool Connect(uint32_t keepalive);
+    bool Disconnect();
+    bool Publish(const std::string&amp; topic, const std::string&amp; message);
+    bool Subscribe(const std::string&amp; topic);
+    int  Start(void);   // 启动 mosquitto_loop_start（后台线程）
+    void SetMessageHandler(MQTTMessageHandler handler, void* arg);
+    bool IsConnected();
+};
+</code></pre>
+<p><strong>已知 Bug</strong>：<code>Disconnect()</code> 方法条件逻辑取反，<code>MOSQ_ERR_SUCCESS</code> 时错误地返回 <code>false</code>：</p>
+<pre><code class="language-cpp">// public/mqtt/MqttClient.cpp:86-93  ← 存在 Bug
+bool CMQTTClient::Disconnect()
+{
+    if(MOSQ_ERR_SUCCESS == mosquitto_disconnect(m_mosq))
+    {
+        skyfend_log_error(&quot;mosquitto_disconnect error.&quot;); // 逻辑反了
+        return false;
+    }
+    return true;
+}
+</code></pre>
+<p>在 <code>MqttTransport</code> 封装层内绕过此方法，直接调用底层 API 或修正逻辑。</p>
+<h3 id="22-electronic_fencemqttagent-topic">2.2 <code>electronic_fence/MQTTAgent</code> —— 不复用，仅参考 topic 格式</h3>
+<p><strong>文件路径</strong>：<code>ros_ws/src/electronic_fence/src/mqtt/MQTTAgent.cpp</code>（约 2667 行）</p>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>具体表现</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>God Class 反模式</strong></td>
+<td>单文件近 2700 行，注册、心跳、目标上报、日志上传、OBS 云存储、雷达掩码全堆在一个类</td>
+</tr>
+<tr>
+<td><strong>职责混乱</strong></td>
+<td>MQTT 传输、JSON 构造、业务逻辑、ROS 数据订阅全部耦合在同一个类中</td>
+</tr>
+<tr>
+<td><strong>无重连机制</strong></td>
+<td>断线后没有指数退避重连逻辑</td>
+</tr>
+<tr>
+<td><strong>硬编码常量</strong></td>
+<td>Topic 字符串、设备类型等散落各处</td>
+</tr>
+<tr>
+<td><strong>线程不安全</strong></td>
+<td>多处 <code>Publish()</code> 调用无互斥锁保护</td>
+</tr>
+<tr>
+<td><strong>可借鉴之处</strong></td>
+<td>JSON 配置加载模式（<code>InitFromJSON</code>）、Topic 格式字符串、OSD 字段命名</td>
+</tr>
+</tbody>
+</table>
+<p><strong>结论：不复用，重新设计并实现 NexusGateway 模块。</strong></p>
+<hr />
+<h2 id="3">3. 架构设计</h2>
+<h3 id="31">3.1 四层分层架构</h3>
+<pre><code class="language-mermaid">flowchart TB
+    subgraph ros_layer [ROS2 Node Layer]
+        node[&quot;nexus_gateway_node\n(入口 &amp; ROS2 生命周期管理)&quot;]
+        bridge[&quot;RosDataBridge\n(实现 INexusDataSource\n &amp; INexusCommandSink)&quot;]
+    end
+
+    subgraph biz_layer [Business Logic Layer]
+        gateway[&quot;NexusGateway\n(编排器)&quot;]
+        lifecycle[&quot;DeviceLifecycle\n(上线/下线/注册/心跳)&quot;]
+        targetpub[&quot;TargetPublisher\n(侦测目标 OSD 上报)&quot;]
+        cfgreport[&quot;ConfigReporter\n(设备配置 state 上报)&quot;]
+        svchandler[&quot;ServiceHandler\n(services 命令处理)&quot;]
+        prophander[&quot;PropertyHandler\n(property/set 处理)&quot;]
+    end
+
+    subgraph proto_layer [Protocol Layer]
+        builder[&quot;ThingModelBuilder\n(JSON 序列化)&quot;]
+        parser[&quot;ThingModelParser\n(JSON 反序列化)&quot;]
+        topics[&quot;TopicManager\n(Topic 字符串管理)&quot;]
+        dispatcher[&quot;MessageDispatcher\n(下行消息路由)&quot;]
+    end
+
+    subgraph transport_layer [Transport Layer]
+        transport[&quot;MqttTransport\n(重连 + 发布队列)&quot;]
+        mqttclient[&quot;CMQTTClient\n(public/mqtt 复用)&quot;]
+    end
+
+    broker[(&quot;天盾 MQTT Broker&quot;)]
+
+    node --&gt; bridge
+    bridge --&gt;|&quot;INexusDataSource\nINexusCommandSink&quot;| gateway
+    gateway --&gt; lifecycle
+    gateway --&gt; targetpub
+    gateway --&gt; cfgreport
+    gateway --&gt; svchandler
+    gateway --&gt; prophander
+
+    lifecycle --&gt; builder
+    targetpub --&gt; builder
+    cfgreport --&gt; builder
+    svchandler --&gt; builder
+    prophander --&gt; builder
+    dispatcher --&gt; parser
+    dispatcher --&gt; svchandler
+    dispatcher --&gt; prophander
+
+    builder --&gt; transport
+    parser --&gt; dispatcher
+    transport --&gt; mqttclient
+    mqttclient &lt;--&gt; broker
+</code></pre>
+<h3 id="32">3.2 数据流向</h3>
+<pre><code class="language-mermaid">flowchart LR
+    subgraph up [上行流 Device to Cloud]
+        ros_topic[&quot;ROS Topics\n(融合目标/设备状态)&quot;]
+        data_bridge[&quot;RosDataBridge\n实现 INexusDataSource&quot;]
+        biz[&quot;业务层\n触发上报&quot;]
+        json_build[&quot;ThingModelBuilder\n构建 JSON&quot;]
+        pub_queue[&quot;MqttTransport\n发布队列(线程安全)&quot;]
+        broker_up[&quot;天盾 Broker&quot;]
+        ros_topic --&gt; data_bridge --&gt; biz --&gt; json_build --&gt; pub_queue --&gt; broker_up
+    end
+
+    subgraph down [下行流 Cloud to Device]
+        broker_down[&quot;天盾 Broker&quot;]
+        recv[&quot;MqttTransport\nOnMessage 回调&quot;]
+        parse[&quot;ThingModelParser&quot;]
+        dispatch[&quot;MessageDispatcher\n按 method 路由&quot;]
+        handler[&quot;ServiceHandler\nPropertyHandler&quot;]
+        cmd_sink[&quot;INexusCommandSink\n回调业务层/ROS&quot;]
+        broker_down --&gt; recv --&gt; parse --&gt; dispatch --&gt; handler --&gt; cmd_sink
+    end
+</code></pre>
+<h3 id="33">3.3 关键设计原则</h3>
+<table>
+<thead>
+<tr>
+<th>原则</th>
+<th>落地方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>接口隔离</strong></td>
+<td>每层之间通过纯虚接口通信，上下层不直接依赖具体类</td>
+</tr>
+<tr>
+<td><strong>单一职责</strong></td>
+<td>每个类代码量控制在 300 行以内，只做一件事</td>
+</tr>
+<tr>
+<td><strong>线程安全发布</strong></td>
+<td><code>MqttTransport</code> 内置 <code>std::queue + std::mutex</code>，消费者线程统一 publish</td>
+</tr>
+<tr>
+<td><strong>自动重连</strong></td>
+<td>断线后指数退避（1s → 2s → 4s → ... → 60s），重连后自动重订阅并触发重注册</td>
+</tr>
+<tr>
+<td><strong>配置驱动</strong></td>
+<td>所有 server/port/sn/credentials 从 JSON 文件加载，不硬编码</td>
+</tr>
+<tr>
+<td><strong>事件驱动命令处理</strong></td>
+<td>下行命令通过 <code>MessageDispatcher</code> 按 method 字符串分发，新增命令只需注册新 handler</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="4-ros-topic">4. ROS Topic 订阅/发布总表</h2>
+<blockquote>
+<p><strong>设计原则</strong>：<code>nexus_gateway_node</code> 是纯通信节点，不是主控节点。它只做两件事：<br />
+1. <strong>订阅</strong>各设备/算法节点发布的状态/侦测数据 → 通过 MQTT 上报天盾<br />
+2. <strong>发布</strong>从天盾收到的控制命令 → 驱动对应子设备节点响应</p>
+<p>参考 <code>ptz100_ros</code> 节点（<code>src/app/ros_app/ros_app.cpp</code>）的订阅模式，但去除主控逻辑。</p>
+</blockquote>
+<h3 id="41">4.1 系统节点关系图</h3>
+<pre><code class="language-mermaid">flowchart LR
+    subgraph devices [设备驱动节点]
+        ptz_svc[&quot;ptz_service\n(和普中程PTZ)&quot;]
+        dhp100_link[&quot;dhp100_link\n(DHP130雷达)&quot;]
+        gnss_b3[&quot;gnss_b3\n(GNSS模块)&quot;]
+        spoofer[&quot;spoofer\n(导航诱导)&quot;]
+        sfl200[&quot;sfl200\n(SFL200)&quot;]
+    end
+
+    subgraph alg [算法节点]
+        ptz100_ros[&quot;ptz100_ros\n(主控/桥接)&quot;]
+        rvfusion[&quot;rvfusion_service\n(雷视融合)&quot;]
+        ptz100_ai[&quot;ptz100_ai\n(视觉AI)&quot;]
+        ptz_guider[&quot;ptz_guider_ctl\n(引导/标定)&quot;]
+        dhp100_tracker[&quot;dhp100_tracker\n(雷达跟踪)&quot;]
+        self_calib[&quot;self_calibration_node\n(多雷达标定)&quot;]
+    end
+
+    subgraph nexus [nexus_gateway_node]
+        NexusGateway[&quot;NexusGateway\n(MQTT上云)&quot;]
+    end
+
+    cloud[&quot;天盾 Cloud\n(MQTT Broker)&quot;]
+
+    ptz_svc --&gt;|&quot;/ptz_status\n/ptz_lens_info\n/ptz_azimuth_pitch_info\n/ptz_device_info&quot;| NexusGateway
+    ptz100_ros --&gt;|&quot;/tracer_matrix_protocol_objs\n/tracer_matrix_spectrum_objs\n/tracerp_heart_beat\n/stp130_protocol_objs\n/stp130_spectrum_objs\n/sys_heartbeat\n/spoofer_heartbeat_info\n/ptz100_ros_sfl100_objs&quot;| NexusGateway
+    rvfusion --&gt;|&quot;/fusiontg_objs_c2\n/rvfusion_heartbeat_info&quot;| NexusGateway
+    ptz100_ai --&gt;|&quot;/visiblelight_track_objs\n/infrared_track_objs\n/vision_ai_heartbeat_info&quot;| NexusGateway
+    ptz_guider --&gt;|&quot;/ptz_guiding_info_vis\n/ptz_guider_ctl_heartbeat_info&quot;| NexusGateway
+    dhp100_link --&gt;|&quot;/dhp100_heartbeat\n/dhp100_detobjs\n/dhp120_status&quot;| NexusGateway
+    dhp100_tracker --&gt;|&quot;/dhp100_trackobjs&quot;| NexusGateway
+    gnss_b3 --&gt;|&quot;/gnss_b3_gga_info\n/gnss_b3_rmc_info&quot;| NexusGateway
+    self_calib --&gt;|&quot;/calib_state_info&quot;| NexusGateway
+
+    NexusGateway &lt;--&gt;|MQTT| cloud
+    NexusGateway --&gt;|&quot;/ptz_guidance_cmd\n/ptz_track_cmd\n/ptz_motion_cmd\n/ptz_lens_cmd&quot;| ptz_svc
+    NexusGateway --&gt;|&quot;/dhp120_cmd_req&quot;| dhp100_link
+    NexusGateway --&gt;|&quot;/from_user_obj_info&quot;| rvfusion
+    NexusGateway --&gt;|&quot;/cmd_set&quot;| ptz_guider
+</code></pre>
+<h3 id="42-nexus_gateway_node-topic">4.2 nexus_gateway_node 订阅的 Topic（上行：数据→天盾）</h3>
+<h4 id="a-ptz-ptz_service">A. PTZ 状态数据（来自 <code>ptz_service</code> 节点）</h4>
+<table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>消息类型</th>
+<th>说明</th>
+<th>上报天盾 method</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/ptz_status</code></td>
+<td><code>PtzStatus</code></td>
+<td>PTZ 实时状态（跟踪状态、工作模式等）</td>
+<td><code>device_heart</code></td>
+</tr>
+<tr>
+<td><code>/ptz_lens_info</code></td>
+<td><code>PtzLensInfo</code></td>
+<td>PTZ 相机镜头参数（焦距、变倍等）</td>
+<td><code>device_heart</code></td>
+</tr>
+<tr>
+<td><code>/ptz_azimuth_pitch_info</code></td>
+<td><code>PtzAzimuthPitchInfo</code></td>
+<td>PTZ 方位角/俯仰角实时角度</td>
+<td><code>device_posture</code></td>
+</tr>
+<tr>
+<td><code>/ptz_device_info</code></td>
+<td><code>PtzDeviceInfo</code></td>
+<td>PTZ 设备信息（和普中程PTZ，供AI算法数据来源配置）</td>
+<td><code>device_config</code></td>
+</tr>
+</tbody>
+</table>
+<h4 id="b-rvfusion_service-rvfusion_node">B. 融合侦测数据（来自 <code>rvfusion_service</code> 节点 / <code>rvfusion_node</code>）</h4>
+<table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>消息类型</th>
+<th>说明</th>
+<th>上报天盾 method</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/fusiontg_objs_c2</code></td>
+<td><code>FusionTargetPack</code></td>
+<td>雷视融合侦测目标（发给 C2 的专用 topic，nexus 直接复用）</td>
+<td><code>device_uav</code></td>
+</tr>
+<tr>
+<td><code>/rvfusion_heartbeat_info</code></td>
+<td><code>HeartbeatInfo</code></td>
+<td>融合节点心跳</td>
+<td><code>device_heart</code></td>
+</tr>
+</tbody>
+</table>
+<h4 id="c-tracermatrix-ptz100_ros-ros_app">C. TracerMatrix 侦测数据（来自 <code>ptz100_ros</code> 节点 / <code>ros_app</code>）</h4>
+<table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>消息类型</th>
+<th>说明</th>
+<th>上报天盾 method</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/tracer_matrix_spectrum_objs</code></td>
+<td><code>SpectrumTargetInfo</code></td>
+<td>TracerMatrix 频谱侦测数据</td>
+<td><code>device_uav_spectrum</code></td>
+</tr>
+<tr>
+<td><code>/tracer_matrix_protocol_objs</code></td>
+<td><code>ProtocolTargetInfo</code></td>
+<td>TracerMatrix 协议侦测数据（DroneID/RemoteID）</td>
+<td><code>device_uav</code></td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>说明</strong>：TracerMatrix <strong>无独立心跳 topic</strong>。心跳信息通过 <code>/sys_heartbeat</code> 中的设备列表上报，也可从 <code>ProtocolTargetInfo.device_type == DEV_TYPE_TRACER_MATRIX</code> 判断设备在线状态。TracerMatrix 的数据由 <code>ptz100_ros</code> 节点（即 <code>ros_app</code>）桥接自 Alink 协议层后发布到 ROS。</p>
+</blockquote>
+<h4 id="d-tracerp-stp120stp130-ptz100_ros-ros_app">D. TracerP (STP120/STP130) 数据（来自 <code>ptz100_ros</code> 节点 / <code>ros_app</code>）</h4>
+<table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>消息类型</th>
+<th>说明</th>
+<th>上报天盾 method</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/tracerp_heart_beat</code></td>
+<td><code>TracerpHeartBeat</code></td>
+<td>TracerP 心跳</td>
+<td><code>device_heart</code></td>
+</tr>
+<tr>
+<td><code>/stp130_spectrum_objs</code></td>
+<td><code>SpectrumTargetInfo</code></td>
+<td>TracerP 频谱侦测数据（topic 变量名 <code>tracerp_spectrum_detect_topic_</code>）</td>
+<td><code>device_uav_spectrum</code></td>
+</tr>
+<tr>
+<td><code>/stp130_protocol_objs</code></td>
+<td><code>ProtocolTargetInfo</code></td>
+<td>TracerP 协议侦测数据（DroneID/RemoteID）</td>
+<td><code>device_uav</code></td>
+</tr>
+<tr>
+<td><code>/tracerp_uav_info</code></td>
+<td><code>TracerpUavInfo</code></td>
+<td>TracerP 无人机详细信息</td>
+<td><code>device_uav</code></td>
+</tr>
+<tr>
+<td><code>/tracerp_uas_info</code></td>
+<td><code>TracerpUasInfo</code></td>
+<td>TracerP UAS 信息</td>
+<td><code>device_uav</code></td>
+</tr>
+<tr>
+<td><code>/tracerp_wifi_drone_info</code></td>
+<td><code>TracerpWifiDroneInfo</code></td>
+<td>TracerP WiFi 无人机数据</td>
+<td><code>device_uav</code></td>
+</tr>
+</tbody>
+</table>
+<h4 id="e-ai-ptz100_ai-ai_node">E. 视觉 AI 侦测数据（来自 <code>ptz100_ai</code> 节点 / <code>ai_node</code>）</h4>
+<table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>消息类型</th>
+<th>说明</th>
+<th>上报天盾 method</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/visiblelight_track_objs</code></td>
+<td><code>AiTargetInfo</code></td>
+<td>可见光跟踪目标（耐杰中程PTZ 来自 <code>ptz100_ai</code>）</td>
+<td><code>device_uav</code></td>
+</tr>
+<tr>
+<td><code>/infrared_track_objs</code></td>
+<td><code>AiTargetInfo</code></td>
+<td>红外跟踪目标</td>
+<td><code>device_uav</code></td>
+</tr>
+<tr>
+<td><code>/vision_ai_heartbeat_info</code></td>
+<td><code>HeartbeatInfo</code></td>
+<td>视觉 AI 节点心跳</td>
+<td><code>device_heart</code></td>
+</tr>
+</tbody>
+</table>
+<h4 id="f-ptz_guider_ctl">F. 引导/标定数据（来自 <code>ptz_guider_ctl</code> 节点）</h4>
+<table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>消息类型</th>
+<th>说明</th>
+<th>上报天盾 method</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/ptz_guiding_info_vis</code></td>
+<td><code>PtzGuidingInfoVis</code></td>
+<td>PTZ 引导状态（锁定目标信息、引导方位）</td>
+<td><code>device_state</code></td>
+</tr>
+<tr>
+<td><code>/ptz_guider_ctl_heartbeat_info</code></td>
+<td><code>HeartbeatInfo</code></td>
+<td>引导节点心跳</td>
+<td><code>device_heart</code></td>
+</tr>
+</tbody>
+</table>
+<h4 id="g-dhp130-dhp100_link">G. DHP130 雷达数据（来自 <code>dhp100_link</code> 节点）</h4>
+<table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>消息类型</th>
+<th>说明</th>
+<th>上报天盾 method</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/dhp100_heartbeat</code></td>
+<td><code>Dhp100Heartbeat</code></td>
+<td>DHP130 雷达心跳（含设备状态）</td>
+<td><code>device_heart</code></td>
+</tr>
+<tr>
+<td><code>/dhp100_detobjs</code></td>
+<td><code>DhpTargetPack</code></td>
+<td>雷达原始探测点迹</td>
+<td><code>device_uav</code></td>
+</tr>
+<tr>
+<td><code>/dhp120_status</code></td>
+<td><code>DhpStatusUpload</code></td>
+<td>雷达状态上报（DHP120/130）</td>
+<td><code>device_heart</code></td>
+</tr>
+</tbody>
+</table>
+<h4 id="h-dhp100_tracker">H. 中程四面阵雷达跟踪数据（来自 <code>dhp100_tracker</code> 节点）</h4>
+<table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>消息类型</th>
+<th>说明</th>
+<th>上报天盾 method</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/dhp100_trackobjs</code></td>
+<td><code>RadarTrackInfo</code></td>
+<td>雷达跟踪目标（经 tracker 处理后）</td>
+<td><code>device_uav</code></td>
+</tr>
+</tbody>
+</table>
+<h4 id="i-spoofer-ptz100_ros-ros_app">I. 系统心跳与 Spoofer 数据（来自 <code>ptz100_ros</code> 节点 / <code>ros_app</code>）</h4>
+<table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>消息类型</th>
+<th>说明</th>
+<th>上报天盾 method</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/sys_heartbeat</code></td>
+<td><code>SysHeartbeat</code></td>
+<td>系统级整体心跳（含设备列表在线状态）</td>
+<td><code>device_heart</code></td>
+</tr>
+<tr>
+<td><code>/spoofer_heartbeat_info</code></td>
+<td><code>HeartbeatInfo</code></td>
+<td>导航诱导（NSF400/Spoofer）心跳</td>
+<td><code>device_heart</code></td>
+</tr>
+<tr>
+<td><code>/ptz100_ros_sfl100_objs</code></td>
+<td><code>SentryTargetPack</code></td>
+<td>SFL200 侦测目标（通过 ptz100_ros 桥接）</td>
+<td><code>device_uav</code></td>
+</tr>
+<tr>
+<td><code>/efence_heart_beat</code></td>
+<td><code>EFenceHeartBeat</code></td>
+<td>电子围栏心跳</td>
+<td><code>device_heart</code></td>
+</tr>
+</tbody>
+</table>
+<h4 id="j-gnss-gnss_b3">J. GNSS 定位数据（来自 <code>gnss_b3</code> 节点）</h4>
+<table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>消息类型</th>
+<th>说明</th>
+<th>上报天盾 method</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/gnss_b3_gga_info</code></td>
+<td><code>GnssGgaInfo</code></td>
+<td>GNSS GGA 定位数据（经纬度、海拔）</td>
+<td><code>device_heart</code> 中的位置字段</td>
+</tr>
+<tr>
+<td><code>/gnss_b3_rmc_info</code></td>
+<td><code>GnssRmcInfo</code></td>
+<td>GNSS RMC 速度/航向数据</td>
+<td><code>device_heart</code> 中的位置字段</td>
+</tr>
+</tbody>
+</table>
+<h4 id="k-self_calibration_node">K. 标定状态（来自 <code>self_calibration_node</code> 节点）</h4>
+<table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>消息类型</th>
+<th>说明</th>
+<th>上报天盾 method</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/calib_state_info</code></td>
+<td><code>UserCalibState</code></td>
+<td>多雷达标定状态（按需上报）</td>
+<td><code>device_config</code></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h3 id="43-nexus_gateway_node-topic">4.3 nexus_gateway_node 发布的 Topic（下行：天盾命令→子设备）</h3>
+<h4 id="a-ptz-ptz_service-ptz_guider_ctl">A. PTZ 控制命令（发布给 <code>ptz_service</code> / <code>ptz_guider_ctl</code> 节点）</h4>
+<table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>消息类型</th>
+<th>说明</th>
+<th>天盾 method 来源</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/ptz_guidance_cmd</code></td>
+<td><code>PtzGuidanceCmd</code></td>
+<td>PTZ 引导到指定目标</td>
+<td><code>sflHitUav</code> / <code>services</code></td>
+</tr>
+<tr>
+<td><code>/ptz_track_cmd</code></td>
+<td><code>PtzTrackCmd</code></td>
+<td>PTZ 跟踪命令</td>
+<td><code>services</code></td>
+</tr>
+<tr>
+<td><code>/ptz_motion_cmd</code></td>
+<td><code>PtzMotionCmd</code></td>
+<td>PTZ 云台运动控制（方位/俯仰角手动调节）</td>
+<td><code>property/set</code></td>
+</tr>
+<tr>
+<td><code>/ptz_lens_cmd</code></td>
+<td><code>PtzLensCmd</code></td>
+<td>PTZ 镜头控制（变倍/聚焦）</td>
+<td><code>property/set</code></td>
+</tr>
+<tr>
+<td><code>/ptz_manual_lock_target_cmd</code></td>
+<td><code>PtzManualLockTargetCmd</code></td>
+<td>手动锁定目标</td>
+<td><code>services</code></td>
+</tr>
+<tr>
+<td><code>/ptz_switch_tracking_source_cmd</code></td>
+<td><code>PtzSwitchTrackingSourceCmd</code></td>
+<td>切换跟踪源</td>
+<td><code>property/set</code></td>
+</tr>
+</tbody>
+</table>
+<h4 id="b-dhp100_link">B. 雷达控制命令（发布给 <code>dhp100_link</code> 节点）</h4>
+<table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>消息类型</th>
+<th>说明</th>
+<th>天盾 method 来源</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/dhp120_cmd_req</code></td>
+<td><code>Dhp120CmdReq</code></td>
+<td>DHP130 雷达命令下发（开关雷达、模式切换等）</td>
+<td><code>services</code></td>
+</tr>
+</tbody>
+</table>
+<h4 id="c-rvfusion_service-ptz_guider_ctl">C. 融合/引导控制（发布给 <code>rvfusion_service</code> / <code>ptz_guider_ctl</code> 节点）</h4>
+<table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>消息类型</th>
+<th>说明</th>
+<th>天盾 method 来源</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/from_user_obj_info</code></td>
+<td><code>FromUserObjListInfo</code></td>
+<td>用户指定目标（云端指定打击目标）</td>
+<td><code>sflHitUav</code></td>
+</tr>
+<tr>
+<td><code>/cmd_set</code></td>
+<td><code>CmdSet</code></td>
+<td>全局命令集（系统级控制）</td>
+<td><code>services</code></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h3 id="44-topic">4.4 Topic 汇总统计</h3>
+<table>
+<thead>
+<tr>
+<th>分类</th>
+<th>订阅数量</th>
+<th>发布数量</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PTZ 状态</td>
+<td>4</td>
+<td>6</td>
+</tr>
+<tr>
+<td>融合侦测</td>
+<td>2</td>
+<td>2</td>
+</tr>
+<tr>
+<td>TracerMatrix</td>
+<td>2</td>
+<td>0</td>
+</tr>
+<tr>
+<td>TracerP (STP)</td>
+<td>6</td>
+<td>0</td>
+</tr>
+<tr>
+<td>视觉 AI</td>
+<td>3</td>
+<td>0</td>
+</tr>
+<tr>
+<td>引导/标定</td>
+<td>2</td>
+<td>1</td>
+</tr>
+<tr>
+<td>DHP130 雷达</td>
+<td>3</td>
+<td>1</td>
+</tr>
+<tr>
+<td>系统/Spoofer/SFL</td>
+<td>4</td>
+<td>0</td>
+</tr>
+<tr>
+<td>GNSS</td>
+<td>2</td>
+<td>0</td>
+</tr>
+<tr>
+<td>标定状态</td>
+<td>1</td>
+<td>0</td>
+</tr>
+<tr>
+<td><strong>合计</strong></td>
+<td><strong>29</strong></td>
+<td><strong>10</strong></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="5">5. 模块目录结构</h2>
+<pre><code>ros_ws/src/nexus_gateway/
+├── CMakeLists.txt
+├── package.xml
+├── config/
+│   └── nexus_gateway.json              # 设备配置(server/port/sn/creds/device_info)
+├── include/
+│   └── nexus_gateway/
+│       ├── INexusDataSource.h          # 上行数据抽象接口（纯虚）
+│       └── INexusCommandSink.h         # 下行命令抽象接口（纯虚）
+└── src/
+    ├── main.cpp                        # ROS2 node 入口
+    │
+    ├── transport/
+    │   ├── CMakeLists.txt
+    │   ├── MqttTransport.h             # ITransport 实现，含重连+发布队列
+    │   └── MqttTransport.cpp
+    │
+    ├── protocol/
+    │   ├── CMakeLists.txt
+    │   ├── TopicManager.h              # 所有 topic 字符串常量/生成函数
+    │   ├── ThingModelMessage.h         # 公共消息 struct 定义（纯数据，无方法）
+    │   ├── ThingModelBuilder.h         # JSON 序列化（基于 cjson）
+    │   ├── ThingModelBuilder.cpp
+    │   ├── ThingModelParser.h          # JSON 反序列化
+    │   ├── ThingModelParser.cpp
+    │   ├── MessageDispatcher.h         # 按 topic+method 路由下行消息
+    │   └── MessageDispatcher.cpp
+    │
+    ├── service/
+    │   ├── CMakeLists.txt
+    │   ├── DeviceLifecycle.h           # 设备生命周期(上线/下线/注册/心跳定时器)
+    │   ├── DeviceLifecycle.cpp
+    │   ├── TargetPublisher.h           # 侦测目标 OSD 上报
+    │   ├── TargetPublisher.cpp
+    │   ├── ConfigReporter.h            # 设备配置 state 上报（含重试）
+    │   ├── ConfigReporter.cpp
+    │   ├── ServiceHandler.h            # services 命令处理
+    │   ├── ServiceHandler.cpp
+    │   ├── PropertyHandler.h           # property/set 处理
+    │   └── PropertyHandler.cpp
+    │
+    ├── ros/
+    │   ├── CMakeLists.txt
+    │   ├── RosDataBridge.h             # 订阅 ROS topics，实现 INexusDataSource/Sink
+    │   └── RosDataBridge.cpp
+    │
+    ├── NexusGateway.h                  # 顶层编排器声明
+    └── NexusGateway.cpp                # 顶层编排器实现（薄层，只做组装）
+</code></pre>
+<hr />
+<h2 id="6">6. 核心接口设计</h2>
+<h3 id="61-inexusdatasourceh">6.1 <code>INexusDataSource.h</code> —— 上行数据抽象接口</h3>
+<pre><code class="language-cpp">// include/nexus_gateway/INexusDataSource.h
+#pragma once
+#include &lt;functional&gt;
+#include &lt;vector&gt;
+#include &lt;cstdint&gt;
+#include &lt;string&gt;
+
+/*
+ * Struct: NexusDeviceHeartbeat
+ * Description: Spotter Pro 设备心跳数据（对应 method=device_heart）
+ */
+struct NexusDeviceHeartbeat {
+    double longitude;       // 经度（必填）
+    double latitude;        // 纬度（必填）
+    double altitude;        // 海拔高度（必填）
+    int    electricity;     // 电量百分比 0~100
+    int    workStatus;      // 设备工作状态
+    int    faultLevel;      // 故障等级 0=无异常 1=功能受限 2=无法使用
+    int    satellitesNum;   // GNSS 卫星数
+    float  elevation;       // 俯仰角
+    float  gunDirection;    // 方位角
+};
+
+/*
+ * Struct: NexusUavTarget
+ * Description: 侦测目标数据（对应 method=device_uav）
+ */
+struct NexusUavTarget {
+    std::string serialNum;          // 无人机 SN
+    std::string droneName;          // 无人机名称
+    double      droneLongitude;     // 经度
+    double      droneLatitude;      // 纬度
+    double      droneAltitude;      // 海拔
+    float       droneHeight;        // 相对高度
+    float       droneSpeed;         // 对地速度
+    float       droneAzimuth;       // 方向角
+    float       dronePitch;         // 俯仰角
+    float       droneVerticalSpeed; // 垂直速度
+    double      pilotLongitude;     // 飞手经度
+    double      pilotLatitude;      // 飞手纬度
+    double      pilotAltitude;      // 飞手海拔
+    int         classification;     // 目标类别（0x01=无人机等）
+    int         classificationProb; // 类别置信度 0~100
+    int         objId;              // 融合 objId
+    uint32_t    source;             // 数据源 bitmask
+    int         existingProb;       // 目标存在概率 0~100
+    float       lifetime;           // 目标生命周期（秒）
+    int         dangerLevel;        // 威胁等级
+    int64_t     targetTimestamp;    // 目标时间戳（毫秒）
+};
+
+/*
+ * Class: INexusDataSource
+ * Description: 上行数据抽象接口，由 RosDataBridge 实现
+ *              业务层通过注册回调获取数据，不直接依赖 ROS
+ */
+class INexusDataSource {
+public:
+    virtual ~INexusDataSource() = default;
+
+    using HeartbeatCallback = std::function&lt;void(const NexusDeviceHeartbeat&amp;)&gt;;
+    using TargetCallback    = std::function&lt;void(const std::vector&lt;NexusUavTarget&gt;&amp;)&gt;;
+
+    virtual void SetHeartbeatCallback(HeartbeatCallback cb) = 0;
+    virtual void SetTargetCallback(TargetCallback cb) = 0;
+};
+</code></pre>
+<h3 id="62-inexuscommandsinkh">6.2 <code>INexusCommandSink.h</code> —— 下行命令抽象接口</h3>
+<pre><code class="language-cpp">// include/nexus_gateway/INexusCommandSink.h
+#pragma once
+#include &lt;string&gt;
+#include &lt;functional&gt;
+#include &quot;INexusDataSource.h&quot;   // 复用 NexusUavTarget
+
+/*
+ * Class: INexusCommandSink
+ * Description: 下行命令抽象接口，由 RosDataBridge 实现
+ *              云端命令通过此接口转发到 ROS 执行层
+ */
+class INexusCommandSink {
+public:
+    virtual ~INexusCommandSink() = default;
+
+    using RebootCallback    = std::function&lt;void(const std::string&amp; tid,
+                                                  const std::string&amp; bid)&gt;;
+    using HitUavCallback    = std::function&lt;void(const std::string&amp; tid,
+                                                  const std::string&amp; bid,
+                                                  const NexusUavTarget&amp; target)&gt;;
+    using HitParamCallback  = std::function&lt;void(const std::string&amp; tid,
+                                                  const std::string&amp; bid,
+                                                  int angleBegin, int angleEnd,
+                                                  int hitTime,
+                                                  int pitchBegin, int pitchEnd)&gt;;
+    using HitModeCallback   = std::function&lt;void(const std::string&amp; tid,
+                                                  const std::string&amp; bid,
+                                                  int hitMode)&gt;;
+    using PowerOnOffCallback = std::function&lt;void(const std::string&amp; tid,
+                                                   const std::string&amp; bid,
+                                                   int switchStatus)&gt;;
+    using StopHitCallback   = std::function&lt;void(const std::string&amp; tid,
+                                                  const std::string&amp; bid)&gt;;
+
+    virtual void SetRebootCallback(RebootCallback cb)       = 0;
+    virtual void SetHitUavCallback(HitUavCallback cb)       = 0;
+    virtual void SetHitParamCallback(HitParamCallback cb)   = 0;
+    virtual void SetHitModeCallback(HitModeCallback cb)     = 0;
+    virtual void SetPowerOnOffCallback(PowerOnOffCallback cb) = 0;
+    virtual void SetStopHitCallback(StopHitCallback cb)     = 0;
+};
+</code></pre>
+<h3 id="63-topicmanagerh-topic">6.3 <code>TopicManager.h</code> —— Topic 字符串管理</h3>
+<pre><code class="language-cpp">// src/protocol/TopicManager.h
+#pragma once
+#include &lt;string&gt;
+
+/*
+ * Class: TopicManager
+ * Description: 集中管理所有 MQTT Topic 字符串，避免硬编码散落各处
+ *              所有 topic 均以设备 SN 为参数动态生成
+ */
+class TopicManager {
+public:
+    explicit TopicManager(const std::string&amp; sn) : m_sn(sn) {}
+
+    // 物模型类 Topic
+    std::string TopicOsd()              const { return &quot;thing/product/&quot; + m_sn + &quot;/osd&quot;; }
+    std::string TopicState()            const { return &quot;thing/product/&quot; + m_sn + &quot;/state&quot;; }
+    std::string TopicStateReply()       const { return &quot;thing/product/&quot; + m_sn + &quot;/state_reply&quot;; }
+    std::string TopicRegister()         const { return &quot;thing/product/&quot; + m_sn + &quot;/register&quot;; }
+    std::string TopicRegisterReply()    const { return &quot;thing/product/&quot; + m_sn + &quot;/register_reply&quot;; }
+    std::string TopicServices()         const { return &quot;thing/product/&quot; + m_sn + &quot;/services&quot;; }
+    std::string TopicServicesReply()    const { return &quot;thing/product/&quot; + m_sn + &quot;/services_reply&quot;; }
+    std::string TopicEvents()           const { return &quot;thing/product/&quot; + m_sn + &quot;/events&quot;; }
+    std::string TopicEventsReply()      const { return &quot;thing/product/&quot; + m_sn + &quot;/events_reply&quot;; }
+    std::string TopicPropertySet()      const { return &quot;thing/product/&quot; + m_sn + &quot;/property/set&quot;; }
+    std::string TopicPropertySetReply() const { return &quot;thing/product/&quot; + m_sn + &quot;/property/set_reply&quot;; }
+
+    // 基础类 Topic
+    std::string TopicSysStatus()        const { return &quot;sys/product/&quot; + m_sn + &quot;/status&quot;; }
+    std::string TopicSysStatusReply()   const { return &quot;sys/product/&quot; + m_sn + &quot;/status_reply&quot;; }
+
+    const std::string&amp; GetSn() const { return m_sn; }
+
+private:
+    std::string m_sn;
+};
+</code></pre>
+<h3 id="64-mqtttransporth">6.4 <code>MqttTransport.h</code> —— 传输层（含重连+发布队列）</h3>
+<pre><code class="language-cpp">// src/transport/MqttTransport.h
+#pragma once
+#include &lt;string&gt;
+#include &lt;queue&gt;
+#include &lt;mutex&gt;
+#include &lt;thread&gt;
+#include &lt;functional&gt;
+#include &lt;atomic&gt;
+#include &lt;vector&gt;
+#include &lt;utility&gt;
+#include &quot;MqttClient.h&quot;
+
+/*
+ * Struct: MqttTransportConfig
+ * Description: MQTT 连接配置，从 nexus_gateway.json 加载
+ */
+struct MqttTransportConfig {
+    std::string clientId;
+    std::string host;
+    uint16_t    port            = 1883;
+    std::string username;
+    std::string password;
+    uint32_t    keepalive       = 60;
+    int         maxReconnectSec = 60;   // 指数退避上限（秒）
+    size_t      maxQueueSize    = 1000; // 发布队列最大容量
+};
+
+/*
+ * Class: MqttTransport
+ * Description: 对 CMQTTClient 的增强封装
+ *              - 指数退避自动重连（独立线程）
+ *              - 线程安全发布队列（独立线程消费）
+ *              - 重连后自动重订阅并通知上层重新注册
+ */
+class MqttTransport {
+public:
+    using MessageHandler    = std::function&lt;void(const std::string&amp; topic,
+                                                  const std::string&amp; payload)&gt;;
+    using ReconnectedHandler = std::function&lt;void()&gt;;
+
+    int  Init(const MqttTransportConfig&amp; cfg);
+    void Start();
+    void Stop();
+
+    bool Publish(const std::string&amp; topic, const std::string&amp; payload);
+    bool Subscribe(const std::string&amp; topic);
+    void SetMessageHandler(MessageHandler handler);
+    void SetReconnectedHandler(ReconnectedHandler handler);
+    bool IsConnected() const;
+
+private:
+    void ReconnectLoop();       // 断线指数退避重连线程
+    void PublishLoop();         // 发布队列消费线程
+    void OnConnected();
+    void OnDisconnected();
+    void ResubscribeAll();      // 重连后重新订阅所有 topic
+    static int OnMqttMessage(const struct mosquitto_message* msg, void* arg);
+
+    CMQTTClient              m_client;
+    MqttTransportConfig      m_cfg;
+    MessageHandler           m_messageHandler;
+    ReconnectedHandler       m_reconnectedHandler;
+
+    std::atomic&lt;bool&gt;        m_running{false};
+    std::atomic&lt;bool&gt;        m_connected{false};
+    std::atomic&lt;bool&gt;        m_needResubscribe{false};
+
+    std::queue&lt;std::pair&lt;std::string, std::string&gt;&gt; m_publishQueue;
+    std::mutex               m_queueMutex;
+
+    std::vector&lt;std::string&gt; m_subscriptions;
+    std::mutex               m_subMutex;
+
+    std::thread              m_reconnectThread;
+    std::thread              m_publishThread;
+};
+</code></pre>
+<h3 id="65-nexus_gatewayjson">6.5 配置文件 <code>nexus_gateway.json</code></h3>
+<pre><code class="language-json">{
+    &quot;sn&quot;: &quot;SPOTTER_PRO_XXXXXX&quot;,
+    &quot;device&quot;: {
+        &quot;domain&quot;: 4,
+        &quot;type&quot;: 1016,
+        &quot;sub_type&quot;: 0,
+        &quot;thing_version&quot;: &quot;1.0.0&quot;,
+        &quot;name&quot;: &quot;Spotter Pro&quot;
+    },
+    &quot;mqtt&quot;: {
+        &quot;server_addr&quot;: &quot;192.168.1.100&quot;,
+        &quot;server_port&quot;: 1883,
+        &quot;user_name&quot;: &quot;spotter&quot;,
+        &quot;password&quot;: &quot;your_password&quot;,
+        &quot;keepalive&quot;: 60,
+        &quot;max_reconnect_sec&quot;: 60
+    }
+}
+</code></pre>
+<hr />
+<h2 id="7">7. 实现步骤</h2>
+<h3 id="step-1">Step 1：搭建模块骨架</h3>
+<p><strong>目标</strong>：创建 <code>nexus_gateway</code> ROS2 包，能够 <code>colcon build</code> 编译通过。</p>
+<p><strong>工作内容</strong>：</p>
+<ol>
+<li>按第 4 节的目录树创建全部文件夹</li>
+<li>编写 <code>package.xml</code>，声明依赖：<code>rclcpp</code>、<code>skyfend_interfaces</code>、<code>ament_cmake</code></li>
+<li>编写顶层 <code>CMakeLists.txt</code>，<code>add_subdirectory</code> 四个子模块</li>
+<li>编写空的 <code>main.cpp</code>（只初始化 ROS2 node，不做任何逻辑）</li>
+<li>放置 <code>config/nexus_gateway.json</code> 配置文件模板</li>
+</ol>
+<p><strong>顶层 CMakeLists.txt 关键片段</strong>：</p>
+<pre><code class="language-cmake">cmake_minimum_required(VERSION 3.8)
+project(nexus_gateway)
+
+find_package(ament_cmake REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(skyfend_interfaces REQUIRED)
+find_package(ament_index_cpp REQUIRED)
+
+# 复用 public/mqtt 的 CMQTTClient
+set(PUBLIC_MQTT_DIR ${CMAKE_SOURCE_DIR}/../../../public/mqtt)
+include_directories(${PUBLIC_MQTT_DIR})
+
+# mosquitto 第三方库
+include_directories(${CMAKE_SOURCE_DIR}/../../../thirdpart/mosquitto/aarch64/include)
+link_directories(${CMAKE_SOURCE_DIR}/../../../thirdpart/mosquitto/aarch64/lib)
+
+# cJSON 第三方库（用于 JSON 构建/解析）
+include_directories(${CMAKE_SOURCE_DIR}/../../../thirdpart/cjson/aarch64/include)
+link_directories(${CMAKE_SOURCE_DIR}/../../../thirdpart/cjson/aarch64/lib)
+
+# 公共头文件目录
+include_directories(include)
+
+add_subdirectory(src/transport)
+add_subdirectory(src/protocol)
+add_subdirectory(src/service)
+add_subdirectory(src/ros)
+
+add_executable(nexus_gateway_node src/main.cpp src/NexusGateway.cpp)
+target_link_libraries(nexus_gateway_node
+    nexus_transport nexus_protocol nexus_sftp://skyfend@192.168.201.102/home/skyfend/log/nexus_gateway.logservice nexus_ros
+    mosquitto cjson)
+ament_target_dependencies(nexus_gateway_node rclcpp skyfend_interfaces ament_index_cpp)
+
+install(TARGETS nexus_gateway_node DESTINATION lib/${PROJECT_NAME})
+install(DIRECTORY config/ DESTINATION share/${PROJECT_NAME}/config)
+</code></pre>
+<p><strong>验收标准</strong>：<code>colcon build --packages-select nexus_gateway</code> 编译无报错。</p>
+<hr />
+<h3 id="step-2-mqtttransport">Step 2：传输层 <code>MqttTransport</code></h3>
+<p><strong>目标</strong>：封装 <code>CMQTTClient</code>，提供自动重连和线程安全发布能力。</p>
+<p><strong>核心逻辑</strong>：</p>
+<pre><code>MqttTransport::Init()
+  → 调用 CMQTTClient::InitClientInfo()
+  → 注册 OnMqttMessage 静态回调（透传给 m_messageHandler）
+
+MqttTransport::Start()
+  → m_running = true
+  → 启动 m_reconnectThread（ReconnectLoop）
+  → 启动 m_publishThread（PublishLoop）
+
+ReconnectLoop() — 断线重连逻辑:
+  → while(m_running):
+      if(!m_connected):
+          delay = min(delay * 2, maxReconnectSec)  // 指数退避
+          sleep(delay)
+          CMQTTClient::Connect() + Start()
+          if 成功: delay = 1, m_needResubscribe = true
+      else:
+          sleep(1s)
+
+PublishLoop() — 发布队列消费:
+  → while(m_running):
+      if m_needResubscribe:
+          ResubscribeAll()
+          m_needResubscribe = false
+          触发 m_reconnectedHandler（通知 DeviceLifecycle 重新注册）
+      if m_connected &amp;&amp; !m_publishQueue.empty():
+          取出队头 (topic, payload) → CMQTTClient::Publish()
+
+MqttTransport::Publish(topic, payload):
+  → 加锁
+  → 若队列满（&gt; maxQueueSize），丢弃最旧消息
+  → 入队（非阻塞，不等待发送完成）
+</code></pre>
+<p><strong>验收标准</strong>：能连接 MQTT broker，能断线后自动重连，Publish 调用不阻塞调用线程，多线程并发 Publish 无崩溃。</p>
+<hr />
+<h3 id="step-3-protocol">Step 3：协议层 <code>protocol/</code></h3>
+<p><strong>目标</strong>：实现 JSON 消息构建/解析、Topic 路由。</p>
+<h4 id="31-thingmodelmessageh">3.1 <code>ThingModelMessage.h</code> —— 公共消息数据结构</h4>
+<pre><code class="language-cpp">// src/protocol/ThingModelMessage.h
+#pragma once
+#include &lt;string&gt;
+#include &lt;cstdint&gt;
+
+struct DeviceInfo {
+    std::string sn;
+    int         domain;         // 4 = 侦测反制类
+    int         type;           // 1016 = SPOTTER
+    int         sub_type;       // 0
+    std::string thing_version;
+    std::string name;
+};
+
+struct ThingModelEnvelope {
+    std::string tid;            // 事务 UUID
+    std::string bid;            // 业务 UUID
+    std::string method;         // 物模型方法
+    std::string gateway;        // 网关 SN（直连场景 = 设备 SN）
+    int64_t     timestamp;      // UTC 毫秒时间戳
+    int         need_reply = 0;
+};
+</code></pre>
+<h4 id="32-thingmodelbuilder-json-cjson">3.2 <code>ThingModelBuilder</code> —— JSON 序列化（基于 cJSON）</h4>
+<p>每个方法返回 <code>std::string</code>（完整 JSON），接受强类型参数，使用 RAII 包装 <code>cJSON*</code> 避免内存泄漏：</p>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>对应 Topic</th>
+<th>method 字段</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>BuildOnlineStatus(online)</code></td>
+<td><code>sys/product/{sn}/status</code></td>
+<td>-</td>
+</tr>
+<tr>
+<td><code>BuildDeviceRegister(DeviceInfo)</code></td>
+<td><code>thing/product/{sn}/register</code></td>
+<td><code>device_register</code></td>
+</tr>
+<tr>
+<td><code>BuildHeartbeat(NexusDeviceHeartbeat)</code></td>
+<td><code>thing/product/{sn}/osd</code></td>
+<td><code>device_heart</code></td>
+</tr>
+<tr>
+<td><code>BuildTargetList(vector&lt;NexusUavTarget&gt;)</code></td>
+<td><code>thing/product/{sn}/osd</code></td>
+<td><code>device_uav</code></td>
+</tr>
+<tr>
+<td><code>BuildConfigReport(config_data)</code></td>
+<td><code>thing/product/{sn}/state</code></td>
+<td><code>device_config</code></td>
+</tr>
+<tr>
+<td><code>BuildServiceReply(tid, bid, method, result)</code></td>
+<td><code>thing/product/{sn}/services_reply</code></td>
+<td>-</td>
+</tr>
+<tr>
+<td><code>BuildPropertySetReply(tid, bid, method, result)</code></td>
+<td><code>thing/product/{sn}/property/set_reply</code></td>
+<td>-</td>
+</tr>
+</tbody>
+</table>
+<h4 id="33-thingmodelparser-json">3.3 <code>ThingModelParser</code> —— JSON 反序列化</h4>
+<pre><code class="language-cpp">struct ParsedMessage {
+    std::string tid;
+    std::string bid;
+    std::string method;
+    std::string gateway;
+    int64_t     timestamp;
+    cJSON*      data;   // 调用方负责 cJSON_Delete
+};
+
+// 返回 false 表示解析失败（JSON 格式错误或字段缺失）
+bool Parse(const std::string&amp; payload, ParsedMessage&amp; out);
+</code></pre>
+<h4 id="34-messagedispatcher">3.4 <code>MessageDispatcher</code> —— 下行消息路由</h4>
+<pre><code class="language-cpp">class MessageDispatcher {
+public:
+    using Handler = std::function&lt;void(const std::string&amp; tid,
+                                        const std::string&amp; bid,
+                                        cJSON* data)&gt;;
+
+    // ServiceHandler/PropertyHandler 在 Init 阶段向 dispatcher 注册
+    void RegisterHandler(const std::string&amp; method, Handler h);
+
+    // MqttTransport 的 MessageHandler 调用此方法
+    void Dispatch(const std::string&amp; topic, const std::string&amp; payload);
+};
+</code></pre>
+<p>路由实现：<code>std::unordered_map&lt;std::string, Handler&gt;</code>，O(1) 查找，无 method 的消息打印警告后丢弃。</p>
+<p><strong>验收标准</strong>：对 <code>device_register</code> 注册请求和 <code>reboot_dev</code>/<code>sflHitUav</code> 命令，均能正确序列化、反序列化、路由。</p>
+<hr />
+<h3 id="step-4-service">Step 4：业务层 <code>service/</code></h3>
+<h4 id="41-devicelifecycle">4.1 <code>DeviceLifecycle</code></h4>
+<p><strong>目标</strong>：管理设备上线注册流程与心跳定时发送。</p>
+<pre><code>Start():
+  1. 订阅 register_reply、status_reply、state_reply
+  2. 发布 sys/status → online
+  3. 发布 thing/register（device_register）
+  4. 等待 register_reply：
+     - result=0：启动 1Hz 心跳定时器
+     - result!=0：5秒后重新注册（最多重试 5 次）
+
+HeartbeatTimer() — 每秒执行:
+  → 从 INexusDataSource 最新心跳数据（由 RosDataBridge 缓存）
+  → BuildHeartbeat() → Publish(osd)
+
+Stop():
+  → 停止心跳定时器
+  → 发布 sys/status → offline
+  → 等待 publish 完成后断开连接
+</code></pre>
+<p><code>MqttTransport::SetReconnectedHandler</code> 注册回调，重连后重新执行上线注册流程（从步骤 2 开始）。</p>
+<h4 id="42-targetpublisher">4.2 <code>TargetPublisher</code></h4>
+<p><strong>目标</strong>：侦测目标数据实时上报。</p>
+<pre><code>Init(INexusDataSource):
+  → 注册 SetTargetCallback：
+    回调触发时 → BuildTargetList() → Publish(osd, method=device_uav)
+
+说明：
+  - 不设定时器，数据由 ROS 回调驱动（融合层以约 1Hz 频率发布）
+  - 目标列表为空时跳过发布
+</code></pre>
+<h4 id="43-configreporter">4.3 <code>ConfigReporter</code></h4>
+<p><strong>目标</strong>：设备配置变更时上报，支持失败重试。</p>
+<pre><code>ReportConfig(config_data):
+  → BuildConfigReport() → Publish(state)
+  → 等待 state_reply（超时 3s）
+  → 失败或超时：重试最多 3 次
+  → 3次失败后记录 error 日志，下次配置变更再重试
+</code></pre>
+<h4 id="44-servicehandler">4.4 <code>ServiceHandler</code></h4>
+<p><strong>目标</strong>：处理云端通过 <code>services</code> topic 下发的命令。</p>
+<p>向 <code>MessageDispatcher</code> 注册的 method：</p>
+<table>
+<thead>
+<tr>
+<th>method</th>
+<th>处理逻辑</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>reboot_dev</code></td>
+<td>调用 <code>INexusCommandSink::RebootCallback</code>，先回复 result=5（重启中），触发重启</td>
+</tr>
+<tr>
+<td><code>sflHitUav</code></td>
+<td>解析目标参数 → 调用 <code>HitUavCallback</code>，回复 result=0</td>
+</tr>
+<tr>
+<td><code>powerOnOff</code></td>
+<td>解析 switchStatus → 调用 <code>PowerOnOffCallback</code>，回复 result=0</td>
+</tr>
+<tr>
+<td><code>stopHit</code></td>
+<td>调用 <code>StopHitCallback</code>，回复 result=0</td>
+</tr>
+</tbody>
+</table>
+<p>所有回复通过 <code>BuildServiceReply()</code> 发布到 <code>services_reply</code> topic，保持 tid/bid 一致。</p>
+<h4 id="45-propertyhandler">4.5 <code>PropertyHandler</code></h4>
+<p><strong>目标</strong>：处理云端通过 <code>property/set</code> topic 下发的属性设置。</p>
+<p>向 <code>MessageDispatcher</code> 注册的 method：</p>
+<table>
+<thead>
+<tr>
+<th>method</th>
+<th>处理逻辑</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>sflHitParamSet</code></td>
+<td>解析打击参数 → 调用 <code>HitParamCallback</code>，发布 <code>property/set_reply</code></td>
+</tr>
+<tr>
+<td><code>sflHitModeSet</code></td>
+<td>解析打击模式 → 调用 <code>HitModeCallback</code>，发布 <code>property/set_reply</code></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h3 id="step-5ros-rosrosdatabridge">Step 5：ROS 数据桥接 <code>ros/RosDataBridge</code></h3>
+<p><strong>目标</strong>：订阅第 4 节所列的全部 ROS topics，实现 <code>INexusDataSource</code> 和 <code>INexusCommandSink</code>，将 ROS 消息转换为 NexusGateway 内部数据结构。</p>
+<p><code>RosDataBridge</code> 的订阅分组与第 4.2 节对应，以下是骨架实现：</p>
+<pre><code class="language-cpp">class RosDataBridge : public INexusDataSource,
+                      public INexusCommandSink {
+public:
+    void Init(rclcpp::Node::SharedPtr node);
+
+    // INexusDataSource
+    void SetHeartbeatCallback(HeartbeatCallback cb) override;
+    void SetTargetCallback(TargetCallback cb) override;
+
+    // INexusCommandSink（命令执行结果回调，nexus 收到后发 services_reply）
+    void SetRebootCallback(RebootCallback cb) override;
+    void SetHitUavCallback(HitUavCallback cb) override;
+    void SetHitParamCallback(HitParamCallback cb) override;
+    void SetHitModeCallback(HitModeCallback cb) override;
+    void SetPowerOnOffCallback(PowerOnOffCallback cb) override;
+    void SetStopHitCallback(StopHitCallback cb) override;
+
+private:
+    // ── A. PTZ 状态（来自 ptz_service）──────────────────────────
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::PtzStatus&gt;::SharedPtr          m_ptzStatusSub;          // /ptz_status
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::PtzLensInfo&gt;::SharedPtr        m_ptzLensSub;            // /ptz_lens_info
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::PtzAzimuthPitchInfo&gt;::SharedPtr m_ptzAzimuthSub;        // /ptz_azimuth_pitch_info
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::PtzDeviceInfo&gt;::SharedPtr      m_ptzDeviceInfoSub;      // /ptz_device_info
+
+    // ── B. 融合侦测（来自 rvfusion_service）─────────────────────
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::FusionTargetPack&gt;::SharedPtr   m_fusionObjsSub;         // /fusiontg_objs_c2
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::HeartbeatInfo&gt;::SharedPtr      m_fusionHeartbeatSub;    // /rvfusion_heartbeat_info
+
+    // ── C. TracerMatrix（来自 ptz100_ros / ros_app）───────────────
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::SpectrumTargetInfo&gt;::SharedPtr m_tmSpectrumSub;         // /tracer_matrix_spectrum_objs
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::ProtocolTargetInfo&gt;::SharedPtr m_tmProtocolSub;         // /tracer_matrix_protocol_objs
+
+    // ── D. TracerP STP130（来自 ptz100_ros / ros_app）────────────
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::TracerpHeartBeat&gt;::SharedPtr   m_tracerpHeartbeatSub;   // /tracerp_heart_beat
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::SpectrumTargetInfo&gt;::SharedPtr m_stpSpectrumSub;        // /stp130_spectrum_objs
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::ProtocolTargetInfo&gt;::SharedPtr m_stpProtocolSub;        // /stp130_protocol_objs
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::TracerpUavInfo&gt;::SharedPtr     m_tracerpUavSub;         // /tracerp_uav_info
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::TracerpUasInfo&gt;::SharedPtr     m_tracerpUasSub;         // /tracerp_uas_info
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::TracerpWifiDroneInfo&gt;::SharedPtr m_tracerpWifiSub;      // /tracerp_wifi_drone_info
+
+    // ── E. 视觉 AI（来自 ptz100_ai）──────────────────────────────
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::AiTargetInfo&gt;::SharedPtr       m_visibleTrackSub;       // /visiblelight_track_objs
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::AiTargetInfo&gt;::SharedPtr       m_infraredTrackSub;      // /infrared_track_objs
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::HeartbeatInfo&gt;::SharedPtr      m_aiHeartbeatSub;        // /vision_ai_heartbeat_info
+
+    // ── F. 引导/标定（来自 ptz_guider_ctl）──────────────────────
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::PtzGuidingInfoVis&gt;::SharedPtr  m_guidingInfoSub;        // /ptz_guiding_info_vis
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::HeartbeatInfo&gt;::SharedPtr      m_guiderHeartbeatSub;    // /ptz_guider_ctl_heartbeat_info
+
+    // ── G. DHP130 雷达（来自 dhp100_link）────────────────────────
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::Dhp100Heartbeat&gt;::SharedPtr    m_dhpHeartbeatSub;       // /dhp100_heartbeat
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::DhpTargetPack&gt;::SharedPtr      m_dhpDetObjsSub;         // /dhp100_detobjs
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::DhpStatusUpload&gt;::SharedPtr    m_dhp120StatusSub;       // /dhp120_status
+
+    // ── H. 雷达跟踪（来自 dhp100_tracker）───────────────────────
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::RadarTrackInfo&gt;::SharedPtr     m_dhpTrackObjsSub;       // /dhp100_trackobjs
+
+    // ── I. 系统心跳/Spoofer/SFL（来自 ptz100_ros）───────────────
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::SysHeartbeat&gt;::SharedPtr       m_sysHeartbeatSub;       // /sys_heartbeat
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::HeartbeatInfo&gt;::SharedPtr      m_spooferHeartbeatSub;   // /spoofer_heartbeat_info
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::SentryTargetPack&gt;::SharedPtr   m_sfl100ObjsSub;         // /ptz100_ros_sfl100_objs
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::EFenceHeartBeat&gt;::SharedPtr    m_efenceHeartbeatSub;    // /efence_heart_beat
+
+    // ── J. GNSS（来自 gnss_b3）───────────────────────────────────
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::GnssGgaInfo&gt;::SharedPtr        m_gnssGgaSub;            // /gnss_b3_gga_info
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::GnssRmcInfo&gt;::SharedPtr        m_gnssRmcSub;            // /gnss_b3_rmc_info
+
+    // ── K. 标定状态（来自 self_calibration_node）─────────────────
+    rclcpp::Subscription&lt;skyfend_interfaces::msg::UserCalibState&gt;::SharedPtr     m_calibStateSub;         // /calib_state_info
+
+    // ── 下行命令 Publisher（天盾 → 子设备）───────────────────────
+    rclcpp::Publisher&lt;skyfend_interfaces::msg::PtzGuidanceCmd&gt;::SharedPtr        m_ptzGuidancePub;        // /ptz_guidance_cmd
+    rclcpp::Publisher&lt;skyfend_interfaces::msg::PtzTrackCmd&gt;::SharedPtr           m_ptzTrackPub;           // /ptz_track_cmd
+    rclcpp::Publisher&lt;skyfend_interfaces::msg::PtzMotionCmd&gt;::SharedPtr          m_ptzMotionPub;          // /ptz_motion_cmd
+    rclcpp::Publisher&lt;skyfend_interfaces::msg::PtzLensCmd&gt;::SharedPtr            m_ptzLensCmdPub;         // /ptz_lens_cmd
+    rclcpp::Publisher&lt;skyfend_interfaces::msg::PtzManualLockTargetCmd&gt;::SharedPtr m_ptzManualLockPub;     // /ptz_manual_lock_target_cmd
+    rclcpp::Publisher&lt;skyfend_interfaces::msg::PtzSwitchTrackingSourceCmd&gt;::SharedPtr m_ptzSwitchSrcPub;  // /ptz_switch_tracking_source_cmd
+    rclcpp::Publisher&lt;skyfend_interfaces::msg::Dhp120CmdReq&gt;::SharedPtr          m_dhp120CmdPub;          // /dhp120_cmd_req
+    rclcpp::Publisher&lt;skyfend_interfaces::msg::FromUserObjListInfo&gt;::SharedPtr   m_fromUserObjPub;        // /from_user_obj_info
+    rclcpp::Publisher&lt;skyfend_interfaces::msg::CmdSet&gt;::SharedPtr                m_cmdSetPub;             // /cmd_set
+
+    // 各类回调（见 INexusDataSource / INexusCommandSink 接口）
+    HeartbeatCallback    m_heartbeatCb;
+    TargetCallback       m_targetCb;
+    RebootCallback       m_rebootCb;
+    HitUavCallback       m_hitUavCb;
+    // ...
+
+    // 线程安全缓存（心跳数据由定时器拉取，目标数据由回调推送）
+    NexusDeviceHeartbeat m_lastHeartbeat;
+    std::mutex           m_heartbeatMutex;
+};
+</code></pre>
+<blockquote>
+<p><strong>关键原则</strong>：<code>RosDataBridge</code> 只做消息格式转换（ROS msg → 内部 struct），不包含任何 MQTT 或 JSON 逻辑，零耦合。每个 subscription callback 只做：解析字段 → 填充内部 struct → 触发对应 callback。</p>
+</blockquote>
+<hr />
+<h3 id="step-6-nexusgateway">Step 6：顶层编排器 <code>NexusGateway</code></h3>
+<p><strong>目标</strong>：薄层编排器，通过依赖注入组装各层，不包含业务逻辑。</p>
+<pre><code class="language-cpp">class NexusGateway {
+public:
+    int  Init(const std::string&amp; config_path,
+              std::shared_ptr&lt;INexusDataSource&gt; data_source,
+              std::shared_ptr&lt;INexusCommandSink&gt; cmd_sink);
+    int  Start();
+    void Stop();
+
+private:
+    int LoadConfig(const std::string&amp; path);  // 解析 nexus_gateway.json
+
+    std::shared_ptr&lt;MqttTransport&gt;     m_transport;
+    std::shared_ptr&lt;TopicManager&gt;      m_topics;
+    std::shared_ptr&lt;MessageDispatcher&gt; m_dispatcher;
+    std::shared_ptr&lt;DeviceLifecycle&gt;   m_lifecycle;
+    std::shared_ptr&lt;TargetPublisher&gt;   m_targetPub;
+    std::shared_ptr&lt;ConfigReporter&gt;    m_configReporter;
+    std::shared_ptr&lt;ServiceHandler&gt;    m_serviceHandler;
+    std::shared_ptr&lt;PropertyHandler&gt;   m_propHandler;
+
+    MqttTransportConfig m_mqttCfg;
+    DeviceInfo          m_deviceInfo;
+};
+</code></pre>
+<p><code>Init()</code> 负责按依赖顺序构造并连接各层（依赖注入），<code>Start()</code> 按顺序启动各层，<code>Stop()</code> 逆序关闭。</p>
+<hr />
+<h3 id="step-7maincpp">Step 7：<code>main.cpp</code> 入口</h3>
+<pre><code class="language-cpp">// src/main.cpp
+#include &quot;rclcpp/rclcpp.hpp&quot;
+#include &quot;ament_index_cpp/get_package_share_directory.hpp&quot;
+#include &quot;skyfend_log.h&quot;
+#include &quot;ros/RosDataBridge.h&quot;
+#include &quot;NexusGateway.h&quot;
+
+int main(int argc, char** argv)
+{
+    rclcpp::init(argc, argv);
+    auto node = rclcpp::Node::make_shared(&quot;nexus_gateway&quot;);
+
+    std::string pkg_path = ament_index_cpp::get_package_share_directory(&quot;nexus_gateway&quot;);
+    int ret = skyfend_log_init(pkg_path.c_str(), &quot;nexus_gateway&quot;);
+    if (ret != 0) {
+        RCLCPP_FATAL(node-&gt;get_logger(), &quot;skyfend_log_init failed&quot;);
+        return -1;
+    }
+
+    std::string config_path = pkg_path + &quot;/config/nexus_gateway.json&quot;;
+
+    auto bridge = std::make_shared&lt;RosDataBridge&gt;();
+    bridge-&gt;Init(node);
+
+    auto gateway = std::make_shared&lt;NexusGateway&gt;();
+    if (gateway-&gt;Init(config_path, bridge, bridge) != 0) {
+        RCLCPP_FATAL(node-&gt;get_logger(), &quot;NexusGateway init failed&quot;);
+        return -1;
+    }
+
+    if (gateway-&gt;Start() != 0) {
+        RCLCPP_FATAL(node-&gt;get_logger(), &quot;NexusGateway start failed&quot;);
+        return -1;
+    }
+
+    rclcpp::spin(node);
+
+    gateway-&gt;Stop();
+    rclcpp::shutdown();
+    return 0;
+}
+</code></pre>
+<blockquote>
+<p><code>RosDataBridge</code> 同时实现 <code>INexusDataSource</code> 和 <code>INexusCommandSink</code>，作为同一个 <code>shared_ptr</code> 传入两个接口，main.cpp 无需感知具体类型。</p>
+</blockquote>
+<hr />
+<h3 id="step-8colcon-build">Step 8：<code>colcon build</code> 集成验证</h3>
+<ol>
+<li>在 <code>ros_ws/src/</code> 下执行 <code>colcon build --packages-select nexus_gateway</code></li>
+<li>连接测试 MQTT broker 验证上线注册流程</li>
+<li>使用 MQTT 客户端工具（如 MQTTX）模拟云端下发 <code>reboot_dev</code>，验证命令路由</li>
+<li>查看 <code>/home/skyfend/log/nexus_gateway/</code> 确认日志正常输出</li>
+</ol>
+<hr />
+<h2 id="8">8. 在线/离线生命周期时序</h2>
+<p>（无 C2 网关，Spotter Pro 直接连接天盾云平台）</p>
+<pre><code class="language-mermaid">sequenceDiagram
+    participant device as Spotter Pro
+    participant broker as 天盾 MQTT Broker
+
+    note over device,broker: 设备上线流程
+
+    device-&gt;&gt;broker: MQTT Connect（clientId=sn, user/pass）
+    device-&gt;&gt;broker: sys/product/{sn}/status  online=true
+    broker--&gt;&gt;device: sys/product/{sn}/status_reply
+    device-&gt;&gt;broker: thing/product/{sn}/register  device_register
+    broker--&gt;&gt;device: thing/product/{sn}/register_reply  result=0
+    device-&gt;&gt;broker: thing/product/{sn}/osd  device_heart（1Hz 持续）
+    device-&gt;&gt;broker: thing/product/{sn}/osd  device_uav（有目标时）
+    device-&gt;&gt;broker: thing/product/{sn}/state  device_config（配置变更时）
+    broker--&gt;&gt;device: thing/product/{sn}/state_reply  result=0
+
+    note over device,broker: 云端命令下发
+
+    broker-&gt;&gt;device: thing/product/{sn}/services  method=reboot_dev
+    device--&gt;&gt;broker: thing/product/{sn}/services_reply  result=5（重启中）
+
+    broker-&gt;&gt;device: thing/product/{sn}/property/set  method=sflHitParamSet
+    device--&gt;&gt;broker: thing/product/{sn}/property/set_reply  result=0
+
+    note over device,broker: 设备下线流程
+
+    device-&gt;&gt;broker: sys/product/{sn}/status  online=false
+    device-&gt;&gt;broker: MQTT Disconnect
+</code></pre>
+<hr />
+<h2 id="9">9. 关键风险及应对</h2>
+<table>
+<thead>
+<tr>
+<th>风险</th>
+<th>影响</th>
+<th>应对措施</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MQTT 掉线导致数据丢失</td>
+<td>目标数据无法上报</td>
+<td>发布队列容量上限（1000条），超限丢弃最旧消息，保证实时性优先</td>
+</tr>
+<tr>
+<td>注册失败后心跳发送无效</td>
+<td>云端不认可设备</td>
+<td><code>DeviceLifecycle</code> 状态机，注册成功后才启动心跳，失败重试（最多5次，间隔5s）</td>
+</tr>
+<tr>
+<td>1Hz 心跳阻塞 ROS 回调线程</td>
+<td>系统卡顿</td>
+<td>心跳定时器在独立线程，<code>Publish()</code> 只入队不等待</td>
+</tr>
+<tr>
+<td>cJSON 内存泄漏</td>
+<td>长时运行内存耗尽</td>
+<td><code>ThingModelBuilder</code> 使用 RAII wrapper 封装 <code>cJSON*</code>，析构时调用 <code>cJSON_Delete</code></td>
+</tr>
+<tr>
+<td>tid/bid UUID 碰撞</td>
+<td>云端消息关联错误</td>
+<td>实现轻量 UUIDv4 生成器（基于 <code>/dev/urandom</code> 或 <code>uuid_generate</code>）</td>
+</tr>
+<tr>
+<td>密码明文存储</td>
+<td>配置文件泄漏风险</td>
+<td>v1 先明文，后续与天盾团队协商对称加密方案</td>
+</tr>
+<tr>
+<td>重连期间命令丢失</td>
+<td>操作未执行</td>
+<td>断线期间队列保留，重连成功后先重注册再发送积压数据</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="10">10. 实现优先级与工期估算</h2>
+<table>
+<thead>
+<tr>
+<th>优先级</th>
+<th>Step</th>
+<th>内容</th>
+<th>预估工期</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>P0 必须</strong></td>
+<td>Step 1</td>
+<td>模块骨架 + CMakeLists 编译通过</td>
+<td>0.5 天</td>
+</tr>
+<tr>
+<td><strong>P0 必须</strong></td>
+<td>Step 2</td>
+<td>传输层 MqttTransport（重连+队列）</td>
+<td>1.5 天</td>
+</tr>
+<tr>
+<td><strong>P0 必须</strong></td>
+<td>Step 3</td>
+<td>协议层（Builder/Parser/Dispatcher）</td>
+<td>1.5 天</td>
+</tr>
+<tr>
+<td><strong>P0 必须</strong></td>
+<td>Step 4.1</td>
+<td>DeviceLifecycle（上线/注册/心跳）</td>
+<td>1 天</td>
+</tr>
+<tr>
+<td><strong>P0 必须</strong></td>
+<td>Step 4.2</td>
+<td>TargetPublisher（侦测目标上报）</td>
+<td>0.5 天</td>
+</tr>
+<tr>
+<td><strong>P1 重要</strong></td>
+<td>Step 4.4</td>
+<td>ServiceHandler（云端命令处理）</td>
+<td>1 天</td>
+</tr>
+<tr>
+<td><strong>P1 重要</strong></td>
+<td>Step 4.5</td>
+<td>PropertyHandler（属性设置处理）</td>
+<td>0.5 天</td>
+</tr>
+<tr>
+<td><strong>P1 重要</strong></td>
+<td>Step 5</td>
+<td>RosDataBridge 完整接入</td>
+<td>1.5 天</td>
+</tr>
+<tr>
+<td><strong>P2 补充</strong></td>
+<td>Step 4.3</td>
+<td>ConfigReporter（含重试机制）</td>
+<td>0.5 天</td>
+</tr>
+<tr>
+<td><strong>P2 补充</strong></td>
+<td>Step 6-8</td>
+<td>编排器 + 集成联调</td>
+<td>1 天</td>
+</tr>
+</tbody>
+</table>
+<p><strong>总计约 10 个工作日</strong>完成核心功能并可联调上线。</p>
+<hr />
+<h2 id="spotter-pro">附录：Spotter Pro 设备类型信息</h2>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>设备名称</td>
+<td>SPOTTER / Spotter Pro</td>
+</tr>
+<tr>
+<td>天盾设备类型名称</td>
+<td>Spotter</td>
+</tr>
+<tr>
+<td>领域 domain</td>
+<td>4（侦测反制类）</td>
+</tr>
+<tr>
+<td>设备类型 type</td>
+<td>1016</td>
+</tr>
+<tr>
+<td>子设备类型 sub_type</td>
+<td>0</td>
+</tr>
+</tbody>
+</table></article>
+    <script>
+        // Sync theme with parent page
+        try {
+            var parentTheme = window.parent.document.documentElement.getAttribute('data-theme');
+            if (parentTheme) document.documentElement.setAttribute('data-theme', parentTheme);
+            // Listen for theme changes
+            var observer = new MutationObserver(function(mutations) {
+                mutations.forEach(function(m) {
+                    if (m.attributeName === 'data-theme') {
+                        var t = window.parent.document.documentElement.getAttribute('data-theme');
+                        if (t) document.documentElement.setAttribute('data-theme', t);
+                    }
+                });
+            });
+            observer.observe(window.parent.document.documentElement, { attributes: true });
+        } catch(e) {}
+    </script>
+</body>
+</html>
