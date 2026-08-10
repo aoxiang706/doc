@@ -1,0 +1,62 @@
+---
+description: 中文版 Git 提交规范，使用 Conventional Commits 格式
+alwaysApply: true
+---
+
+# Git 提交规范（中文版）
+
+## 提交类型
+
+| 类型 | 说明 | 示例 |
+|------|------|------|
+| feat | 新功能 | `feat(ptz): 添加和普云台自适应识别` |
+| fix | Bug 修复 | `fix(video): 修复多线程段错误` |
+| docs | 文档更新 | `docs: 更新协议文档` |
+| refactor | 重构（不改变功能） | `refactor(alink): 优化设备枚举结构` |
+| perf | 性能优化 | `perf(gst): 降低解码延迟` |
+| test | 测试相关 | `test: 添加视频流单元测试` |
+| chore | 构建/工具/配置 | `chore: 更新 CMakeLists` |
+| style | 代码格式（不影响逻辑） | `style: 统一缩进风格` |
+| revert | 回滚提交 | `revert: 回滚 xxx 修改` |
+
+## 提交格式
+
+```
+<type>(<scope>): <简短描述>
+
+[可选：详细说明，解释为什么做这个修改]
+
+[可选：关联 Issue 或 MR]
+```
+
+## 常用 scope（作用域）
+
+| Scope | 说明 |
+|-------|------|
+| ptz | PTZ 云台相关 |
+| video | 视频流/GStreamer |
+| alink | Alink 协议 |
+| radar | 雷达相关 |
+| efence | 电子围栏 |
+| ros | ROS2 节点/消息 |
+| config | 配置/设置 |
+| hepu | 和普设备 |
+| fusion | 融合算法 |
+
+## 最佳实践
+
+- 使用祈使句：「添加」而非「添加了」
+- 首行不超过 50 字符
+- 说明「为什么」而非「做了什么」
+- 一次提交只做一件事
+- 相关修改放在一个提交
+
+## 示例
+
+```
+feat(hepu): 设备启动后手动设置识别自适应
+
+- 调用 set_image_scence_mode 设置场景模式
+- 在 ptzDeviceHepu 初始化流程中添加配置
+- 解决自动识别在特定场景下失效问题
+```

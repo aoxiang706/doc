@@ -1,0 +1,176 @@
+---
+description: 嵌入式 C/C++ 编码规范，适用于 AGX/Jetson 平台
+globs: "**/*.cpp,**/*.c,**/*.h,**/*.hpp"
+alwaysApply: false
+---
+
+# 嵌入式 C/C++ 编码规范（中文版）
+
+## 内存管理
+
+### 避免动态内存分配（热路径）
+
+```cpp
+// ❌ 避免：频繁 new/delete
+void processFrame() {
+    auto* buffer = new uint8_t[1024];  // 每帧都分配
+    // ...
+    delete[] buffer;
+}
+
+// ✅ 推荐：预分配或栈上分配
+class FrameProcessor {
+    uint8_t buffer_[1024];  // 类成员预分配
+public:
+    void processFrame() {
+        // 直接使用 buffer_
+    }
+};
+```
+
+### 使用 RAII
+
+```cpp
+// ✅ 推荐：智能指针管理资源
+std::unique_ptr<Resource> res = std::make_unique<Resource>();
+
+// ✅ 推荐：锁的 RAII
+std::lock_guard<std::mutex> lock(mutex_);
+```
+
+---
+
+## 线程安全
+
+### 保护共享资源
+
+```cpp
+// ❌ 危险：无保护的共享变量
+int sharedCounter = 0;
+void increment() { sharedCounter++; }
+
+// ✅ 安全：使用原子变量或互斥锁
+std::atomic<int> sharedCounter{0};
+void increment() { sharedCounter++; }
+
+// 或使用互斥锁
+std::mutex mutex_;
+void increment() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    sharedCounter++;
+}
+```
+
+### 避免死锁
+
+```cpp
+// ❌ 危险：锁顺序不一致可能死锁
+void func1() { lock(a); lock(b); }
+void func2() { lock(b); lock(a); }  // 死锁风险
+
+// ✅ 安全：统一锁顺序或使用 scoped_lock
+void func1() { std::scoped_lock lock(a, b); }
+void func2() { std::scoped_lock lock(a, b); }
+```
+
+---
+
+## 性能优化
+
+### 避免不必要的拷贝
+
+```cpp
+// ❌ 拷贝大对象
+void process(std::vector<Data> data);
+
+// ✅ 传引用
+void process(const std::vector<Data>& data);
+void process(std::vector<Data>&& data);  // 移动语义
+```
+
+### 使用合适的容器
+
+| 场景 | 推荐容器 |
+|------|----------|
+| 固定大小 | `std::array` |
+| 频繁头部操作 | `std::deque` |
+| 频繁查找 | `std::unordered_map` |
+| 有序数据 | `std::map` |
+| 一般用途 | `std::vector` |
+
+---
+
+## 错误处理
+
+### 检查返回值
+
+```cpp
+// ❌ 忽略返回值
+socket(AF_INET, SOCK_STREAM, 0);
+
+// ✅ 检查并处理错误
+int fd = socket(AF_INET, SOCK_STREAM, 0);
+if (fd < 0) {
+    RCLCPP_ERROR(logger_, "socket 创建失败: %s", strerror(errno));
+    return false;
+}
+```
+
+### 使用 RCLCPP 日志
+
+```cpp
+RCLCPP_DEBUG(logger_, "调试信息: %d", value);
+RCLCPP_INFO(logger_, "一般信息");
+RCLCPP_WARN(logger_, "警告: 可能的问题");
+RCLCPP_ERROR(logger_, "错误: 需要处理");
+RCLCPP_FATAL(logger_, "致命错误: 程序无法继续");
+```
+
+---
+
+## 代码风格
+
+### 文件内辅助函数
+
+- **不要用匿名 `namespace { }` 包裹文件内 helper**；用文件作用域 `static` 函数即可。
+- 已有同类写法（如 `static bool isPtzSubDev(...)`）时，新 helper 保持一致。
+- 仅单文件使用的逻辑，优先 `static` 函数；确需复用时再抽到公共头/工具模块，避免过早抽象。
+
+```cpp
+// ❌ 避免：匿名 namespace 包一层
+namespace {
+std::string formatSn(const std::string& raw) { ... }
+}
+
+// ✅ 推荐：文件作用域 static
+static std::string formatSn(const std::string& raw) { ... }
+```
+
+### 最小修改原则
+
+- 只改与当前任务直接相关的代码；不顺手重构、不扩大 diff。
+- 复用现有函数、命名、错误处理方式；新增代码应像原文件作者写的。
+- 不为「可能用到」提前加 helper、配置项或分支；边界 case 除非任务明确要求。
+- 注释只解释非显而易见的业务/协议细节，不写显而易见的步骤说明。
+
+### 命名规范
+
+| 类型 | 风格 | 示例 |
+|------|------|------|
+| 类名 | PascalCase | `PtzDeviceHepu` |
+| 函数名 | camelCase | `getDeviceStatus()` |
+| 变量名 | snake_case | `device_status` |
+| 成员变量 | snake_case_ | `device_status_` |
+| 常量 | UPPER_CASE | `MAX_BUFFER_SIZE` |
+| 宏 | UPPER_CASE | `PTZ100_APP_VERSION` |
+
+### 头文件保护
+
+```cpp
+#ifndef PTZ_DEVICE_HEPU_H_
+#define PTZ_DEVICE_HEPU_H_
+
+// ...
+
+#endif  // PTZ_DEVICE_HEPU_H_
+```

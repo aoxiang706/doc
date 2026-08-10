@@ -1,0 +1,57 @@
+---
+description: TerraHub 架构原则规约，基于《Jetson AGX Orin 反无系统软件架构设计文档 V4.1》第二十七章
+globs: src/**/*,protocols/**/*,deploy/**/*,pkgs/**/*
+alwaysApply: false
+---
+
+# TerraHub 架构原则
+
+## 设备接入
+
+- **所有设备网口接入**，禁止串口/SPI/I2C 直连 AGX
+- 塞防自研设备（Tracer/近程 Radar/Hunter/Thunder/SFL/PowerBox）统一使用 **MQTT + Protobuf**
+- 第三方设备（中/远/超远程 Radar、PTZ Hepu/Naijie、LaserStrike）使用 **ETH + UDP + 厂商私有协议**，差异在 Module 内部消化
+
+## Module 设计
+
+- **Module 是设备代理**：设备离线/故障时 Module 不退出，只更新状态为 OFFLINE/FAULT
+- **设备私有 SDK 跟 Module 走**：谁用谁带，不放公共库（`src/03_InfraLayer/skyfendlibs/` 只放跨 Module 共享的自研公共库）
+- **Module 不直接调用 AimRT 三方库**：面向 `CoreRef` 接口编程，通过 `core.GetLogger()`、`core.GetExecutorManager()` 等获取能力
+- **每个 Topic 唯一发布者**：一个 Topic 只能有一个 Module 发布，可多个订阅者
+- **阈值参数可在线调**：战术策略参数支持不重启修改
+
+## Topic 规范
+
+- **Topic 名用编号不用品牌**：`ptz/01` 而不是 `ptz/hepu`，上层不感知设备品牌
+- 单实例 Module 的 Topic 省略编号
+- 通配符格式：`device/+/+/online`、`radar/*/targets`
+
+## 分层与依赖
+
+- **依赖单向性**：下层不能依赖上层（InfraLayer 不能 include SolutionLayer 的头文件）
+- **AimRT 框架代码仓只读不写**：`AimrtFramework/` 目录由 AgiBot 提供，Skyfend 不修改
+- **一个 YAML = 一个产品**：切换产品形态改配置不改代码（`deploy/spotter_pro.yaml`、`deploy/sentry.yaml`）
+
+## 通信协议分层
+
+- **管理面走 Web**：参数配置、诊断、门户页面通过 HTTP/HTTPS + WebSocket（Caddy + WebGatewayModule）
+- **业务面走 MQTT**：设备数据上报、OODA 相关业务消息走 MQTT + Protobuf
+- **端侧不叠管理面 RPC**：子设备不需要实现独立 RPC/gRPC，管理入口为设备自带 Web 或厂商 Web
+- **高危指令仅走 MQTT 业务 Topic**：浏览器经 Caddy → WebGatewayModule → AimRT Channel/RPC → 业务 Module，不得绕过决策链直打设备
+
+## 进程模型
+
+- **单进程多 Module**（aimrt_main）：所有业务 Module 运行在同一进程
+- **Pkg 预注册多实例**：同一 Module 类通过不同名字注册多个实例，YAML 控制实际加载数量
+- **Executor 线程隔离**：每个 Module 可绑定不同 Executor，互不阻塞
+- **系统独立进程**：mosquitto（MQTT Broker）、mediamtx（流媒体）、caddy（Web 入口）不在 aimrt_main 内
+
+## OODA 闭环
+
+```
+Observe（观察）→ Orient（判断）→ Decide（决策）→ Act（行动）→ 反馈
+  Fusion+设备层   TargetManager    TargetAssign   StrikeManager
+                  +ThreatAssess                   +PtzGuidance
+                                                       ↓
+                                              结果 → TargetManager
+```

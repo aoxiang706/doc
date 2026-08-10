@@ -1,0 +1,194 @@
+---
+description: ROS2 节点开发最佳实践
+globs: "**/ros_ws/**/*.cpp,**/ros_ws/**/*.hpp"
+alwaysApply: false
+---
+
+# ROS2 节点最佳实践（中文版）
+
+## 节点结构
+
+### 基本模板
+
+```cpp
+#include <rclcpp/rclcpp.hpp>
+
+class MyNode : public rclcpp::Node {
+public:
+    MyNode() : Node("my_node") {
+        // 声明参数
+        this->declare_parameter("param_name", default_value);
+        
+        // 创建发布者
+        publisher_ = this->create_publisher<MsgType>("topic", 10);
+        
+        // 创建订阅者
+        subscription_ = this->create_subscription<MsgType>(
+            "topic", 10,
+            std::bind(&MyNode::callback, this, std::placeholders::_1));
+        
+        // 创建定时器
+        timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(100),
+            std::bind(&MyNode::timerCallback, this));
+    }
+
+private:
+    void callback(const MsgType::SharedPtr msg) {
+        // 处理消息
+    }
+    
+    void timerCallback() {
+        // 定时任务
+    }
+    
+    rclcpp::Publisher<MsgType>::SharedPtr publisher_;
+    rclcpp::Subscription<MsgType>::SharedPtr subscription_;
+    rclcpp::TimerBase::SharedPtr timer_;
+};
+```
+
+---
+
+## QoS 配置
+
+### 常用 QoS 配置
+
+```cpp
+// 可靠传输（适合控制指令）
+auto qos_reliable = rclcpp::QoS(10)
+    .reliability(RMW_QOS_POLICY_RELIABILITY_RELIABLE)
+    .durability(RMW_QOS_POLICY_DURABILITY_VOLATILE);
+
+// 最新数据（适合传感器数据）
+auto qos_sensor = rclcpp::SensorDataQoS();
+
+// 系统默认
+auto qos_default = rclcpp::SystemDefaultsQoS();
+```
+
+### QoS 兼容性
+
+| 发布者 | 订阅者 | 兼容性 |
+|--------|--------|--------|
+| RELIABLE | RELIABLE | ✅ |
+| RELIABLE | BEST_EFFORT | ✅ |
+| BEST_EFFORT | RELIABLE | ❌ |
+| BEST_EFFORT | BEST_EFFORT | ✅ |
+
+---
+
+## 参数管理
+
+```cpp
+// 声明参数
+this->declare_parameter("device_ip", "192.168.1.100");
+this->declare_parameter("timeout_ms", 5000);
+
+// 获取参数
+auto ip = this->get_parameter("device_ip").as_string();
+auto timeout = this->get_parameter("timeout_ms").as_int();
+
+// 动态参数回调
+auto param_callback = [this](const std::vector<rclcpp::Parameter>& params) {
+    for (const auto& param : params) {
+        if (param.get_name() == "timeout_ms") {
+            timeout_ms_ = param.as_int();
+        }
+    }
+    return rcl_interfaces::msg::SetParametersResult();
+};
+param_callback_handle_ = this->add_on_set_parameters_callback(param_callback);
+```
+
+---
+
+## 日志规范
+
+```cpp
+// 使用节点自带的 logger
+RCLCPP_DEBUG(this->get_logger(), "调试: value=%d", value);
+RCLCPP_INFO(this->get_logger(), "节点已启动");
+RCLCPP_WARN(this->get_logger(), "超时，重试中...");
+RCLCPP_ERROR(this->get_logger(), "连接失败: %s", error_msg);
+
+// 条件日志（避免刷屏）
+RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 
+    1000, "每秒最多打印一次");
+
+// 首次日志
+RCLCPP_INFO_ONCE(this->get_logger(), "只打印一次");
+```
+
+---
+
+## 生命周期管理
+
+### 优雅关闭
+
+```cpp
+class MyNode : public rclcpp::Node {
+public:
+    ~MyNode() {
+        // 清理资源
+        stopDevice();
+    }
+    
+    void stopDevice() {
+        if (device_running_) {
+            device_running_ = false;
+            // 等待线程结束
+            if (worker_thread_.joinable()) {
+                worker_thread_.join();
+            }
+        }
+    }
+};
+```
+
+### 信号处理
+
+```cpp
+int main(int argc, char** argv) {
+    rclcpp::init(argc, argv);
+    
+    auto node = std::make_shared<MyNode>();
+    
+    // 优雅关闭
+    rclcpp::on_shutdown([node]() {
+        node->stopDevice();
+    });
+    
+    rclcpp::spin(node);
+    rclcpp::shutdown();
+    return 0;
+}
+```
+
+---
+
+## 常见问题
+
+### 回调中的长耗时操作
+
+```cpp
+// ❌ 错误：阻塞回调
+void callback(const MsgType::SharedPtr msg) {
+    std::this_thread::sleep_for(std::chrono::seconds(5));  // 阻塞
+}
+
+// ✅ 正确：异步处理
+void callback(const MsgType::SharedPtr msg) {
+    // 放入队列，由工作线程处理
+    task_queue_.push(msg);
+}
+```
+
+### 多线程执行器
+
+```cpp
+// 多线程执行回调
+rclcpp::executors::MultiThreadedExecutor executor;
+executor.add_node(node);
+executor.spin();
+```

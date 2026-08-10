@@ -1,0 +1,171 @@
+---
+description: TerraHub Module 开发规范，指导 AimRT Module 的编写、注册、通信和目录组织
+globs: src/01_SolutionLayer/**/*,src/02_DevAbsLayer/**/*,src/03_InfraLayer/**/*
+alwaysApply: false
+---
+
+# TerraHub Module 开发规范
+
+## Module 生命周期
+
+每个 Module 必须实现 `aimrt::ModuleBase` 的四个接口：
+
+```cpp
+class MyModule : public aimrt::ModuleBase {
+ public:
+  ModuleInfo Info() const override;           // 返回 Module 名称和描述
+  bool Initialize(aimrt::CoreRef core) override;  // 初始化（获取配置/注册 Topic/绑 Executor）
+  bool Start() override;                      // 启动业务逻辑
+  void Shutdown() override;                   // 清理资源
+};
+```
+
+- `Initialize` 阶段：从 `CoreRef` 获取 Logger、Executor、Channel/RPC Handle 等
+- `Start` 阶段：启动数据收发、定时任务等
+- `Shutdown` 阶段：停止线程、释放资源
+
+## Pkg 注册（多实例）
+
+一个 `.so` 包（Pkg）可注册多个命名 Module 实例。同一 C++ 类创建多个实例时，用不同名字分别注册：
+
+```cpp
+// pkg_main.cc
+AIMRT_PKG_MAIN() {
+  // 预注册足够多的实例名，YAML 决定实际加载数量
+  AIMRT_REGISTER_MODULE(HepuPtzModule, "HepuPtzModule_01");
+  AIMRT_REGISTER_MODULE(HepuPtzModule, "HepuPtzModule_02");
+  AIMRT_REGISTER_MODULE(HepuPtzModule, "HepuPtzModule_03");
+}
+```
+
+## 通信选型
+
+### Channel（发布/订阅）— ~85% 场景
+
+适用于 OODA 数据流、设备状态上报、设备指令下发、系统事件。
+
+```cpp
+// 发布
+auto publisher = core.GetChannelHandle().GetPublisher<RadarTargetList>("radar/01/targets");
+publisher.Publish(msg);
+
+// 订阅
+core.GetChannelHandle().Subscribe<FusedTargetList>("fusion/targets",
+    [this](const auto& msg) { OnFusionTargets(msg); });
+```
+
+### RPC（请求/响应）— ~15% 场景
+
+适用于 PowerBox 控制、OTA 指令、参数调整等需要 ACK 的场景。
+
+## Executor 线程隔离
+
+- 每个 Module 实例可绑定到不同 Executor
+- 关键路径（OODA 主链路）使用 `simple_thread` + `SCHED_FIFO`
+- 普通数据使用 `asio_thread` 共享池
+- 配置方式在 YAML 中指定，代码中通过 `core.GetExecutorManager()` 获取
+
+## 设备 Module 设计模式
+
+### 塞防自研设备（MQTT + Protobuf）
+
+```
+设备 ──MQTT──> Broker ──MQTT──> AimRT mqtt_plugin ──Channel──> Module
+Module ──Channel──> AimRT mqtt_plugin ──MQTT──> Broker ──MQTT──> 设备
+```
+
+Module 内部：
+- 订阅设备上报的 MQTT Topic，解析 Protobuf，转为内部 Channel 发布
+- 订阅内部指令 Channel，序列化为 Protobuf，发布到 MQTT Topic
+
+### 第三方设备（厂商私有协议）
+
+```
+设备 ──ETH/UDP──> Module 内部 SDK ──Channel──> 上层 Module
+```
+
+Module 内部：
+- 内嵌厂商 SDK，直接处理 UDP/TCP 收发
+- 将厂商数据格式转换为统一 Protobuf 消息
+- 厂商协议差异完全在 Module 内部消化，上层统一收标准 Topic
+
+## 设备状态机
+
+所有设备 Module 维护统一的设备状态机：
+
+```
+OFFLINE ──(连接成功)──> ONLINE ──(执行任务)──> BUSY
+   ↑                     |                     |
+   └──(断连/超时)──────────┘                     |
+   ↑                     ↑                     |
+   └──(恢复失败)── FAULT <──(异常)───────────────┘
+```
+
+Thunder 特殊状态：`ONLINE → LAUNCHING → FLYING → ATTACKING → SACRIFICED / LOST`
+
+## 目录结构
+
+每个 Module 遵循统一目录结构：
+
+```
+ModuleName/
+├── module_name.h          # 头文件（类声明）
+├── module_name.cc         # 实现文件
+├── CMakeLists.txt         # 构建脚本
+├── sdk/                   # 可选：厂商 SDK（仅第三方设备）
+└── README.md              # 可选：Module 说明
+```
+
+### CMakeLists.txt 模板
+
+```cmake
+add_library(module_name
+  module_name.cc
+)
+
+target_include_directories(module_name PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_link_libraries(module_name
+  aimrt::interface::aimrt_module_cpp_interface
+  # 如有 Protobuf 消息依赖：
+  # terrahub_protocols
+)
+```
+
+## 日志规范
+
+统一使用 AimRT Logger，不自建日志系统：
+
+```cpp
+// 在 Initialize 中获取 logger
+logger_ = core.GetLogger();
+
+// 使用 AimRT 日志宏
+AIMRT_TRACE(logger_, "Detailed trace info");
+AIMRT_DEBUG(logger_, "Debug: device_id={}", id);
+AIMRT_INFO(logger_, "Device {} online", device_id);
+AIMRT_WARN(logger_, "Device {} heartbeat timeout", device_id);
+AIMRT_ERROR(logger_, "Failed to connect device {}", device_id);
+AIMRT_FATAL(logger_, "Critical failure in {}", module_name);
+```
+
+## 配置加载
+
+Module 配置通过 YAML 传入，在 `Initialize` 中读取：
+
+```cpp
+bool MyModule::Initialize(aimrt::CoreRef core) {
+  auto cfg = core.GetConfigurator();
+  // 读取 Module 专属配置节
+  // 配置格式由 deploy/*.yaml 中的 module 节定义
+}
+```
+
+## 注意事项
+
+- Module 中不要直接 `#include` 其他层的头文件（遵循依赖单向性）
+- 不要在 Module 中自行创建线程，使用 AimRT Executor
+- 不要在 Module 中直接操作 MQTT/Socket，通过 AimRT Channel/RPC 或 Plugin
+- 厂商 SDK 如需直接 UDP 收发，封装在 Module 内部，不暴露给上层

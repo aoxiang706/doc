@@ -1,0 +1,30 @@
+---
+description: GStreamer 视频流开发规范，包含 pipeline 构建和调试方法
+globs: "**/gstNvDeeps/**/*.cpp"
+alwaysApply: false
+---
+
+# GStreamer 开发规范
+
+## Pipeline 构建原则
+
+- 优先使用硬件解码器 (`nvv4l2decoder`)
+- 硬件编码使用 `nvv4l2h264enc`
+- 格式转换使用 `nvvidconv` (GPU) 而非 `videoconvert` (CPU)
+
+## 调试方法
+
+```bash
+# 启用日志
+export GST_DEBUG=3
+export GST_DEBUG_FILE=/tmp/gst.log
+
+# 测试 pipeline
+gst-launch-1.0 rtspsrc location=rtsp://... ! fakesink
+```
+
+## 错误处理
+
+- 检查 `gst_element_set_state()` 返回值
+- 监听 bus 消息处理错误
+- 资源释放使用 `gst_object_unref()`

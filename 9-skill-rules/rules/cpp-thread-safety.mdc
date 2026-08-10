@@ -1,0 +1,32 @@
+---
+description: C++ 多线程安全规范，避免常见并发问题
+globs: "**/*.cpp"
+alwaysApply: false
+---
+
+# C++ 多线程安全规范
+
+## cv::VideoCapture 并发调用
+
+cv::VideoCapture 使用 FFmpeg 后端时**不是线程安全**的，多线程并发调用会导致段错误。
+
+```cpp
+// ❌ 危险：多线程并发调用
+void checkUrl(const std::string& url) {
+    cv::VideoCapture cap(url);  // 多线程同时执行 → 段错误
+}
+
+// ✅ 正确：使用静态互斥锁保护
+bool isVideoUrlOk(const std::string& url) {
+    static std::mutex s_mutex;
+    std::lock_guard<std::mutex> lock(s_mutex);
+    cv::VideoCapture cap(url);
+    return cap.isOpened();
+}
+```
+
+## 其他常见线程安全问题
+
+- 使用 `std::mutex` 保护共享资源
+- 优先使用 `std::lock_guard` 或 `std::unique_lock`
+- 避免在持有锁时调用可能阻塞的外部库函数

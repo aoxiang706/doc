@@ -1,0 +1,120 @@
+---
+description: TerraHub 命名规范，基于架构文档 V4.1 第 16 章 Topic 字典和第 27.2 节命名规范
+globs: src/**/*,protocols/**/*,deploy/**/*
+alwaysApply: false
+---
+
+# TerraHub 命名规范
+
+## C++ 代码命名
+
+| 类型 | 规范 | 示例 |
+|------|------|------|
+| Module 类名 | 驼峰 + `Module` 后缀 | `FusionModule`、`HepuPtzModule`、`MiddleRangeRadarModule` |
+| Module 实例名 | 类名 + 下划线编号 | `HepuPtzModule_01`、`MiddleRangeRadarModule_02` |
+| 头文件 | 小写下划线 + `.h` | `hepu_ptz_module.h`、`fusion_module.h` |
+| 源文件 | 小写下划线 + `.cc` | `hepu_ptz_module.cc` |
+
+## Topic 命名
+
+- **格式**：`{设备类型}/{编号}/{数据类型}`
+- **小写 + 斜杠分隔 + 数字编号**（`01`/`02`），不用品牌名
+- 单实例 Module 的 Topic 省略编号
+- 每个 Topic **唯一发布者**，可多个订阅者
+
+### 设备层 Topic
+
+```
+radar/01/targets        # 雷达目标列表
+radar/01/status         # 雷达状态
+tracer/01/targets       # 电侦目标
+ptz/01/ai_targets       # PTZ AI 检测结果
+ptz/01/status           # PTZ 状态
+ptz/01/guide_command    # PTZ 引导指令
+ptz/01/track_result     # PTZ 跟踪结果
+hunter/01/status        # 打击炮状态
+hunter/01/command       # 打击指令
+hunter/01/result        # 打击反馈
+```
+
+### 解决方案层 Topic
+
+```
+fusion/targets          # 融合目标列表
+target/managed_list     # 目标管理列表
+threat/ranked_targets   # 威胁排序列表
+strike/assignment       # 打击分配
+strike/progress         # 打击进度
+strike/result           # 打击结果
+ptz/assignment          # PTZ 分配
+ptz/guidance_status     # PTZ 引导状态
+```
+
+### 系统 Topic
+
+```
+system/health           # 系统健康状态
+system/alarm            # 告警事件
+nexus/report            # 上报天盾
+nexus/command           # 天盾指令
+nexus/assign_override   # 天盾分配覆盖
+```
+
+### MQTT 设备组网 Topic
+
+```
+device/{type}/{id}/online       # 设备上线（retained=true）
+device/{type}/{id}/offline      # 设备掉线（遗嘱消息）
+device/{type}/{id}/heartbeat    # 设备心跳
+```
+
+## Protobuf 命名
+
+| 类型 | 规范 | 示例 |
+|------|------|------|
+| package | 点分隔，`skyfend` 前缀 | `skyfend.proto` |
+| message | 大驼峰 | `RadarTargetList`、`PtzAiTarget`、`StrikeCommand` |
+| field | 小写下划线 | `target_id`、`geo_position`、`threat_level` |
+| enum | 大驼峰，值全大写 | `ThreatLevel { LOW = 0; MEDIUM = 1; HIGH = 2; CRITICAL = 3; }` |
+| 文件名 | 小写下划线 | `radar_target.proto`、`ptz_status.proto` |
+
+### Proto 目录结构
+
+```
+protocols/
+├── common/     # header.proto, target_common.proto, device_status.proto
+├── radar/      # radar_target.proto
+├── tracer/     # tracer_target.proto
+├── ptz/        # ptz_ai_target.proto, ptz_guide_command.proto, ptz_status.proto
+├── fusion/     # fused_target.proto
+├── strike/     # strike_assignment.proto, strike_command.proto, strike_feedback.proto
+├── nexus/      # nexus_report.proto, nexus_command.proto, nexus_heartbeat.proto
+└── system/     # health_check.proto, alarm.proto
+```
+
+## 配置文件命名
+
+| 类型 | 规范 | 示例 |
+|------|------|------|
+| 部署 YAML | 小写下划线 | `spotter_pro.yaml`、`sentry.yaml`、`tracer_matrix.yaml` |
+| Topic 字典 | 固定名 | `topic_dictionary.yaml` |
+| 策略配置 | 小写下划线 | `fault_manager_policy.yaml` |
+
+## 数据优先级标识
+
+在代码注释和文档中统一使用以下四级优先级标识：
+
+- `P-Critical` — 必达指令（打击 command、分配覆盖）
+- `P-High` — 核心数据流（融合目标、威胁评估、打击结果）
+- `P-Normal` — 常规数据（设备状态、PTZ 状态）
+- `P-Low` — 辅助数据（系统监控、日志）
+
+## 视频流路径命名
+
+```
+/ptz/01/raw             # 原始流（无标注）
+/ptz/01/annotated       # 标注流（叠加检测框/ID/威胁等级）
+/laser/01/raw
+/laser/01/annotated
+/thunder/01/raw
+```

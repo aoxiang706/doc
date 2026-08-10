@@ -1,0 +1,89 @@
+---
+description: C++/ROS2 项目代码检查流程
+globs: "**/*.cpp,**/*.c,**/*.h,**/*.hpp"
+alwaysApply: false
+---
+
+# 代码检查（中文版）
+
+## 检查流程
+
+### 1. 编译检查
+
+```bash
+# ROS2 项目
+cd ros_ws && colcon build
+
+# 独立 CMake 项目
+mkdir build && cd build && cmake .. && make
+```
+
+### 2. 静态分析
+
+```bash
+# clang-tidy（需要 compile_commands.json）
+clang-tidy src/*.cpp -- -I include/
+
+# cppcheck
+cppcheck --enable=all --std=c++17 src/
+```
+
+### 3. 运行时检查
+
+```bash
+# Valgrind 内存检查
+valgrind --leak-check=full ./your_program
+
+# AddressSanitizer（编译时添加）
+cmake -DCMAKE_CXX_FLAGS="-fsanitize=address" ..
+```
+
+---
+
+## 常见问题检查清单
+
+### 内存安全
+- [ ] 指针使用前检查是否为空
+- [ ] 动态分配的内存是否正确释放
+- [ ] 避免悬垂指针
+- [ ] 数组越界检查
+
+### 线程安全
+- [ ] 共享资源是否有互斥锁保护
+- [ ] 避免死锁（锁的获取顺序一致）
+- [ ] cv::VideoCapture 等非线程安全 API 是否加锁
+
+### 资源管理
+- [ ] 文件句柄是否正确关闭
+- [ ] Socket 连接是否正确断开
+- [ ] GStreamer 资源是否 unref
+
+### ROS2 特定
+- [ ] 节点生命周期管理
+- [ ] QoS 配置是否匹配
+- [ ] 回调函数是否线程安全
+
+---
+
+## 修复优先级
+
+1. **编译错误** - 必须立即修复
+2. **运行时崩溃** - 段错误、内存泄漏
+3. **逻辑错误** - 功能不正确
+4. **警告** - 潜在问题
+5. **代码风格** - 可读性
+
+---
+
+## 项目特定命令
+
+```bash
+# 完整编译
+./config/tools/build_dev.sh
+
+# 开发编译（生成 compile_commands.json）
+./config/tools/build_dev.sh
+
+# 运行 ROS2 节点（带 GDB）
+ros2 run --prefix 'gdb -ex run --args' ptz_service ptz_service
+```

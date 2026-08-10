@@ -1,0 +1,139 @@
+---
+description: Mermaid 图表生成，用于绘制架构图、数据流图、时序图
+alwaysApply: false
+---
+
+# Mermaid 图表生成（中文版）
+
+## 常用图表类型
+
+### 1. 流程图（数据流）
+
+```mermaid
+flowchart LR
+    雷达[雷达模块] --> 融合[数据融合]
+    相机[相机模块] --> 融合
+    融合 --> PTZ[PTZ 跟踪]
+    PTZ --> 推流[RTSP 推流]
+```
+
+### 2. 时序图（通信协议）
+
+```mermaid
+sequenceDiagram
+    participant C2 as C2 控制端
+    participant AGX as AGX 主机
+    participant PTZ as PTZ 云台
+    
+    C2->>AGX: 0x77 心跳请求
+    AGX->>PTZ: 控制指令
+    PTZ-->>AGX: 状态反馈
+    AGX-->>C2: 0x77 心跳响应
+```
+
+### 3. 类图（代码结构）
+
+```mermaid
+classDiagram
+    class PtzDeviceBase {
+        +start()
+        +stop()
+        +setPosition()
+    }
+    class PtzDeviceHepu {
+        -GstSourceDecode decoder
+        -GstRtspClient rtspClient
+        +start()
+        +handleVideo()
+    }
+    PtzDeviceBase <|-- PtzDeviceHepu
+```
+
+### 4. 状态图
+
+```mermaid
+stateDiagram-v2
+    [*] --> 初始化
+    初始化 --> 就绪: 初始化完成
+    就绪 --> 跟踪: 收到目标
+    跟踪 --> 就绪: 目标丢失
+    跟踪 --> 打击: 确认打击
+    打击 --> 就绪: 打击完成
+```
+
+---
+
+## 项目常用模板
+
+### 视频流数据流
+
+```mermaid
+flowchart TD
+    subgraph 输入
+        RTSP[RTSP 流]
+        FILE[本地文件]
+    end
+    
+    subgraph 解码
+        GstSource[GstSourceDecode]
+        NVDEC[NVDEC 硬解]
+    end
+    
+    subgraph 处理
+        AI[AI 推理]
+        Fusion[融合处理]
+    end
+    
+    subgraph 输出
+        Display[本地显示]
+        RTSP_Out[RTSP 推流]
+    end
+    
+    RTSP --> GstSource
+    FILE --> GstSource
+    GstSource --> NVDEC
+    NVDEC --> AI
+    AI --> Fusion
+    Fusion --> Display
+    Fusion --> RTSP_Out
+```
+
+### 设备通信架构
+
+```mermaid
+flowchart TB
+    subgraph 外部
+        C2[C2 控制端]
+        Cloud[云平台]
+    end
+    
+    subgraph AGX
+        Alink[Alink 协议层]
+        EthLink[eth_link 网络层]
+        ROS[ROS2 节点]
+    end
+    
+    subgraph 外设
+        Radar[雷达]
+        PTZ[PTZ 云台]
+        Tracer[干扰器]
+    end
+    
+    C2 <--> EthLink
+    Cloud <--> Alink
+    Alink <--> EthLink
+    EthLink <--> ROS
+    ROS <--> Radar
+    ROS <--> PTZ
+    ROS <--> Tracer
+```
+
+---
+
+## 语法要点
+
+- 使用 `flowchart` 而非 `graph`（更现代）
+- 方向：`TD`（上到下）、`LR`（左到右）
+- 节点形状：`[]` 矩形、`()` 圆角、`{}` 菱形、`[()]` 圆柱
+- 连接线：`-->` 箭头、`---` 无箭头、`-.->` 虚线
+- 子图：`subgraph` 分组
